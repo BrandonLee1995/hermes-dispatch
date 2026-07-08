@@ -12,6 +12,7 @@ build/
 local-secrets/
 secrets/
 github-token
+github-token.env
 artifacts/
 scratch/
 *.bak
