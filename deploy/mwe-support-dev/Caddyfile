@@ -1,0 +1,21 @@
+{
+    auto_https off
+}
+
+(basic_auth_login_workaround) {
+    @basicAuthRedirect {
+        path /auth/login
+        query provider=basic
+    }
+    redir @basicAuthRedirect /login?{query} 302
+}
+
+:8080 {
+    import basic_auth_login_workaround
+
+    handle /mcp* {
+        reverse_proxy hermes-mwe-support-http-mcp:8765
+    }
+
+    reverse_proxy hermes-mwe-support-gateway:9119
+}

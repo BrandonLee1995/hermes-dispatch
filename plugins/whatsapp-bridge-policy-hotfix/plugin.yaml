@@ -1,0 +1,46 @@
+name: whatsapp-bridge-policy-hotfix
+version: 0.1.0
+description: "Local hotfix: make WhatsApp bridge group access follow group_policy/group_allow_from instead of DM allowlist, and expose group/admin controls for dashboard configuration. Remove after upstream Hermes includes equivalent behavior."
+author: local
+kind: standalone
+optional_env:
+  - name: WHATSAPP_DM_POLICY
+    description: "WhatsApp DM policy. Use allowlist to keep private chats limited to WHATSAPP_ALLOWED_USERS"
+    prompt: "WhatsApp DM policy"
+    password: false
+    category: messaging
+  - name: WHATSAPP_GROUP_POLICY
+    description: "WhatsApp group policy. Use open for all joined groups; Hermes also requires WHATSAPP_ALLOW_ALL_USERS=true as an explicit open opt-in"
+    prompt: "WhatsApp group policy"
+    password: false
+    category: messaging
+  - name: WHATSAPP_GROUP_ALLOWED_USERS
+    description: "Comma-separated WhatsApp group JIDs allowed when group policy is allowlist"
+    prompt: "Allowed WhatsApp group JIDs"
+    password: false
+    category: messaging
+  - name: WHATSAPP_REQUIRE_MENTION
+    description: "When true, WhatsApp group messages only trigger the agent when they mention the bot, reply to the bot, use a slash command, or match WHATSAPP_MENTION_PATTERNS"
+    prompt: "WhatsApp require mention"
+    password: false
+    category: messaging
+  - name: WHATSAPP_ALLOW_ADMIN_FROM
+    description: "Comma-separated WhatsApp user IDs allowed to run all admin slash commands in DMs"
+    prompt: "WhatsApp DM admins"
+    password: false
+    category: messaging
+  - name: WHATSAPP_USER_ALLOWED_COMMANDS
+    description: "Comma-separated slash commands non-admin WhatsApp DM users may run"
+    prompt: "WhatsApp DM user commands"
+    password: false
+    category: messaging
+  - name: WHATSAPP_GROUP_ALLOW_ADMIN_FROM
+    description: "Comma-separated WhatsApp user IDs allowed to run all admin slash commands in groups"
+    prompt: "WhatsApp group admins"
+    password: false
+    category: messaging
+  - name: WHATSAPP_GROUP_USER_ALLOWED_COMMANDS
+    description: "Comma-separated slash commands non-admin WhatsApp group users may run"
+    prompt: "WhatsApp group user commands"
+    password: false
+    category: messaging

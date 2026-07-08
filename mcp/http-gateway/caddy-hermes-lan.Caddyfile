@@ -1,0 +1,8 @@
+{
+    auto_https off
+}
+
+{$HERMES_MCP_PUBLIC_SITE:http://localhost:18080} {
+    bind {$HERMES_MCP_PROXY_BIND:127.0.0.1}
+    reverse_proxy {$HERMES_MCP_UPSTREAM:127.0.0.1:8765}
+}

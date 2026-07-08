@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "tencent-docs": {
+      "url": "https://docs.qq.com/openapi/mcp",
+      "startup_timeout_ms": 30000,
+      "headers": {
+        "Authorization": "${TENCENT_DOCS_TOKEN}"
+      },
+      "enabled": true
+    },
+    "example-stdio-tool": {
+      "command": "node",
+      "args": ["/opt/data/mcp/example-stdio-tool/server.js"],
+      "env": {
+        "EXAMPLE_API_BASE_URL": "https://example.internal",
+        "EXAMPLE_READONLY": "true"
+      }
+    }
+  }
+}

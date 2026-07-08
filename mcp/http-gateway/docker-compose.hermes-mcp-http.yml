@@ -1,0 +1,33 @@
+name: ${HERMES_MCP_PROJECT_NAME:-hermes-mcp-http}
+
+services:
+  hermes-mcp-http:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    container_name: ${HERMES_MCP_CONTAINER_NAME:-hermes-mcp-http}
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ${HERMES_MCP_ENV_FILE:?set HERMES_MCP_ENV_FILE to the target Hermes .env path}
+    volumes:
+      - ${HERMES_MCP_DATA_DIR:?set HERMES_MCP_DATA_DIR to the target Hermes data directory}:/opt/data
+    environment:
+      HERMES_HOME: /opt/data
+      HERMES_MCP_HTTP_HOST: ${HERMES_MCP_HTTP_HOST:-127.0.0.1}
+      HERMES_MCP_HTTP_PORT: ${HERMES_MCP_HTTP_PORT:-8765}
+      HERMES_MCP_HTTP_PATH: ${HERMES_MCP_HTTP_PATH:-/mcp}
+      HERMES_MCP_HTTP_BEARER_TOKEN: ${HERMES_MCP_HTTP_BEARER_TOKEN:?set HERMES_MCP_HTTP_BEARER_TOKEN}
+      HERMES_MCP_ENABLE_QQBOT_HOTFIX: ${HERMES_MCP_ENABLE_QQBOT_HOTFIX:-0}
+    entrypoint: ["/opt/hermes/.venv/bin/python3"]
+    command: ["/opt/data/scripts/hermes-mcp-http.py"]
+
+  hermes-caddy-lan:
+    image: ${HERMES_MCP_CADDY_IMAGE:-caddy:2-alpine}
+    container_name: ${HERMES_MCP_CADDY_CONTAINER_NAME:-hermes-mcp-caddy}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HERMES_MCP_PUBLIC_SITE: ${HERMES_MCP_PUBLIC_SITE:-http://localhost:18080}
+      HERMES_MCP_PROXY_BIND: ${HERMES_MCP_PROXY_BIND:-127.0.0.1}
+      HERMES_MCP_UPSTREAM: ${HERMES_MCP_UPSTREAM:-127.0.0.1:8765}
+    volumes:
+      - ${HERMES_MCP_CADDYFILE:-./caddy-hermes-lan.Caddyfile}:/etc/caddy/Caddyfile:ro

@@ -1,0 +1,92 @@
+name: hermes-mwe-support-dev
+
+x-hermes-logging: &hermes-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  gateway:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    container_name: hermes-mwe-support-gateway
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    shm_size: 1g
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${HERMES_DATA_DIR:-/home/marvel/.hermes}:/opt/data
+    env_file:
+      - ${HERMES_DATA_DIR:-/home/marvel/.hermes}/.env
+    environment:
+      OTEL_SERVICE_NAME: hermes-mwe-support-gateway
+      OTEL_SERVICE_NAMESPACE: hermes-agent
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=hermes-agent,deployment.environment=dev,hermes.department=mwe-support
+      HERMES_UID: ${HERMES_UID}
+      HERMES_GID: ${HERMES_GID}
+      HERMES_GATEWAY_BOOTSTRAP_STATE: "running"
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 0.0.0.0
+      HERMES_DASHBOARD_PORT: "9119"
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${DASHBOARD_USER}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${DASHBOARD_PASSWORD}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${DASHBOARD_SECRET}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: ${API_SERVER_KEY}
+    ports:
+      - "127.0.0.1:${API_PORT:-8642}:8642"
+      - "127.0.0.1:${DASHBOARD_PORT:-9119}:9119"
+    mem_limit: ${HERMES_MEM_LIMIT:-3g}
+    cpus: "${HERMES_CPUS:-1.5}"
+    logging: *hermes-logging
+
+  http-mcp:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    container_name: hermes-mwe-support-http-mcp
+    restart: unless-stopped
+    command: ["/opt/hermes/.venv/bin/python3", "/opt/data/scripts/hermes-mcp-http.py"]
+    depends_on:
+      - gateway
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${HERMES_DATA_DIR:-/home/marvel/.hermes}:/opt/data
+    env_file:
+      - ${HERMES_DATA_DIR:-/home/marvel/.hermes}/.env
+    environment:
+      HERMES_HOME: /opt/data
+      HERMES_UID: ${HERMES_UID}
+      HERMES_GID: ${HERMES_GID}
+      HERMES_MCP_HTTP_HOST: 0.0.0.0
+      HERMES_MCP_HTTP_PORT: "8765"
+      HERMES_MCP_HTTP_PATH: /mcp
+      HERMES_MCP_HTTP_BEARER_TOKEN: ${MCP_BEARER_TOKEN}
+      HERMES_MCP_ENABLE_QQBOT_HOTFIX: ${HERMES_MCP_ENABLE_QQBOT_HOTFIX:-1}
+    ports:
+      - "127.0.0.1:${MCP_HTTP_PORT:-8765}:8765"
+    mem_limit: 512m
+    cpus: "0.25"
+    logging: *hermes-logging
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2-alpine}
+    container_name: hermes-mwe-support-caddy
+    restart: unless-stopped
+    depends_on:
+      - gateway
+      - http-mcp
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    logging: *hermes-logging
+
+  cloudflared:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    container_name: hermes-mwe-support-cloudflared
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARED_TOKEN}"]
+    depends_on:
+      - caddy
+    logging: *hermes-logging
