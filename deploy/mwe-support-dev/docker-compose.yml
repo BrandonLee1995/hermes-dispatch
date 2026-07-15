@@ -47,7 +47,8 @@ services:
     image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
     container_name: hermes-mwe-support-http-mcp
     restart: unless-stopped
-    command: ["/opt/hermes/.venv/bin/python3", "/opt/data/scripts/hermes-mcp-http.py"]
+    user: "${HERMES_UID}:${HERMES_GID}"
+    entrypoint: ["/opt/hermes/.venv/bin/python3", "/opt/data/scripts/hermes-mcp-supervisor.py"]
     depends_on:
       - gateway
     security_opt:
