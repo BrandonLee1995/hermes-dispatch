@@ -17,19 +17,47 @@ plugins:
 ```
 
 Remove this plugin after the upstream Hermes image includes equivalent fixes for
-QQBot connect signature compatibility, channel-directory chat routing,
+QQBot connect signature compatibility, QQ group configuration interaction ACKs,
+channel-directory chat routing,
 `GROUP_MESSAGE_CREATE` context buffering, deterministic group-context compaction,
-emoji-only group mentions, reply `msg_id` handling, markdown fallback, and media
-caption compatibility.
+structured self-mention gating, emoji-only group mentions, reply `msg_id`
+handling, markdown fallback, and media caption compatibility.
 
 Compatibility contract:
 
-- QQ official group event payloads expose `id`, `content`, `group_openid`, and
-  `author.member_openid` on both `GROUP_AT_MESSAGE_CREATE` and
-  `GROUP_MESSAGE_CREATE`, so non-mention group messages can be buffered as
-  context while only mention messages are routed to the agent.
+- Tencent's current connector answers `INTERACTION_CREATE` configuration query
+  and update types `2001`/`2002` with a `claw_cfg` object. Hermes 0.18.2 ACKs
+  those events without the required data. This plugin implements the narrow
+  ACK contract, including QQ's `claw_type=openclaw` wire identifier, and
+  defaults `QQBOT_GROUP_RECEIVE_MODE=all`. The independent
+  `QQBOT_GROUP_MESSAGE_CREATE_MODE=mention` default still prevents the agent
+  from responding to every passive group message.
+
+- When delivered, QQ group event payloads expose `id`, `content`,
+  `group_openid`, and `author.member_openid` on
+  `GROUP_AT_MESSAGE_CREATE`/`GROUP_MESSAGE_CREATE`, so the latter can be
+  buffered while only mention messages are routed to the agent.
+- QQ defaults each group's robot receive scope to mention-only. The **group
+  owner** (not an ordinary member or group administrator) can open the QQ group
+  robot settings and select **获取全部群消息**. QQ then delivers ordinary group
+  traffic as `GROUP_MESSAGE_CREATE` on the existing connection; this plugin
+  buffers those events and injects recent context when the bot is mentioned.
+  Before returning from a passive event, version 1.5.3 invokes the optional
+  `message-snapshot-store` raw-capture hook. This keeps full-message snapshots
+  independent of plugin load order without routing passive traffic to the
+  agent.
+  Without that per-group switch, the server does not deliver unmentioned
+  messages and no Hermes-side plugin or database wrapper can recover them.
+  The native owner setting itself is authoritative. The separate 2001/2002
+  compatibility patch responds with `claw_cfg` only when QQ sends a connector
+  configuration interaction; owners do not need to toggle or reconfirm an
+  already effective native permission just to activate snapshot capture.
 - QQ group passive replies must carry a valid recent `msg_id`. This plugin does
   not reuse stale `_last_msg_id` values; explicit `reply_to` is preserved.
+- QQ may label a message that mentions another member as
+  `GROUP_AT_MESSAGE_CREATE`. Version 1.5.2 and later check the authoritative
+  `mentions[].is_you` field, so @owner/@member traffic is captured as context
+  but does not wake the agent; only an actual @bot does.
 
 Group context controls:
 

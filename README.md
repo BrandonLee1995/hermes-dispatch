@@ -12,6 +12,8 @@ edit container-internal source files.
 
 ```text
 plugins/
+  codex-app-server-phase-hotfix/     Codex phase routing and image delivery fix
+  message-snapshot-store/            Persistent snapshots and hybrid retrieval
   qqbot-connect-hotfix/              QQ Bot adapter compatibility plugin
   whatsapp-bridge-policy-hotfix/     WhatsApp bridge/policy/admin plugin
 mcp/
@@ -28,7 +30,13 @@ docs/
 
 - QQ Bot: message send fallbacks, media send compatibility, group message
   routing/context buffering, emoji-only mention handling, channel directory
-  routing, and long-context compaction support.
+  routing, long-context compaction, and persistent snapshots of bot-visible
+  text/media events with structured + BM25 hybrid retrieval. QQ defaults each
+  group robot to mention-only; its group owner can enable **获取全部群消息** for
+  `GROUP_MESSAGE_CREATE` capture. The snapshot hook runs before passive routing
+  suppression and is independent of plugin load order.
+- Codex app server: preserve commentary without duplicate final replies and
+  convert completed `imageGeneration` results into native gateway media.
 - WhatsApp: split private-chat allowlist from group openness, expose group/admin
   controls to Dashboard, patch group bridge intake so group messages are not
   filtered by DM allowlists, and expose `WHATSAPP_REQUIRE_MENTION`.
@@ -49,6 +57,8 @@ runtime:
 
 ```bash
 hermes plugins enable qqbot-connect-hotfix
+hermes plugins enable codex-app-server-phase-hotfix
+hermes plugins enable message-snapshot-store
 hermes plugins enable whatsapp-bridge-policy-hotfix
 ```
 
@@ -73,6 +83,12 @@ The plugin tests are self-contained:
 ```bash
 python plugins/qqbot-connect-hotfix/test_hotfix.py
 python plugins/qqbot-connect-hotfix/test_media_reply.py
+python plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+python plugins/codex-app-server-phase-hotfix/test_hotfix.py
+python plugins/message-snapshot-store/test_store.py
+python plugins/message-snapshot-store/test_capture.py
+python plugins/message-snapshot-store/test_materialize.py
+python plugins/message-snapshot-store/test_quoted_attachment.py
 python plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
 python mcp/http-gateway/test_hermes_mcp_http_auth.py
 python mcp/http-gateway/test_hermes_mcp_qqbot_target_patch.py

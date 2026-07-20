@@ -23,6 +23,9 @@ from .group_context import (
     remember_group_message as _remember_group_message,
     should_handle_group_message_create as _should_handle_group_message_create,
 )
+from .group_config_interaction import (
+    patch_group_config_interactions as _patch_group_config_interactions,
+)
 from .outbound import (
     patch_media_caption_retry as _patch_media_caption_retry,
     patch_plain_text_retry as _patch_plain_text_retry,
@@ -41,6 +44,7 @@ def register(ctx):
         return
 
     _patch_connect_signature(QQAdapter)
+    _patch_group_config_interactions(QQAdapter)
     _patch_channel_directory_chat_type(QQAdapter)
     _patch_emoji_only_group_mentions(QQAdapter)
     _patch_group_message_create_event(QQAdapter)

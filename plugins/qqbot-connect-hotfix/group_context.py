@@ -24,6 +24,18 @@ def patch_group_message_create_event(QQAdapter):
 
     async def _on_message(self, event_type: str, d: Any) -> None:
         if event_type == "GROUP_MESSAGE_CREATE":
+            # This wrapper intentionally stops passive group events before
+            # Hermes normalizes/routes them. Give persistent snapshot plugins
+            # an explicit raw-event hook so capture does not depend on whether
+            # that plugin was loaded before or after this compatibility layer.
+            capture_raw = getattr(self, "_message_snapshot_capture_raw", None)
+            if callable(capture_raw):
+                try:
+                    await capture_raw(event_type, d)
+                except Exception:
+                    logger.exception(
+                        "qqbot-connect-hotfix: passive GROUP_MESSAGE_CREATE snapshot failed"
+                    )
             context = group_context_block(self, d)
             if should_handle_group_message_create(self, d):
                 routed = dict(d) if isinstance(d, dict) else d
@@ -36,6 +48,17 @@ def patch_group_message_create_event(QQAdapter):
             logger.debug("qqbot-connect-hotfix: buffered GROUP_MESSAGE_CREATE without bot mention marker")
             return
         if event_type == "GROUP_AT_MESSAGE_CREATE" and isinstance(d, dict):
+            # QQ can label a message GROUP_AT_MESSAGE_CREATE when it mentions
+            # *any* group member, not only this bot. Structured mentions are
+            # authoritative: routing an ``is_you=false`` mention would wake
+            # the agent merely because somebody addressed the group owner.
+            if not group_at_mentions_this_bot(d):
+                remember_group_message(self, d)
+                logger.debug(
+                    "qqbot-connect-hotfix: buffered GROUP_AT_MESSAGE_CREATE "
+                    "whose structured mentions do not target this bot"
+                )
+                return
             context = group_context_block(self, d)
             if context:
                 routed = dict(d)
@@ -80,17 +103,34 @@ def should_handle_group_message_create(self, d: Any) -> bool:
         return True
     if mode in {"off", "disabled", "false", "0", "no"} or not isinstance(d, dict):
         return False
-    content = str(d.get("content") or "").strip()
-    if content.startswith("@"):
-        return True
-    return contains_mention_marker(d, str(getattr(self, "_app_id", "")))
+    return group_at_mentions_this_bot(d, fallback=False)
+
+
+def group_at_mentions_this_bot(d: Any, *, fallback: bool = True) -> bool:
+    """Return QQ's structured self-mention decision.
+
+    ``mentions[].is_you`` is present on current QQ group payloads and avoids
+    confusing @owner/@member messages with @bot. Older GROUP_AT payloads may
+    omit ``mentions`` entirely, so the GROUP_AT route keeps its historical
+    behavior only in that absence. GROUP_MESSAGE_CREATE never uses that
+    fallback because its purpose is passive full-group delivery.
+    """
+    if not isinstance(d, dict):
+        return False
+    mentions = d.get("mentions")
+    if not isinstance(mentions, list):
+        return fallback
+    return any(
+        isinstance(mention, dict) and mention.get("is_you") is True
+        for mention in mentions
+    )
 
 
 def contains_mention_marker(value: Any, app_id: str = "") -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
             key_text = str(key).lower()
-            if ("mention" in key_text or key_text.startswith("at_")) and bool(item):
+            if key_text in {"is_you", "at_bot", "mentioned_bot"} and item is True:
                 return True
         for key in ("type", "elem_type", "element_type", "msg_type"):
             if str(value.get(key) or "").strip().lower() in {"at", "mention", "at_user"}:

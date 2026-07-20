@@ -9,9 +9,9 @@ import anyio
 
 
 def load_plugin_module():
-    path = Path("/opt/data/plugins/qqbot-connect-hotfix/__init__.py")
+    path = Path(__file__).with_name("__init__.py")
     if not path.exists():
-        path = Path(__file__).with_name("__init__.py")
+        path = Path("/opt/data/plugins/qqbot-connect-hotfix/__init__.py")
     spec = importlib.util.spec_from_file_location(
         "qqbot_connect_hotfix_test",
         path,
@@ -56,6 +56,46 @@ class DummyAdapter:
     async def _api_request(self, method, path, body):
         self.calls.append((method, path, body))
         return {"id": "ok"}
+
+
+class DummyInteractionAdapter:
+    def __init__(self):
+        self.acks = []
+        self.delegated = []
+
+    async def _acknowledge_interaction(self, interaction_id, code=0):
+        self.acks.append((interaction_id, code, None))
+
+    async def _on_interaction(self, raw):
+        self.delegated.append(raw)
+
+
+class DummyHttpResponse:
+    status_code = 204
+    text = ""
+
+
+class DummyHttpClient:
+    def __init__(self):
+        self.calls = []
+
+    async def put(self, path, **kwargs):
+        self.calls.append((path, kwargs))
+        return DummyHttpResponse()
+
+
+class DummyAckAdapter:
+    def __init__(self):
+        self._http_client = DummyHttpClient()
+
+    async def _ensure_token(self):
+        return "test-token"
+
+    async def _acknowledge_interaction(self, interaction_id, code=0):
+        raise AssertionError("the wrapped data-aware ACK must bypass the original method")
+
+    async def _on_interaction(self, raw):
+        return None
 
 
 class DummyDispatchAdapter:
@@ -103,6 +143,45 @@ async def main():
     mixed = QQAdapter._strip_at_mention('@Momo 你好 <faceType=1,faceId="333">')
     assert mixed == "你好 <faceType=1,faceId=\"333\">"
 
+    mod._patch_group_config_interactions(DummyInteractionAdapter)
+    interaction_adapter = DummyInteractionAdapter()
+
+    async def capture_ack(interaction_id, code=0, data=None):
+        interaction_adapter.acks.append((interaction_id, code, data))
+
+    interaction_adapter._acknowledge_interaction = capture_ack
+    await interaction_adapter._on_interaction(
+        {"id": "cfg-query", "group_openid": "group-openid", "data": {"type": 2001}}
+    )
+    assert interaction_adapter.acks[0][0:2] == ("cfg-query", 0)
+    assert interaction_adapter.acks[0][2]["claw_cfg"]["require_mention"] == "always"
+    assert interaction_adapter.acks[0][2]["claw_cfg"]["claw_type"] == "openclaw"
+    await interaction_adapter._on_interaction(
+        {
+            "id": "cfg-update",
+            "group_openid": "group-openid",
+            "data": {"type": 2002, "resolved": {"claw_cfg": {"require_mention": "mention"}}},
+        }
+    )
+    assert interaction_adapter.acks[1][2]["claw_cfg"]["require_mention"] == "mention"
+    await interaction_adapter._on_interaction({"id": "button", "data": {"type": 11}})
+    assert interaction_adapter.delegated == [{"id": "button", "data": {"type": 11}}]
+
+    mod._patch_group_config_interactions(DummyAckAdapter)
+    ack_adapter = DummyAckAdapter()
+    claw_cfg = {
+        "claw_cfg": {
+            "channel_type": "qqbot",
+            "claw_type": "openclaw",
+            "require_mention": "always",
+        }
+    }
+    await ack_adapter._acknowledge_interaction("interaction-wire", 0, claw_cfg)
+    ack_path, ack_options = ack_adapter._http_client.calls[0]
+    assert ack_path.endswith("/interactions/interaction-wire")
+    assert ack_options["json"] == {"code": 0, "data": claw_cfg}
+    assert ack_options["headers"]["Authorization"] == "QQBot test-token"
+
     directory_type = mod._lookup_channel_directory_type("B279C1A461933B21DAFEE3263B8854A6")
     assert directory_type == "group", directory_type
 
@@ -124,9 +203,10 @@ async def main():
             "t": "GROUP_MESSAGE_CREATE",
             "d": {
                 "id": "msg-1",
-                "content": "@Momo hello",
+                "content": "<@bot-openid> hello",
                 "group_openid": "group-openid",
                 "author": {"member_openid": "member-b"},
+                "mentions": [{"id": "bot-openid", "bot": True, "is_you": True}],
             },
         }
     )
@@ -137,6 +217,19 @@ async def main():
     ignored_adapter = DummyDispatchAdapter()
     await ignored_adapter._on_message("GROUP_MESSAGE_CREATE", {"id": "msg-2", "content": "hello"})
     assert ignored_adapter.events == []
+
+    other_mention_adapter = DummyDispatchAdapter()
+    await other_mention_adapter._on_message(
+        "GROUP_AT_MESSAGE_CREATE",
+        {
+            "id": "msg-other-at",
+            "content": "owner test<@owner-openid>",
+            "group_openid": "group-openid",
+            "author": {"member_openid": "member-c"},
+            "mentions": [{"id": "owner-openid", "bot": False, "is_you": False}],
+        },
+    )
+    assert other_mention_adapter.events == []
 
     old_env = {
         key: os.environ.get(key)
@@ -165,9 +258,10 @@ async def main():
             "GROUP_MESSAGE_CREATE",
             {
                 "id": "msg-c-at",
-                "content": "@Momo hello",
+                "content": "<@bot-openid> hello",
                 "group_openid": "compact-group",
                 "author": {"member_openid": "member-at"},
+                "mentions": [{"id": "bot-openid", "bot": True, "is_you": True}],
             },
         )
         compact_context = compact_adapter.events[0][1]["_qqbot_channel_context"]
@@ -203,6 +297,7 @@ async def main():
     assert body["content"] == "**hello**"
     print("adapter_guess_B279=group")
     print("emoji_only_normalized=2")
+    print("group_config_interaction_ack=true")
     print("directory_type_B279=group")
     print("group_message_create_context=recent")
     print("plain_path=" + request_path)
