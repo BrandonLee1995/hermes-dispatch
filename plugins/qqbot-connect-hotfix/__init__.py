@@ -32,6 +32,10 @@ from .outbound import (
     send_plain_text as _send_plain_text,
     should_retry_plain_text as _should_retry_plain_text,
 )
+from .approval_owner import (
+    patch_shared_group_approval_owners as _patch_shared_group_approval_owners,
+    patch_shared_group_typed_approvals as _patch_shared_group_typed_approvals,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,3 +55,17 @@ def register(ctx):
     _patch_group_channel_context(QQAdapter)
     _patch_plain_text_retry(QQAdapter)
     _patch_media_caption_retry(QQAdapter)
+    approval_status = _patch_shared_group_approval_owners(QQAdapter)
+    logger.info("qqbot-connect-hotfix: %s", approval_status)
+    try:
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        typed_status = _patch_shared_group_typed_approvals(
+            GatewaySlashCommandsMixin
+        )
+        logger.info("qqbot-connect-hotfix: %s", typed_status)
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch typed approvals: %s",
+            exc,
+        )

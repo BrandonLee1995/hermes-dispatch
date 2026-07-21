@@ -65,7 +65,7 @@ MESSAGE_SNAPSHOT_CONTEXT_MESSAGES=20
 MESSAGE_SNAPSHOT_CONTEXT_TOKENS=4000
 ```
 
-## Codex App-Server Image Delivery
+## Codex App-Server Compatibility
 
 `codex-app-server-phase-hotfix` converts completed Codex app-server
 `imageGeneration` items into image files below `$HERMES_HOME/cache/images` and
@@ -74,9 +74,40 @@ truncating the opaque base64 item and dropping media-only turns at its
 empty-response branch. The existing QQ adapter then performs native image
 upload; no container source file is modified.
 
+Version 1.3.0 also bridges Codex command execution, file change, permission,
+and bundled Computer Use app-authorization requests into Hermes' registered
+Gateway approval queue. This compensates for Hermes 0.18.2 using only the
+terminal callback for command/file approvals and hard-coding permission and
+non-Hermes MCP elicitation requests to decline. On Codex 0.144.6, permission
+approval returns the requested, schema-filtered subset; denial or timeout
+returns an empty subset. Computer Use approval returns the MCP elicitation
+response and lets Codex own session/permanent app policy.
+
+`qqbot-connect-hotfix` 1.5.4 makes those buttons usable when
+`group_sessions_per_user: false`: each prompt carries a short-lived opaque
+nonce bound to the member who initiated the current turn. Another member, a
+different group, an expired token, or a repeated click cannot resolve the
+pending approval. Typed `/approve` and `/deny` commands enforce the same owner
+binding.
+
 After updating the plugin, restart the gateway and ask Codex to generate one
 image. Verification succeeds when the gateway log reports the materialized
 cache path and QQ receives the image rather than an empty response.
+
+To verify approvals, ask Codex through QQ to perform an operation that requires
+network access or an additional writable path. The QQ chat must receive an
+approval request while the turn remains blocked. **允许一次** grants only that
+turn; **始终允许** is limited to the active Codex session; **拒绝**, silence,
+send failure, or timeout grants nothing. Do not enable `/yolo` or set
+`approvals.mode: off` for this test because those modes intentionally bypass
+the human approval boundary.
+
+To verify Computer Use specifically, first remove the test app from Codex App's
+Computer Use allowlist, then ask through QQ to operate a non-forbidden app such
+as Notes. The QQ approval card must name the app. Verify rejection by another
+group member, approval by the requester, successful continuation of the same
+turn, and **始终允许** reuse on a later turn. A hard safety-denied app must remain
+blocked without a bypass prompt.
 
 Check capture and FTS5 availability with `/message-snapshot stats`. Search examples:
 
@@ -113,6 +144,13 @@ hermes plugins disable qqbot-connect-hotfix
 hermes plugins disable codex-app-server-phase-hotfix
 hermes plugins disable message-snapshot-store
 ```
+
+Disabling `codex-app-server-phase-hotfix` restores Hermes 0.18.2 behavior:
+Codex Gateway approvals are no longer sent to QQ, permission requests fail
+closed, Computer Use app elicitations are declined, duplicate-final protection
+is removed, and Codex media-only image turns may again be dropped. Disabling
+`qqbot-connect-hotfix` restores the shared-group approval rejection when group
+sessions are not user-isolated. Restart the gateway after rollback.
 
 For script-level MCP changes, stop the `http-mcp` container or point the compose
 service back to the upstream Hermes MCP command.

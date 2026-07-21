@@ -1,5 +1,5 @@
 name: codex-app-server-phase-hotfix
-version: 1.1.0
-description: "Prevent duplicate Codex final answers and deliver Codex imageGeneration results through Hermes media adapters."
+version: 1.3.0
+description: "Fix Codex final routing, image delivery, permission requests, and Computer Use elicitation approvals for Hermes adapters."
 author: local
 kind: standalone

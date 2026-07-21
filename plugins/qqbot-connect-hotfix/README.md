@@ -23,6 +23,18 @@ channel-directory chat routing,
 structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, markdown fallback, and media caption compatibility.
 
+Version 1.5.4 also compensates for shared-group approval ownership. With
+`group_sessions_per_user: false`, Hermes' group session key contains no user id,
+but the upstream QQ click validator requires one; consequently every approval
+button is rejected, including a click by the person who initiated the turn.
+The plugin captures `HERMES_SESSION_USER_ID` when the approval is sent, places a
+short-lived opaque nonce in the QQ button, and resolves the real Gateway session
+only when the same group member clicks it. The nonce is single-use, expires with
+the normal five-minute approval timeout, and is kept only in process memory.
+This preserves shared group context without allowing other members or stale
+buttons to approve a later request. The same requester check covers typed
+`/approve` and `/deny`, so the text fallback cannot bypass button ownership.
+
 Compatibility contract:
 
 - Tencent's current connector answers `INTERACTION_CREATE` configuration query

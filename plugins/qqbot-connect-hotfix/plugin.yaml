@@ -1,5 +1,5 @@
 name: qqbot-connect-hotfix
-version: 1.5.3
-description: "Local hotfix: modular QQBot compatibility patches for connect signature, QQ group config interaction ACKs, channel-directory chat routing, load-order-independent GROUP_MESSAGE_CREATE snapshot hooks and context buffering with deterministic compaction, structured self-mention gating, stale reply msg_id guard, emoji-only group mentions, markdown fallback, and media compatibility. Remove after Hermes upgrade."
+version: 1.5.4
+description: "Local hotfix: modular QQBot compatibility patches for connect signature, group interactions, owner-bound shared-group approvals, channel routing, snapshots/context, mention gating, reply msg_id, markdown, and media compatibility. Remove after Hermes upgrade."
 author: local
 kind: standalone

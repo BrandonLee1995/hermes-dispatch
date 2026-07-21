@@ -12,7 +12,7 @@ edit container-internal source files.
 
 ```text
 plugins/
-  codex-app-server-phase-hotfix/     Codex phase routing and image delivery fix
+  codex-app-server-phase-hotfix/     Codex routing, media, and approval bridge
   message-snapshot-store/            Persistent snapshots and hybrid retrieval
   qqbot-connect-hotfix/              QQ Bot adapter compatibility plugin
   whatsapp-bridge-policy-hotfix/     WhatsApp bridge/policy/admin plugin
@@ -23,6 +23,7 @@ deploy/
   mwe-support-dev/                   Gateway + HTTP MCP + Caddy example
 docs/
   architecture.md                    Compatibility design notes
+  development-log.md                 Dated compatibility change record
   operations.md                      Install, verify, rollback notes
 ```
 
@@ -35,8 +36,13 @@ docs/
   group robot to mention-only; its group owner can enable **获取全部群消息** for
   `GROUP_MESSAGE_CREATE` capture. The snapshot hook runs before passive routing
   suppression and is independent of plugin load order.
-- Codex app server: preserve commentary without duplicate final replies and
-  convert completed `imageGeneration` results into native gateway media.
+  Shared-group approval buttons use short-lived requester-bound tokens, so the
+  initiating member can approve without splitting the group conversation and
+  other members cannot reuse the button.
+- Codex app server: preserve commentary without duplicate final replies,
+  convert completed `imageGeneration` results into native gateway media, and
+  bridge execution, file-change, permission, and Computer Use application
+  authorization requests into Hermes' existing Gateway approval queue.
 - WhatsApp: split private-chat allowlist from group openness, expose group/admin
   controls to Dashboard, patch group bridge intake so group messages are not
   filtered by DM allowlists, and expose `WHATSAPP_REQUIRE_MENTION`.

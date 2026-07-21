@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 
@@ -128,6 +129,75 @@ class DummyHandleAdapter:
     async def handle_message(self, event):
         self.events.append(event)
         return None
+
+
+class DummyApprovalAdapter:
+    _APPROVAL_BUTTON_TO_CHOICE = {
+        "allow-once": "once",
+        "allow-always": "always",
+        "deny": "deny",
+    }
+
+    def __init__(self):
+        self.sent = []
+        self.delegated = []
+
+    @staticmethod
+    def _parse_gateway_session_key(session_key):
+        parts = str(session_key).split(":")
+        if len(parts) < 5 or parts[:3] != ["agent", "main", "qqbot"]:
+            return None
+        parsed = {
+            "platform": parts[2],
+            "chat_type": parts[3],
+            "chat_id": parts[4],
+        }
+        if len(parts) > 5:
+            parsed["user_id"] = parts[5]
+        return parsed
+
+    async def send_exec_approval(
+        self,
+        chat_id,
+        command,
+        session_key,
+        description="dangerous command",
+        metadata=None,
+        allow_permanent=True,
+        smart_denied=False,
+    ):
+        self.sent.append(
+            (
+                chat_id,
+                command,
+                session_key,
+                description,
+                metadata,
+                allow_permanent,
+                smart_denied,
+            )
+        )
+        return SimpleNamespace(success=True)
+
+    async def _default_interaction_dispatch(self, event):
+        self.delegated.append(event)
+
+
+class DummySlashCommands:
+    def __init__(self):
+        self.handled = []
+
+    @staticmethod
+    def _session_key_for_source(source):
+        return source.session_key
+
+    async def _handle_approve_command(self, event):
+        self.handled.append(("approve", event.source.user_id))
+        return "approved"
+
+    async def _handle_deny_command(self, event):
+        self.handled.append(("deny", event.source.user_id))
+        return "denied"
 
 
 async def main():
@@ -282,6 +352,129 @@ async def main():
     await handle_adapter.handle_message(event)
     assert event.channel_context == "[Recent group messages]\n[member-a] 普通上下文"
 
+    # Shared group sessions omit user_id from the session key. Bind the button
+    # to the initiating user's ContextVar via an opaque, single-use token.
+    approval_patch_status = mod._patch_shared_group_approval_owners(
+        DummyApprovalAdapter
+    )
+    approval_patch_status_again = mod._patch_shared_group_approval_owners(
+        DummyApprovalAdapter
+    )
+    assert "approval sender patched" in approval_patch_status
+    assert "already patched" in approval_patch_status_again
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    approval_adapter = DummyApprovalAdapter()
+    shared_session = "agent:main:qqbot:group:group-openid"
+    session_tokens = set_session_vars(
+        platform="qqbot",
+        chat_id="group-openid",
+        user_id="requester-openid",
+        session_key=shared_session,
+    )
+    try:
+        approval_result = await approval_adapter.send_exec_approval(
+            "group-openid",
+            "computer_use app=com.apple.Notes",
+            shared_session,
+            "Allow Computer Use to use Notes?",
+        )
+    finally:
+        clear_session_vars(session_tokens)
+    assert approval_result.success
+    public_token = approval_adapter.sent[0][2]
+    assert public_token.startswith("qq-approval-v1.")
+    assert shared_session not in public_token
+
+    import tools.approval
+
+    resolved = []
+    original_resolve = tools.approval.resolve_gateway_approval
+    tools.approval.resolve_gateway_approval = (
+        lambda session_key, choice: resolved.append((session_key, choice)) or 1
+    )
+    try:
+        await approval_adapter._default_interaction_dispatch(
+            SimpleNamespace(
+                button_data=f"approve:{public_token}:allow-once",
+                operator_openid="other-member",
+                group_openid="group-openid",
+                guild_id="",
+            )
+        )
+        assert resolved == []
+        await approval_adapter._default_interaction_dispatch(
+            SimpleNamespace(
+                button_data=f"approve:{public_token}:allow-once",
+                operator_openid="requester-openid",
+                group_openid="group-openid",
+                guild_id="",
+            )
+        )
+        assert resolved == [(shared_session, "once")]
+        # The nonce is consumed: a stale/double click cannot approve anything.
+        await approval_adapter._default_interaction_dispatch(
+            SimpleNamespace(
+                button_data=f"approve:{public_token}:allow-once",
+                operator_openid="requester-openid",
+                group_openid="group-openid",
+                guild_id="",
+            )
+        )
+        assert resolved == [(shared_session, "once")]
+    finally:
+        tools.approval.resolve_gateway_approval = original_resolve
+
+    typed_status = mod._patch_shared_group_typed_approvals(DummySlashCommands)
+    typed_status_again = mod._patch_shared_group_typed_approvals(
+        DummySlashCommands
+    )
+    assert "_handle_approve_command patched" in typed_status
+    assert "already patched" in typed_status_again
+
+    # Create a new pending approval because the button test consumed the first
+    # token and its associated requester record.
+    session_tokens = set_session_vars(
+        platform="qqbot",
+        chat_id="group-openid",
+        user_id="requester-openid",
+        session_key=shared_session,
+    )
+    try:
+        await approval_adapter.send_exec_approval(
+            "group-openid",
+            "computer_use app=com.apple.Notes",
+            shared_session,
+        )
+    finally:
+        clear_session_vars(session_tokens)
+
+    slash_commands = DummySlashCommands()
+    intruder_event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="qqbot",
+            user_id="other-member",
+            session_key=shared_session,
+        )
+    )
+    owner_event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="qqbot",
+            user_id="requester-openid",
+            session_key=shared_session,
+        )
+    )
+    intruder_reply = await slash_commands._handle_approve_command(intruder_event)
+    assert "Only the member" in intruder_reply
+    assert slash_commands.handled == []
+    assert await slash_commands._handle_approve_command(owner_event) == "approved"
+    assert slash_commands.handled == [("approve", "requester-openid")]
+    # Once consumed, even the prior owner cannot use a typed command to affect
+    # a later or unrelated pending queue item.
+    owner_reply = await slash_commands._handle_deny_command(owner_event)
+    assert "Only the member" in owner_reply
+
     dummy = DummyAdapter()
     result = await mod._send_plain_text(
         dummy,
@@ -300,6 +493,9 @@ async def main():
     print("group_config_interaction_ack=true")
     print("directory_type_B279=group")
     print("group_message_create_context=recent")
+    print("shared_group_approval_owner_bound=true")
+    print("shared_group_approval_nonce_single_use=true")
+    print("shared_group_typed_approval_owner_bound=true")
     print("plain_path=" + request_path)
     print("plain_msg_type=0")
 

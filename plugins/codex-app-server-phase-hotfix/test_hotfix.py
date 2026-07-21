@@ -8,7 +8,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def load_plugin_module():
@@ -133,6 +135,247 @@ def main():
         assert "projector patched" in image_status
         assert "already patched" in image_status_again
 
+    # Current Codex app-server permissions protocol: only the granted subset
+    # is returned. An empty profile is a denial; persistence is session-only.
+    requested = {
+        "network": {"enabled": True, "ignored": "not-on-wire"},
+        "fileSystem": {
+            "write": ["/tmp/export"],
+            "entries": [
+                {
+                    "access": "write",
+                    "path": {"type": "path", "path": "/tmp/export"},
+                }
+            ],
+            "ignored": ["/etc"],
+        },
+        "unknown": {"enabled": True},
+    }
+    once_response = mod.approval_bridge.permission_response(requested, "once")
+    assert once_response["scope"] == "turn"
+    assert once_response["permissions"]["network"] == {"enabled": True}
+    assert once_response["permissions"]["fileSystem"]["write"] == ["/tmp/export"]
+    assert "ignored" not in once_response["permissions"]["fileSystem"]
+    assert "unknown" not in once_response["permissions"]
+    assert mod.approval_bridge.permission_response(requested, "always") == {
+        "permissions": once_response["permissions"],
+        "scope": "session",
+    }
+    assert mod.approval_bridge.permission_response(requested, "deny") == {
+        "permissions": {},
+        "scope": "turn",
+    }
+
+    permission_responses = []
+
+    class PermissionClient:
+        def respond(self, request_id, result):
+            permission_responses.append((request_id, result))
+
+    permission_callback_calls = []
+
+    class PermissionSession:
+        _client = PermissionClient()
+        _approval_callback = staticmethod(
+            lambda *args, **kwargs: permission_callback_calls.append((args, kwargs))
+            or "once"
+        )
+
+    delegated_requests = []
+    permission_handler = mod.approval_bridge.wrap_server_request_handler(
+        lambda _self, request: delegated_requests.append(request)
+    )
+    permission_handler(
+        PermissionSession(),
+        {
+            "id": 61,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "cwd": "/workspace",
+                "reason": "download a dependency",
+                "permissions": {"network": {"enabled": True}},
+            },
+        },
+    )
+    assert permission_responses == [
+        (61, {"permissions": {"network": {"enabled": True}}, "scope": "turn"})
+    ]
+    assert permission_callback_calls[0][1]["allow_permanent"] is True
+    assert delegated_requests == []
+    ordinary_request = {"id": 62, "method": "item/fileChange/requestApproval"}
+    permission_handler(PermissionSession(), ordinary_request)
+    assert delegated_requests == [ordinary_request]
+
+    # Computer Use asks through MCP elicitation rather than the standalone
+    # permissions method. Only the bundled connector identity is intercepted.
+    computer_use_request = {
+        "id": 63,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "serverName": "node-repl",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "mode": "openai/form",
+            "message": 'Allow Computer Use to use "Notes"?',
+            "requestedSchema": {},
+            "_meta": {
+                "connector_id": "computer-use",
+                "connector_name": "Computer Use",
+                "persist": ["session", "always"],
+                "riskLevel": "medium",
+                "tool_params": {"app": "com.apple.Notes"},
+                "tool_params_display": [
+                    {"name": "app", "display_name": "App", "value": "Notes"}
+                ],
+            },
+        },
+    }
+    permission_handler(PermissionSession(), computer_use_request)
+    assert permission_responses[-1] == (
+        63,
+        {"action": "accept", "content": None, "_meta": None},
+    )
+    cua_args, cua_kwargs = permission_callback_calls[-1]
+    assert cua_args[0] == "computer_use app=com.apple.Notes"
+    assert 'Allow Computer Use to use "Notes"?' in cua_args[1]
+    assert cua_kwargs["allow_permanent"] is True
+
+    assert mod.approval_bridge.computer_use_elicitation_response("always") == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "always"},
+    }
+    assert mod.approval_bridge.computer_use_elicitation_response("deny") == {
+        "action": "decline",
+        "content": None,
+        "_meta": None,
+    }
+
+    unrelated_elicitation = {
+        "id": 64,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "serverName": "third-party-mcp",
+            "threadId": "thread-1",
+            "mode": "form",
+            "message": "Provide a value",
+            "requestedSchema": {"type": "object", "properties": {}},
+        },
+    }
+    permission_handler(PermissionSession(), unrelated_elicitation)
+    assert delegated_requests[-1] == unrelated_elicitation
+
+    # Exercise the same private queue contract Hermes' own command guards use.
+    notified = []
+    approval_module = SimpleNamespace(
+        _lock=threading.Lock(),
+        _gateway_notify_cbs={"qq-session": notified.append},
+        get_current_session_key=lambda default="": "qq-session",
+        _await_gateway_decision=lambda session_key, notify, data, surface: (
+            notify(data) or {"resolved": True, "choice": "once"}
+        ),
+    )
+    gateway_choice = mod.approval_bridge._gateway_approval_choice(
+        "curl https://example.invalid/file",
+        "Codex requests network access",
+        _approval_module=approval_module,
+    )
+    assert gateway_choice == "once"
+    assert notified and notified[0]["allow_permanent"] is False
+
+    # Integrate with the installed Hermes queue, not only the isolated fake.
+    from tools import approval as real_approval
+
+    real_session_key = "codex-approval-hotfix-regression"
+    real_notified = []
+    real_token = real_approval.set_current_session_key(real_session_key)
+
+    def resolve_real_queue(data):
+        real_notified.append(data)
+        assert real_approval.resolve_gateway_approval(real_session_key, "once") == 1
+
+    real_approval.register_gateway_notify(real_session_key, resolve_real_queue)
+    try:
+        assert mod.approval_bridge._gateway_approval_choice(
+            "request_permissions network",
+            "Codex requests network access",
+        ) == "once"
+        assert real_notified[0]["pattern_key"] == "codex_app_server:approval"
+    finally:
+        real_approval.unregister_gateway_notify(real_session_key)
+        real_approval.reset_current_session_key(real_token)
+
+    injected_callbacks = []
+
+    def capture_init(_self, **kwargs):
+        injected_callbacks.append(kwargs.get("approval_callback"))
+
+    mod.approval_bridge.wrap_session_init(capture_init)(object(), approval_callback=None)
+    assert injected_callbacks == [mod.approval_bridge._gateway_approval_choice]
+
+    approval_status = mod.approval_bridge.patch_codex_gateway_approvals()
+    approval_status_again = mod.approval_bridge.patch_codex_gateway_approvals()
+    assert "gateway callback patched" in approval_status
+    assert "permission requests patched" in approval_status
+    assert "Computer Use elicitations patched" in approval_status
+    assert "already patched" in approval_status_again
+
+    # Verify all four live session request methods after the class patch.
+    from agent.transports.codex_app_server_session import (
+        CodexAppServerSession,
+        _ServerRequestRouting,
+    )
+
+    bridged_responses = []
+
+    class BridgedClient:
+        def respond(self, request_id, result):
+            bridged_responses.append((request_id, result))
+
+    live_session = object.__new__(CodexAppServerSession)
+    live_session._client = BridgedClient()
+    live_session._routing = _ServerRequestRouting()
+    live_session._cwd = "/workspace"
+    live_session._pending_file_changes = {"file-1": "change README.md"}
+    live_session._approval_callback = lambda *_args, **_kwargs: "once"
+    live_session._handle_server_request(
+        {
+            "id": 71,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "curl https://example.invalid", "cwd": "/workspace"},
+        }
+    )
+    live_session._handle_server_request(
+        {
+            "id": 72,
+            "method": "item/fileChange/requestApproval",
+            "params": {"itemId": "file-1", "reason": "update documentation"},
+        }
+    )
+    live_session._handle_server_request(
+        {
+            "id": 73,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "cwd": "/workspace",
+                "permissions": {"network": {"enabled": True}},
+            },
+        }
+    )
+    live_session._handle_server_request(
+        {
+            "id": 74,
+            "method": "mcpServer/elicitation/request",
+            "params": computer_use_request["params"],
+        }
+    )
+    assert bridged_responses == [
+        (71, {"decision": "accept"}),
+        (72, {"decision": "accept"}),
+        (73, {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+        (74, {"action": "accept", "content": None, "_meta": None}),
+    ]
+
     if old_home is None:
         os.environ.pop("HERMES_HOME", None)
     else:
@@ -143,6 +386,12 @@ def main():
     print("unknown_terminal_suppressed=true")
     print("image_generation_materialized=true")
     print("empty_image_final_recovered=true")
+    print("gateway_approval_callback=true")
+    print("gateway_real_queue_roundtrip=true")
+    print("permission_subset_response=true")
+    print("permission_deny_empty_subset=true")
+    print("computer_use_elicitation_bridge=true")
+    print("unrelated_elicitation_delegated=true")
     print(f"install_status={status}")
 
 
