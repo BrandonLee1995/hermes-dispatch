@@ -134,6 +134,7 @@ class DummyHandleAdapter:
 class DummyApprovalAdapter:
     _APPROVAL_BUTTON_TO_CHOICE = {
         "allow-once": "once",
+        "allow-session": "session",
         "allow-always": "always",
         "deny": "deny",
     }
@@ -183,6 +184,26 @@ class DummyApprovalAdapter:
         self.delegated.append(event)
 
 
+class DummyChoiceAdapter:
+    _APPROVAL_BUTTON_TO_CHOICE = {
+        "allow-once": "once",
+        "allow-always": "always",
+        "deny": "deny",
+    }
+
+    def __init__(self):
+        self.sent = []
+        self.delegated = []
+
+    async def send_with_keyboard(self, chat_id, text, keyboard, reply_to=None):
+        self.sent.append((chat_id, text, keyboard.to_dict(), reply_to))
+        return SimpleNamespace(success=True)
+
+    async def send_approval_request(self, chat_id, req, reply_to=None):
+        self.delegated.append((chat_id, req, reply_to))
+        return SimpleNamespace(success=True)
+
+
 class DummySlashCommands:
     def __init__(self):
         self.handled = []
@@ -203,10 +224,18 @@ class DummySlashCommands:
 async def main():
     mod.register(None)
     from gateway.platforms.qqbot.adapter import QQAdapter
+    from gateway.platforms.qqbot.keyboards import (
+        ApprovalRequest,
+        parse_approval_button_data,
+    )
 
     adapter = QQAdapter.__new__(QQAdapter)
     adapter._chat_type_map = {}
     assert adapter._guess_chat_type("B279C1A461933B21DAFEE3263B8854A6") == "group"
+    assert parse_approval_button_data(
+        "approve:agent:main:qqbot:c2c:user:allow-session"
+    ) == ("agent:main:qqbot:c2c:user", "allow-session")
+    assert QQAdapter._APPROVAL_BUTTON_TO_CHOICE["allow-session"] == "session"
     face_message = '<faceType=1,faceId="333",ext="x"><faceType=1,faceId="333">'
     normalized = QQAdapter._strip_at_mention(face_message)
     assert normalized == "用户在群里 @ 了你，并发送了 2 个 QQ 表情。请根据上下文做简短回应。"
@@ -352,6 +381,77 @@ async def main():
     await handle_adapter.handle_message(event)
     assert event.channel_context == "[Recent group messages]\n[member-a] 普通上下文"
 
+    # Codex records exact request scopes on the existing Gateway queue. QQ must
+    # render every scope and return the missing allow-session vocabulary.
+    choice_status = mod._patch_codex_approval_choices(DummyChoiceAdapter)
+    choice_status_again = mod._patch_codex_approval_choices(DummyChoiceAdapter)
+    assert "approval choices sender patched" in choice_status
+    assert "already patched" in choice_status_again
+
+    from tools import approval as approval_tools
+
+    choice_session = "agent:main:qqbot:c2c:user-openid"
+    choice_entry = approval_tools._ApprovalEntry(
+        {
+            "command": "curl https://example.invalid",
+            "codex_approval_choices": ["once", "session", "always", "deny"],
+        }
+    )
+    with approval_tools._lock:
+        approval_tools._gateway_queues[choice_session] = [choice_entry]
+    choice_adapter = DummyChoiceAdapter()
+    try:
+        choice_result = await choice_adapter.send_approval_request(
+            "user-openid",
+            ApprovalRequest(
+                session_key=choice_session,
+                title="Execute this command?",
+                command_preview="curl https://example.invalid",
+            ),
+            reply_to="message-id",
+        )
+    finally:
+        with approval_tools._lock:
+            approval_tools._gateway_queues.pop(choice_session, None)
+    assert choice_result.success
+    assert choice_adapter.delegated == []
+    rows = choice_adapter.sent[0][2]["content"]["rows"]
+    buttons = [button for row in rows for button in row["buttons"]]
+    labels = [button["render_data"]["label"] for button in buttons]
+    assert labels == [
+        "✅ 本次允许",
+        "🕒 会话允许",
+        "⭐ 始终允许同类",
+        "❌ 拒绝",
+    ]
+    assert buttons[1]["action"]["data"].endswith(":allow-session")
+    assert len(rows) == 2
+
+    group_token = "qq-approval-v1.test-token"
+    choice_adapter._qq_shared_approval_tokens = {
+        group_token: {"session_key": choice_session}
+    }
+    with approval_tools._lock:
+        approval_tools._gateway_queues[choice_session] = [choice_entry]
+    try:
+        await choice_adapter.send_approval_request(
+            "group-openid",
+            ApprovalRequest(
+                session_key=group_token,
+                title="Execute this command?",
+            ),
+        )
+    finally:
+        with approval_tools._lock:
+            approval_tools._gateway_queues.pop(choice_session, None)
+    group_rows = choice_adapter.sent[1][2]["content"]["rows"]
+    group_buttons = [
+        button for row in group_rows for button in row["buttons"]
+    ]
+    assert group_buttons[1]["action"]["data"] == (
+        f"approve:{group_token}:allow-session"
+    )
+
     # Shared group sessions omit user_id from the session key. Bind the button
     # to the initiating user's ContextVar via an opaque, single-use token.
     approval_patch_status = mod._patch_shared_group_approval_owners(
@@ -423,6 +523,37 @@ async def main():
             )
         )
         assert resolved == [(shared_session, "once")]
+
+        session_tokens = set_session_vars(
+            platform="qqbot",
+            chat_id="group-openid",
+            user_id="requester-openid",
+            session_key=shared_session,
+        )
+        try:
+            await approval_adapter.send_exec_approval(
+                "group-openid",
+                "python -m pytest",
+                shared_session,
+                "Allow this command for the session?",
+            )
+        finally:
+            clear_session_vars(session_tokens)
+        session_public_token = approval_adapter.sent[1][2]
+        await approval_adapter._default_interaction_dispatch(
+            SimpleNamespace(
+                button_data=(
+                    f"approve:{session_public_token}:allow-session"
+                ),
+                operator_openid="requester-openid",
+                group_openid="group-openid",
+                guild_id="",
+            )
+        )
+        assert resolved == [
+            (shared_session, "once"),
+            (shared_session, "session"),
+        ]
     finally:
         tools.approval.resolve_gateway_approval = original_resolve
 
@@ -493,6 +624,9 @@ async def main():
     print("group_config_interaction_ack=true")
     print("directory_type_B279=group")
     print("group_message_create_context=recent")
+    print("approval_session_choice=true")
+    print("approval_complete_keyboard=true")
+    print("approval_session_button_roundtrip=true")
     print("shared_group_approval_owner_bound=true")
     print("shared_group_approval_nonce_single_use=true")
     print("shared_group_typed_approval_owner_bound=true")

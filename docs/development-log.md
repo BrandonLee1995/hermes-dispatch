@@ -1,5 +1,56 @@
 # Development Log
 
+## 2026-07-24 — Codex automatic reviewer and complete QQ approval scopes
+
+### Problem
+
+Hermes 0.18.2 reduced Codex command and file approvals to two QQ buttons because
+its app-server callback always passed `allow_permanent=False`. This hid
+Codex's supported `acceptForSession` decision. The remaining generic
+**始终允许** label was also ambiguous: standalone permission requests support
+only turn/session scope, while permanent command approval is valid only when
+Codex supplies an exec-policy or network-policy amendment.
+
+The local Codex configuration had no explicit reviewer, so the upstream default
+sent every interactive approval to the user instead of using the requested
+automatic reviewer.
+
+### Change
+
+- Set the user Codex defaults through app-server `config/batchWrite` to
+  `approval_policy="on-request"`, `approvals_reviewer="auto_review"`, and
+  `sandbox_mode="workspace-write"`.
+- `codex-app-server-phase-hotfix` 1.4.0 now intercepts command and file approval
+  responses as well as permission requests, records exact request choices on
+  Hermes' existing in-memory queue, returns `acceptForSession` for session
+  approval, and returns only the persistent amendment proposed by Codex.
+- `qqbot-connect-hotfix` 1.6.0 adds the missing `allow-session` callback and
+  renders the choices in two rows. Shared-group opaque owner tokens resolve back
+  to the same queue metadata without exposing a real session key.
+
+This compensates for Hermes' incomplete QQ presentation and legacy Codex
+response mapping. It does not modify container source, create a second approval
+database, or invent permanent allow rules.
+
+### Verification
+
+`codex config/read` returned the three requested defaults and
+`codex --strict-config doctor` accepted the configuration. Plugin regressions
+cover one-shot/session/persistent/deny response mapping, exact exec/network
+amendment round-trips, the real Hermes blocking queue, four-button QQ
+serialization, and shared-group owner binding.
+
+For live QQ verification with human buttons, temporarily switch the reviewer to
+`user`; automatic review normally resolves eligible requests before a QQ prompt
+exists. Restore `auto_review` afterward.
+
+### Rollback
+
+Remove the three Codex keys to restore upstream defaults. Disable
+`codex-app-server-phase-hotfix` and `qqbot-connect-hotfix`, reinstall the
+persistent plugin set, and restart the Gateway to restore Hermes 0.18.2
+behavior.
+
 ## 2026-07-20 — Computer Use elicitation and QQ shared-group approvals
 
 ### Problem

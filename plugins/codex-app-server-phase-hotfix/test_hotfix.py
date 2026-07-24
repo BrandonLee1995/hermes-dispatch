@@ -200,11 +200,55 @@ def main():
     assert permission_responses == [
         (61, {"permissions": {"network": {"enabled": True}}, "scope": "turn"})
     ]
-    assert permission_callback_calls[0][1]["allow_permanent"] is True
+    assert permission_callback_calls[0][1]["allow_permanent"] is False
+    assert permission_callback_calls[0][1]["approval_choices"] == [
+        "once",
+        "session",
+        "deny",
+    ]
     assert delegated_requests == []
-    ordinary_request = {"id": 62, "method": "item/fileChange/requestApproval"}
-    permission_handler(PermissionSession(), ordinary_request)
-    assert delegated_requests == [ordinary_request]
+
+    execpolicy_params = {
+        "command": "curl https://example.invalid",
+        "cwd": "/workspace",
+        "proposedExecpolicyAmendment": ["prefix_rule", "curl"],
+    }
+    assert mod.approval_bridge.command_approval_choices(execpolicy_params) == [
+        "once",
+        "session",
+        "always",
+        "deny",
+    ]
+    assert mod.approval_bridge.command_response(execpolicy_params, "session") == {
+        "decision": "acceptForSession"
+    }
+    assert mod.approval_bridge.command_response(execpolicy_params, "always") == {
+        "decision": {
+            "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": ["prefix_rule", "curl"]
+            }
+        }
+    }
+    assert mod.approval_bridge.command_response(
+        {
+            "proposedNetworkPolicyAmendments": [
+                {"host": "example.invalid", "action": "allow"}
+            ]
+        },
+        "always",
+    ) == {
+        "decision": {
+            "applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {
+                    "host": "example.invalid",
+                    "action": "allow",
+                }
+            }
+        }
+    }
+    assert mod.approval_bridge.file_change_response("session") == {
+        "decision": "acceptForSession"
+    }
 
     # Computer Use asks through MCP elicitation rather than the standalone
     # permissions method. Only the bundled connector identity is intercepted.
@@ -239,6 +283,12 @@ def main():
     assert cua_args[0] == "computer_use app=com.apple.Notes"
     assert 'Allow Computer Use to use "Notes"?' in cua_args[1]
     assert cua_kwargs["allow_permanent"] is True
+    assert cua_kwargs["approval_choices"] == [
+        "once",
+        "session",
+        "always",
+        "deny",
+    ]
 
     assert mod.approval_bridge.computer_use_elicitation_response("always") == {
         "action": "accept",
@@ -278,10 +328,12 @@ def main():
     gateway_choice = mod.approval_bridge._gateway_approval_choice(
         "curl https://example.invalid/file",
         "Codex requests network access",
+        approval_choices=["once", "session", "deny"],
         _approval_module=approval_module,
     )
     assert gateway_choice == "once"
     assert notified and notified[0]["allow_permanent"] is False
+    assert notified[0]["codex_approval_choices"] == ["once", "session", "deny"]
 
     # Integrate with the installed Hermes queue, not only the isolated fake.
     from tools import approval as real_approval
@@ -299,8 +351,14 @@ def main():
         assert mod.approval_bridge._gateway_approval_choice(
             "request_permissions network",
             "Codex requests network access",
+            approval_choices=["once", "session", "deny"],
         ) == "once"
         assert real_notified[0]["pattern_key"] == "codex_app_server:approval"
+        assert real_notified[0]["codex_approval_choices"] == [
+            "once",
+            "session",
+            "deny",
+        ]
     finally:
         real_approval.unregister_gateway_notify(real_session_key)
         real_approval.reset_current_session_key(real_token)
@@ -316,6 +374,7 @@ def main():
     approval_status = mod.approval_bridge.patch_codex_gateway_approvals()
     approval_status_again = mod.approval_bridge.patch_codex_gateway_approvals()
     assert "gateway callback patched" in approval_status
+    assert "command/file approval choices patched" in approval_status
     assert "permission requests patched" in approval_status
     assert "Computer Use elicitations patched" in approval_status
     assert "already patched" in approval_status_again
@@ -376,6 +435,32 @@ def main():
         (74, {"action": "accept", "content": None, "_meta": None}),
     ]
 
+    scoped_responses = []
+    live_session._client = SimpleNamespace(
+        respond=lambda request_id, result: scoped_responses.append(
+            (request_id, result)
+        )
+    )
+    live_session._approval_callback = lambda *_args, **_kwargs: "session"
+    live_session._handle_server_request(
+        {
+            "id": 75,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "pwd", "cwd": "/workspace"},
+        }
+    )
+    live_session._handle_server_request(
+        {
+            "id": 76,
+            "method": "item/fileChange/requestApproval",
+            "params": {"itemId": "file-1"},
+        }
+    )
+    assert scoped_responses == [
+        (75, {"decision": "acceptForSession"}),
+        (76, {"decision": "acceptForSession"}),
+    ]
+
     if old_home is None:
         os.environ.pop("HERMES_HOME", None)
     else:
@@ -388,6 +473,8 @@ def main():
     print("empty_image_final_recovered=true")
     print("gateway_approval_callback=true")
     print("gateway_real_queue_roundtrip=true")
+    print("complete_command_file_choices=true")
+    print("persistent_command_amendment=true")
     print("permission_subset_response=true")
     print("permission_deny_empty_subset=true")
     print("computer_use_elicitation_bridge=true")

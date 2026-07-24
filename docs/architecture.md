@@ -41,10 +41,13 @@ already registered by `gateway/run.py`, and waits on `tools.approval` exactly as
 Hermes terminal tools do. QQ remains only a presentation and interaction
 adapter; clicking its approval buttons resolves the same Gateway queue.
 
-Codex owns permission scope. The bridge grants at most the requested permission
-subset, maps one-shot approval to turn scope, maps the QQ persistent choice to
-Codex session scope, and represents deny/timeout as an empty subset. No approval
-changes `config.toml`, container source, or a host permanent allowlist.
+Codex owns permission scope. The bridge records the request's exact UI choices
+on the existing in-memory Gateway queue. QQ renders one-shot and session choices
+separately, and renders a permanent command choice only when Codex supplies an
+exec-policy or network-policy amendment. Selecting it returns that exact
+amendment to app-server. Standalone permission requests remain limited to
+`turn` or `session`; deny/timeout returns an empty subset. The bridge does not
+invent rules or write `config.toml`.
 
 Computer Use remains the policy owner. The bridge recognizes only the bundled
 `computer-use` connector, forwards its app authorization elicitation, and sends
@@ -57,7 +60,9 @@ token bound to the current turn's `HERMES_SESSION_USER_ID`. The real session key
 and requester identity remain in memory; only the matching operator in the
 matching group can consume the token. This is an interaction-routing record,
 not a durable permission database. Typed `/approve` and `/deny` commands consult
-the same requester record.
+the same requester record. The dynamic approval keyboard can resolve the opaque
+token back to the real pending queue entry, so shared-group prompts retain the
+same complete choice set as direct chats without exposing the session key.
 
 ## WhatsApp Area
 

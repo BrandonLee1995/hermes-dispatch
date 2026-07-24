@@ -53,12 +53,19 @@ The bridge covers:
 - `item/permissions/requestApproval`
 - Computer Use `mcpServer/elicitation/request`
 
+Version 1.4.0 preserves the decisions advertised by each Codex request instead
+of reducing command and file approvals to allow/deny. Command requests expose
+one-shot and session approval, plus a persistent choice only when Codex supplies
+an exec-policy or network-policy amendment. File changes expose one-shot and
+session approval. A persistent command choice returns the exact amendment
+proposed by Codex; the compatibility layer never invents a broader rule.
+
 For permission requests, allowing once returns the requested, schema-filtered
-permission subset with `scope: turn`. QQ's **始终允许** choice maps only to
-`scope: session`; it does not modify `~/.codex/config.toml` or Hermes' permanent
-allowlist. Deny, timeout, a missing Gateway notifier, or an internal exception
-returns an empty permission profile. Codex treats every omitted permission as
-denied.
+permission subset with `scope: turn`; session approval returns `scope: session`.
+The permissions protocol has no permanent scope, so it does not modify
+`~/.codex/config.toml` or a Hermes allowlist. Deny, timeout, a missing Gateway
+notifier, or an internal exception returns an empty permission profile. Codex
+treats every omitted permission as denied.
 
 For Computer Use, the bridge matches only the bundled connector identity,
 renders the requested display name and bundle id through the same Gateway
@@ -68,8 +75,8 @@ policy. Unknown or third-party MCP elicitations continue through Hermes'
 upstream fail-closed handler. Apps marked `forbidden` by the Computer Use
 runtime never emit this elicitation and remain blocked.
 
-This behavior follows the current upstream [Codex app-server permission
-contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#permission-requests).
+This behavior follows the current upstream [Codex app-server approval
+contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#approvals).
 
 Install under the Hermes data directory and enable it:
 

@@ -36,6 +36,9 @@ from .approval_owner import (
     patch_shared_group_approval_owners as _patch_shared_group_approval_owners,
     patch_shared_group_typed_approvals as _patch_shared_group_typed_approvals,
 )
+from .approval_choices import (
+    patch_codex_approval_choices as _patch_codex_approval_choices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,8 @@ def register(ctx):
     _patch_group_channel_context(QQAdapter)
     _patch_plain_text_retry(QQAdapter)
     _patch_media_caption_retry(QQAdapter)
+    choices_status = _patch_codex_approval_choices(QQAdapter)
+    logger.info("qqbot-connect-hotfix: %s", choices_status)
     approval_status = _patch_shared_group_approval_owners(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", approval_status)
     try:

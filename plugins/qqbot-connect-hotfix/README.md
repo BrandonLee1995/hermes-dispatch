@@ -23,6 +23,26 @@ channel-directory chat routing,
 structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, markdown fallback, and media caption compatibility.
 
+Version 1.6.0 restores the Codex approval choices that Hermes 0.18.2 drops from
+QQ. The upstream adapter passes `allow_permanent=False` for command and file
+requests, so QQ renders only allow/deny even though app-server supports
+`acceptForSession`. The Codex compatibility plugin now records the exact
+request-scoped choices on Hermes' existing short-lived approval queue. This
+plugin reads that entry and renders:
+
+- **本次允许**
+- **会话允许**
+- **始终允许同类**, only when Codex proposed a persistent command or network
+  policy amendment
+- **拒绝**
+
+The buttons use two rows for QQ mobile compatibility. The new
+`allow-session` callback maps to Hermes' existing `session` queue decision.
+Permission and file-change prompts never claim permanent scope; Computer Use
+shows permanent approval only when its elicitation advertises `persist=always`.
+If the Codex plugin is disabled or the queue has no decision metadata, the
+upstream QQ keyboard remains unchanged.
+
 Version 1.5.4 also compensates for shared-group approval ownership. With
 `group_sessions_per_user: false`, Hermes' group session key contains no user id,
 but the upstream QQ click validator requires one; consequently every approval
