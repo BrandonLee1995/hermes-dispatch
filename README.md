@@ -24,6 +24,7 @@ deploy/
 docs/
   architecture.md                    Compatibility design notes
   development-log.md                 Dated compatibility change record
+  macos-hermes-codex-deployment.md    Complete macOS migration and deployment
   operations.md                      Install, verify, rollback notes
 ```
 
@@ -69,6 +70,9 @@ hermes plugins enable whatsapp-bridge-policy-hotfix
 ```
 
 Restart the gateway after enabling or updating plugins.
+
+For a complete, version-unpinned Mac mini migration and deployment procedure,
+see [`docs/macos-hermes-codex-deployment.md`](docs/macos-hermes-codex-deployment.md).
 
 ## Security Boundary
 
