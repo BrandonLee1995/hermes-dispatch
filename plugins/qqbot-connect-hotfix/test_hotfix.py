@@ -184,6 +184,35 @@ class DummyApprovalAdapter:
         self.delegated.append(event)
 
 
+class DummyCurrentApprovalAdapter(DummyApprovalAdapter):
+    """Model the 0.19-era adapter contract with explicit session scope."""
+
+    async def send_exec_approval(
+        self,
+        chat_id,
+        command,
+        session_key,
+        description="dangerous command",
+        metadata=None,
+        allow_permanent=True,
+        allow_session=True,
+        smart_denied=False,
+    ):
+        self.sent.append(
+            (
+                chat_id,
+                command,
+                session_key,
+                description,
+                metadata,
+                allow_permanent,
+                allow_session,
+                smart_denied,
+            )
+        )
+        return SimpleNamespace(success=True)
+
+
 class DummyChoiceAdapter:
     _APPROVAL_BUTTON_TO_CHOICE = {
         "allow-once": "once",
@@ -463,6 +492,36 @@ async def main():
     assert "approval sender patched" in approval_patch_status
     assert "already patched" in approval_patch_status_again
 
+    # Newer Gateway code passes allow_session even when the installed adapter
+    # is still the legacy implementation. The wrapper must accept and safely
+    # omit it for that old original method.
+    legacy_direct = DummyApprovalAdapter()
+    legacy_result = await legacy_direct.send_exec_approval(
+        "user-openid",
+        "echo legacy",
+        "agent:main:qqbot:c2c:user-openid",
+        allow_session=False,
+    )
+    assert legacy_result.success
+    assert legacy_direct.sent[0][2] == "agent:main:qqbot:c2c:user-openid"
+
+    # Current adapters implement allow_session and must receive its exact
+    # value rather than having the compatibility wrapper discard it.
+    current_status = mod._patch_shared_group_approval_owners(
+        DummyCurrentApprovalAdapter
+    )
+    assert "approval sender patched" in current_status
+    current_direct = DummyCurrentApprovalAdapter()
+    current_result = await current_direct.send_exec_approval(
+        "user-openid",
+        "echo current",
+        "agent:main:qqbot:c2c:user-openid",
+        allow_permanent=False,
+        allow_session=False,
+    )
+    assert current_result.success
+    assert current_direct.sent[0][5:8] == (False, False, False)
+
     from gateway.session_context import clear_session_vars, set_session_vars
 
     approval_adapter = DummyApprovalAdapter()
@@ -479,6 +538,7 @@ async def main():
             "computer_use app=com.apple.Notes",
             shared_session,
             "Allow Computer Use to use Notes?",
+            allow_session=True,
         )
     finally:
         clear_session_vars(session_tokens)

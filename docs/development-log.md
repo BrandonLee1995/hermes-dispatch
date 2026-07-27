@@ -1,5 +1,57 @@
 # Development Log
 
+## 2026-07-27 — Hermes 0.19 approval signature compatibility
+
+### Problem
+
+Hermes' newer 0.19-era Gateway passes `allow_session` to the cross-adapter
+`send_exec_approval` contract. The persistent QQ shared-group owner wrapper was
+written against Hermes 0.18.2 and did not accept that keyword. Live logs showed
+the call failing in Python before any QQ API request:
+
+```text
+Button-based approval failed, falling back to text:
+QQAdapter.send_exec_approval() got an unexpected keyword argument 'allow_session'
+```
+
+The Gateway therefore emitted a text-only `/approve` prompt even though the
+Codex approval bridge, QQ adapter, and four-scope keyboard patch were all
+registered successfully.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.6.1.
+- The shared-group wrapper now accepts `allow_session` and future keyword
+  additions.
+- Keyword forwarding is signature-aware: the wrapper preserves
+  `allow_session` for current adapters and omits it only when calling an older
+  Hermes 0.18.2 adapter that does not implement the parameter.
+- Calls to the wrapped adapter use named arguments so later optional-parameter
+  insertion cannot silently shift approval semantics.
+
+This compensates for the cross-version adapter contract change while retaining
+one persistent plugin build for both Hermes 0.18.2 and 0.19-era installations.
+
+### Verification
+
+Run:
+
+```bash
+python plugins/qqbot-connect-hotfix/test_hotfix.py
+```
+
+The regression covers both the legacy method signature and the current
+`allow_session` signature, including shared-group owner-token routing.
+After installing the plugin, restart the Gateway and verify the startup log
+still reports `approval sender patched`. A live approval must render buttons
+without `unexpected keyword argument 'allow_session'` or the text fallback.
+
+### Rollback
+
+Reinstall `qqbot-connect-hotfix` 1.6.0 and restart the Gateway. On newer
+0.19-era Gateway code this intentionally restores the text-only fallback, so
+rollback is intended only for diagnosing a regression on an older runtime.
+
 ## 2026-07-24 — Codex automatic reviewer and complete QQ approval scopes
 
 ### Problem

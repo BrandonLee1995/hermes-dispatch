@@ -10,6 +10,7 @@ the real session key plus requester id only in process memory.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import secrets
 import time
@@ -70,6 +71,30 @@ def _current_requester_user_id() -> str:
         return ""
 
 
+def _supported_call_kwargs(
+    original: Callable,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Forward only keywords supported by the installed Hermes adapter."""
+    try:
+        parameters = inspect.signature(original).parameters
+    except (TypeError, ValueError):
+        # The known approval contract predates allow_session. If an unusual
+        # callable exposes no signature, retain that conservative base.
+        parameters = {}
+
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return dict(values)
+    return {
+        name: value
+        for name, value in values.items()
+        if name in parameters
+    }
+
+
 def wrap_send_exec_approval(original: Callable) -> Callable:
     """Issue an opaque owner-bound token for a shared group approval."""
 
@@ -82,8 +107,21 @@ def wrap_send_exec_approval(original: Callable) -> Callable:
         description: str = "dangerous command",
         metadata=None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
+        **kwargs,
     ):
+        call_kwargs = _supported_call_kwargs(
+            original,
+            {
+                "description": description,
+                "metadata": metadata,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
+                "smart_denied": smart_denied,
+                **kwargs,
+            },
+        )
         parsed = _shared_group_session(self, session_key)
         if parsed is None:
             return await original(
@@ -91,10 +129,7 @@ def wrap_send_exec_approval(original: Callable) -> Callable:
                 chat_id,
                 command,
                 session_key,
-                description,
-                metadata,
-                allow_permanent,
-                smart_denied,
+                **call_kwargs,
             )
 
         requester = _current_requester_user_id()
@@ -109,10 +144,7 @@ def wrap_send_exec_approval(original: Callable) -> Callable:
                 chat_id,
                 command,
                 session_key,
-                description,
-                metadata,
-                allow_permanent,
-                smart_denied,
+                **call_kwargs,
             )
 
         now = time.monotonic()
@@ -131,10 +163,7 @@ def wrap_send_exec_approval(original: Callable) -> Callable:
                 chat_id,
                 command,
                 token,
-                description,
-                metadata,
-                allow_permanent,
-                smart_denied,
+                **call_kwargs,
             )
         except Exception:
             store.pop(token, None)

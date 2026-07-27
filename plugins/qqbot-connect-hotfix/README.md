@@ -23,6 +23,16 @@ channel-directory chat routing,
 structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, markdown fallback, and media caption compatibility.
 
+Version 1.6.1 keeps the shared-group approval wrapper compatible with both
+Hermes 0.18.2 and the newer 0.19-era cross-adapter contract. New Gateway code
+passes an explicit `allow_session` keyword to `send_exec_approval`; the old
+wrapper rejected that keyword before QQ could send a keyboard and forced the
+Gateway into its plain-text `/approve` fallback. The wrapper now accepts
+current and future keyword additions, forwards only parameters implemented by
+the installed adapter, and preserves `allow_session` when the adapter supports
+it. This is a runtime signature compatibility fix; it does not broaden any
+approval scope.
+
 Version 1.6.0 restores the Codex approval choices that Hermes 0.18.2 drops from
 QQ. The upstream adapter passes `allow_permanent=False` for command and file
 requests, so QQ renders only allow/deny even though app-server supports
