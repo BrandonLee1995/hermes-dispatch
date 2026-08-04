@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from .capture import patch_qq_snapshot_capture
+from .capture import patch_qq_snapshot_capture, patch_whatsapp_snapshot_factory
 from .config import SnapshotConfig
 from .store import SnapshotStore
 from .tools import register_snapshot_interfaces
@@ -28,6 +28,11 @@ def register(ctx) -> None:
         logger.warning("message-snapshot-store: QQAdapter unavailable: %s", exc)
     else:
         patch_qq_snapshot_capture(QQAdapter, _store)
+
+    if not patch_whatsapp_snapshot_factory(_store):
+        logger.warning(
+            "message-snapshot-store: WhatsAppAdapter unavailable; WhatsApp snapshots disabled"
+        )
 
     logger.info(
         "message-snapshot-store: ready db=%s media=%s storage=%s context=%d/%d tokens",

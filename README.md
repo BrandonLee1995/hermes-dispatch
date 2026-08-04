@@ -44,9 +44,9 @@ docs/
   convert completed `imageGeneration` results into native gateway media, and
   bridge execution, file-change, permission, and Computer Use application
   authorization requests into Hermes' existing Gateway approval queue.
-- WhatsApp: split private-chat allowlist from group openness, expose group/admin
-  controls to Dashboard, patch group bridge intake so group messages are not
-  filtered by DM allowlists, and expose `WHATSAPP_REQUIRE_MENTION`.
+- WhatsApp: split private-chat allowlist from group openness, enforce mention
+  response policy, capture passive Baileys events before that response gate,
+  and persist text/media in the same structured + BM25 snapshot store as QQ.
 - MCP: authenticated streamable HTTP MCP wrapper for Hermes, local reverse proxy
   examples, and an optional QQBot target compatibility patch for MCP outbound
   dispatch.
@@ -99,6 +99,7 @@ python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py
 python plugins/message-snapshot-store/test_materialize.py
 python plugins/message-snapshot-store/test_quoted_attachment.py
+python plugins/message-snapshot-store/test_whatsapp_capture.py
 python plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
 python mcp/http-gateway/test_hermes_mcp_http_auth.py
 python mcp/http-gateway/test_hermes_mcp_qqbot_target_patch.py

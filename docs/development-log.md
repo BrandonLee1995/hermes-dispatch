@@ -1,5 +1,146 @@
 # Development Log
 
+## 2026-08-04 — WhatsApp mention routing and durable Baileys snapshots
+
+### Problem
+
+Hermes 0.20 had stored the intended WhatsApp mention policy at
+`display.platforms.whatsapp.require_mention`. The WhatsApp adapter only reads
+`platforms.whatsapp.require_mention` or `WHATSAPP_REQUIRE_MENTION`, so the live
+value silently remained false and every group message triggered the agent.
+
+The existing `message-snapshot-store` captured only QQ. WhatsApp text and media
+could reach the agent and ordinary Hermes transcript/cache, but they were not
+written to the permanent structured database, included in BM25/hybrid recall,
+or recoverable through the content-addressed archive.
+
+### Change
+
+- Bumped `whatsapp-bridge-policy-hotfix` to 0.2.2. It treats the misplaced
+  display value as a compatibility fallback only when the canonical adapter
+  config and environment variable are absent. Deployments should still migrate
+  to `platforms.whatsapp.require_mention: true`.
+- Bumped `message-snapshot-store` to 1.1.0 and wrapped Hermes 0.20's deferred
+  WhatsApp factory.
+- Baileys bridge events are captured before Hermes applies its mention gate, so
+  passive group traffic is retained without triggering Codex.
+- Routed WhatsApp messages receive the same bounded 20-message/4000-token
+  database context and exact/FTS5-BM25/substring/fuzzy/RRF retrieval as QQ.
+- WhatsApp's decrypted media cache paths are mirrored immediately into the
+  SHA-256 content-addressed archive. Hashing and copying are streamed in 1 MiB
+  chunks to avoid reading large media into Python memory a second time.
+- If Baileys cannot download/decrypt media even after its reupload recovery,
+  the snapshot records an unavailable attachment marker rather than claiming
+  that a restorable URL exists.
+
+This compensates for Hermes 0.20's configuration placement mismatch and for the
+Baileys bridge boundary: `messages.upsert` exposes WhatsApp Web message objects,
+while `downloadMediaMessage()` yields decrypted bytes, not a durable plaintext
+link suitable for QQ-style link-only retention.
+
+### Enable and verify
+
+Install the persistent plugin directories, enable both plugins, set the
+canonical mention policy, and restart the Gateway:
+
+```bash
+scripts/install-plugins.sh "$HOME/.hermes" \
+  whatsapp-bridge-policy-hotfix message-snapshot-store
+hermes plugins enable whatsapp-bridge-policy-hotfix
+hermes plugins enable message-snapshot-store
+hermes gateway restart
+```
+
+Run:
+
+```bash
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/message-snapshot-store/test_store.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/message-snapshot-store/test_capture.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/message-snapshot-store/test_materialize.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/message-snapshot-store/test_quoted_attachment.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/message-snapshot-store/test_whatsapp_capture.py
+```
+
+Live verification requires two group messages after restart: an ordinary
+unmentioned message must create a WhatsApp snapshot without an agent turn; a
+later mention must trigger one turn whose durable context includes the passive
+message. A media test must report `archive_status=archived` and remain
+restorable after the Baileys cache file is unavailable.
+
+### Rollback
+
+Disable `message-snapshot-store` to stop new snapshots and retrieval tools; the
+existing database/archive remains untouched. Disable
+`whatsapp-bridge-policy-hotfix` to restore upstream policy handling. Correctly
+configured `platforms.whatsapp.require_mention` continues to work without the
+fallback. Delete `$HERMES_HOME/message-snapshots` only as a separate intentional
+data-destruction action.
+
+## 2026-08-04 — Hermes 0.20 persistent-plugin compatibility verification
+
+### Scope
+
+Upgraded the live macOS Hermes installation from 0.19.0 to 0.20.0 and checked
+the repository and installed copies of both persistent compatibility layers:
+
+- `qqbot-connect-hotfix` 1.6.1
+- `codex-app-server-phase-hotfix` 1.4.0
+
+Hermes 0.20 retains the QQ adapter approval and reconnect call shapes, and the
+Codex app-server request-handler call shape, that these wrappers depend on.
+The upgrade also updated CUA Driver from 0.9.0 to 0.17.0.
+
+### Result
+
+No plugin code change or version bump was required. Both regression suites
+passed against the repository copies and again against the copies installed in
+`~/.hermes/plugins`. After reinstalling the persistent plugins and restarting
+the LaunchAgent, the Gateway loaded both patches, connected QQ, sent Identify,
+and reached `Ready`. The new startup interval contained no `TypeError`,
+`unexpected keyword`, approval fallback, or traceback.
+
+### Enable and upgrade
+
+```bash
+hermes gateway stop
+hermes update --yes
+scripts/install-plugins.sh "$HOME/.hermes" \
+  qqbot-connect-hotfix codex-app-server-phase-hotfix
+hermes gateway start
+```
+
+### Verification
+
+```bash
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/qqbot-connect-hotfix/test_hotfix.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/codex-app-server-phase-hotfix/test_hotfix.py
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  "$HOME/.hermes/plugins/qqbot-connect-hotfix/test_hotfix.py"
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  "$HOME/.hermes/plugins/codex-app-server-phase-hotfix/test_hotfix.py"
+```
+
+Also confirm the current-version banner, the LaunchAgent state, both plugin
+startup summaries, and QQ's `Ready` event in `~/.hermes/logs/agent.log`.
+
+### Rollback
+
+Stop the Gateway, restore the pre-upgrade Hermes checkout or backup, reinstall
+that release's dependencies, reinstall the persistent plugins, and start the
+Gateway. To isolate a plugin regression without downgrading Hermes, disable the
+affected plugin in `~/.hermes/config.yaml`, restart, and then re-enable it after
+diagnosis. This verification changed no plugin code, so there is no repository
+code rollback for the 0.20 compatibility check.
+
 ## 2026-07-27 — Hermes 0.19 approval signature compatibility
 
 ### Problem

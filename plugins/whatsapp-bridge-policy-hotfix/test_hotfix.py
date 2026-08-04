@@ -47,6 +47,47 @@ def test_bridge_patch_bypasses_dm_allowlist_for_groups():
     assert patched_bridge_source(patched) == patched
 
 
+def test_bridge_patch_supports_hermes_020_policy_gate():
+    from whatsapp_bridge_policy_hotfix_test.bridge_runtime import (
+        PATCH_MARKER,
+        patched_bridge_source,
+    )
+
+    source = (
+        "if (!msg.key.fromMe) {\n"
+        "        if (WHATSAPP_DM_POLICY !== 'pairing' && "
+        "!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {\n"
+        "          continue;\n"
+        "        }\n"
+        "}\n"
+    )
+
+    patched = patched_bridge_source(source)
+
+    assert PATCH_MARKER in patched
+    assert "if (!isGroup && WHATSAPP_DM_POLICY !== 'pairing'" in patched
+    assert patched_bridge_source(patched) == patched
+
+
+def test_runtime_paths_default_below_plugin_and_hermes_home():
+    from whatsapp_bridge_policy_hotfix_test.bridge_runtime import (
+        resolve_data_bridge_dir,
+        resolve_runtime_bridge_dir,
+    )
+
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        plugin_dir = root / "plugins" / "whatsapp-bridge-policy-hotfix"
+        hermes_home = root / "hermes-home"
+
+        assert resolve_runtime_bridge_dir(plugin_dir) == (
+            plugin_dir / "runtime" / "whatsapp-bridge"
+        )
+        assert resolve_data_bridge_dir(hermes_home) == (
+            hermes_home / "scripts" / "whatsapp-bridge"
+        )
+
+
 def test_adapter_env_allowlists_are_scope_separated():
     from whatsapp_bridge_policy_hotfix_test.adapter_patch import (
         _env_backed_allowlist,
@@ -85,6 +126,30 @@ def test_adapter_env_allowlists_are_scope_separated():
             os.environ.pop("WHATSAPP_GROUP_ALLOWED_USERS", None)
         else:
             os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = old_group
+
+
+def test_registry_factory_redirects_lazy_platform_adapter():
+    from whatsapp_bridge_policy_hotfix_test.adapter_patch import (
+        _patch_registry_entry,
+    )
+
+    class Adapter:
+        def __init__(self):
+            self._allow_from = set()
+            self._group_allow_from = set()
+            self._bridge_script = "native/bridge.js"
+
+        @staticmethod
+        def _coerce_allow_list(raw):
+            return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    entry = SimpleNamespace(adapter_factory=lambda config: Adapter())
+    runtime_bridge = Path("/portable/plugin/runtime/whatsapp-bridge/bridge.js")
+
+    assert _patch_registry_entry(entry, runtime_bridge) is True
+    adapter = entry.adapter_factory(SimpleNamespace())
+    assert adapter._bridge_script == str(runtime_bridge)
+    assert _patch_registry_entry(entry, runtime_bridge) is False
 
 
 def test_runtime_install_patches_data_bridge_path():
@@ -163,14 +228,52 @@ def test_dashboard_env_metadata_includes_require_mention():
     assert meta["password"] is False
 
 
+def test_display_require_mention_compat_fallback():
+    from whatsapp_bridge_policy_hotfix_test.adapter_patch import (
+        apply_require_mention_compat,
+    )
+
+    old = os.environ.pop("WHATSAPP_REQUIRE_MENTION", None)
+    try:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "display:\n"
+                "  platforms:\n"
+                "    whatsapp:\n"
+                "      require_mention: true\n",
+                encoding="utf-8",
+            )
+            adapter = SimpleNamespace(config=SimpleNamespace(extra={}))
+            assert apply_require_mention_compat(adapter, config_path) is True
+            assert adapter.config.extra["require_mention"] is True
+
+            authoritative = SimpleNamespace(
+                config=SimpleNamespace(extra={"require_mention": False})
+            )
+            assert apply_require_mention_compat(authoritative, config_path) is False
+            assert authoritative.config.extra["require_mention"] is False
+    finally:
+        if old is not None:
+            os.environ["WHATSAPP_REQUIRE_MENTION"] = old
+
+
 if __name__ == "__main__":
     test_bridge_patch_bypasses_dm_allowlist_for_groups()
+    test_bridge_patch_supports_hermes_020_policy_gate()
+    test_runtime_paths_default_below_plugin_and_hermes_home()
     test_adapter_env_allowlists_are_scope_separated()
+    test_registry_factory_redirects_lazy_platform_adapter()
     test_runtime_install_patches_data_bridge_path()
     test_slash_admin_envs_are_scoped()
     test_dashboard_env_metadata_includes_require_mention()
+    test_display_require_mention_compat_fallback()
     print("bridge_group_dm_allowlist_bypass=ok")
+    print("bridge_hermes_020_policy_gate=ok")
+    print("portable_runtime_paths=ok")
     print("adapter_env_scope_split=ok")
+    print("lazy_platform_factory_redirect=ok")
     print("runtime_data_bridge_patch=ok")
     print("slash_admin_env_scope=ok")
     print("dashboard_require_mention_metadata=ok")
+    print("display_require_mention_compat=ok")

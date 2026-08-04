@@ -287,6 +287,22 @@ class SnapshotStore:
 
     @staticmethod
     def _raw_parts(platform: str, event_type: str, raw: dict[str, Any]) -> dict[str, str]:
+        if platform == "whatsapp":
+            content = str(raw.get("body") or "")
+            attachments = list(_iter_raw_attachments(raw))
+            return {
+                "platform": platform,
+                "event_type": event_type,
+                "message_id": str(raw.get("messageId") or raw.get("id") or ""),
+                "chat_id": str(raw.get("chatId") or ""),
+                "chat_type": "group" if raw.get("isGroup") else "dm",
+                "sender_id": str(raw.get("senderId") or ""),
+                "sender_name": str(raw.get("senderName") or ""),
+                "content": content,
+                "message_kind": _message_kind(content, attachments),
+                "reply_to_message_id": str(raw.get("quotedMessageId") or ""),
+                "occurred_at": str(raw.get("timestamp") or ""),
+            }
         author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
         message_id = str(raw.get("id") or raw.get("message_id") or "")
         chat_id = str(
@@ -396,7 +412,12 @@ class SnapshotStore:
                 (snapshot_id, event_type, now, raw_json, raw_sha),
             )
             self._replace_values(conn, snapshot_id, payload)
-            self._upsert_raw_attachments(conn, snapshot_id, payload)
+            self._upsert_raw_attachments(
+                conn,
+                snapshot_id,
+                payload,
+                force_mirror=platform == "whatsapp",
+            )
             self._refresh_fts(conn, snapshot_id)
             conn.commit()
         return snapshot_id
@@ -483,6 +504,7 @@ class SnapshotStore:
                     ordinal=ordinal,
                     local_path=str(local_path),
                     content_type=str(media_type),
+                    force_mirror=platform == "whatsapp",
                 )
             for kind, display_name, local_path in _iter_embedded_local_paths(
                 str(getattr(event, "text", "") or "")
@@ -501,6 +523,7 @@ class SnapshotStore:
                     ordinal=ordinal,
                     local_path=local_path,
                     content_type="",
+                    force_mirror=platform == "whatsapp",
                 )
             self._refresh_fts(conn, snapshot_id)
             conn.commit()
@@ -544,20 +567,29 @@ class SnapshotStore:
             rows,
         )
 
-    def _upsert_raw_attachments(self, conn: sqlite3.Connection, snapshot_id: int, raw: Any) -> None:
+    def _upsert_raw_attachments(
+        self,
+        conn: sqlite3.Connection,
+        snapshot_id: int,
+        raw: Any,
+        *,
+        force_mirror: bool = False,
+    ) -> None:
         for ordinal, attachment in enumerate(_iter_raw_attachments(raw)):
+            local_path = str(attachment.get("local_path") or "")
             conn.execute(
                 """
                 INSERT INTO attachments(
                     message_snapshot_id, ordinal, content_type, filename,
-                    remote_url, remote_id, declared_size, raw_json
-                ) VALUES(?,?,?,?,?,?,?,?)
+                    remote_url, remote_id, declared_size, local_path, raw_json
+                ) VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(message_snapshot_id, ordinal) DO UPDATE SET
                     content_type=CASE WHEN excluded.content_type<>'' THEN excluded.content_type ELSE attachments.content_type END,
                     filename=CASE WHEN excluded.filename<>'' THEN excluded.filename ELSE attachments.filename END,
                     remote_url=CASE WHEN excluded.remote_url<>'' THEN excluded.remote_url ELSE attachments.remote_url END,
                     remote_id=CASE WHEN excluded.remote_id<>'' THEN excluded.remote_id ELSE attachments.remote_id END,
                     declared_size=COALESCE(excluded.declared_size, attachments.declared_size),
+                    local_path=CASE WHEN excluded.local_path<>'' THEN excluded.local_path ELSE attachments.local_path END,
                     raw_json=excluded.raw_json
                 """,
                 (
@@ -568,9 +600,19 @@ class SnapshotStore:
                     _normalized_url(str(attachment.get("url") or "")),
                     str(attachment.get("id") or attachment.get("file_id") or ""),
                     _optional_int(attachment.get("size") or attachment.get("file_size")),
+                    local_path,
                     canonical_json(attachment),
                 ),
             )
+            if local_path:
+                self._archive_local_attachment(
+                    conn,
+                    snapshot_id=snapshot_id,
+                    ordinal=ordinal,
+                    local_path=local_path,
+                    content_type=str(attachment.get("content_type") or ""),
+                    force_mirror=force_mirror,
+                )
 
     def _archive_local_attachment(
         self,
@@ -580,16 +622,16 @@ class SnapshotStore:
         ordinal: int,
         local_path: str,
         content_type: str,
+        force_mirror: bool = False,
     ) -> None:
         path = Path(local_path)
         if not path.is_file():
             return
-        data = path.read_bytes()
-        sha = hashlib.sha256(data).hexdigest()
+        sha, byte_size = _hash_file(path)
         archive_path = ""
         archive_status = "cached"
-        if self.config.media_storage == "mirror":
-            stored_path, sha = self._write_blob(data, content_type, path.name)
+        if force_mirror or self.config.media_storage == "mirror":
+            stored_path = self._write_file_blob(path, content_type, path.name, sha)
             archive_path = str(stored_path)
             archive_status = "archived"
         conn.execute(
@@ -615,7 +657,7 @@ class SnapshotStore:
                 str(path),
                 archive_path,
                 sha,
-                len(data),
+                byte_size,
                 archive_status,
             ),
         )
@@ -674,14 +716,9 @@ class SnapshotStore:
 
     def _write_blob(self, data: bytes, content_type: str, filename: str) -> tuple[Path, str]:
         sha = hashlib.sha256(data).hexdigest()
-        ext = Path(filename).suffix.lower()
-        if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
-            ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip()) or ""
-        target_dir = self.config.media_dir / sha[:2] / sha[2:4]
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{sha}{ext}"
+        target = self._blob_target(sha, content_type, filename)
         if not target.exists():
-            fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", dir=target_dir)
+            fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", dir=target.parent)
             try:
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
@@ -693,6 +730,38 @@ class SnapshotStore:
                 if os.path.exists(tmp_name):
                     os.unlink(tmp_name)
         return target, sha
+
+    def _write_file_blob(
+        self,
+        source: Path,
+        content_type: str,
+        filename: str,
+        sha: str,
+    ) -> Path:
+        """Mirror a Baileys cache file without loading the whole file in RAM."""
+        target = self._blob_target(sha, content_type, filename)
+        if target.exists():
+            return target
+        fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", dir=target.parent)
+        try:
+            with source.open("rb") as reader, os.fdopen(fd, "wb") as writer:
+                shutil.copyfileobj(reader, writer, length=1024 * 1024)
+                writer.flush()
+                os.fsync(writer.fileno())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, target)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        return target
+
+    def _blob_target(self, sha: str, content_type: str, filename: str) -> Path:
+        ext = Path(filename).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+            ext = mimetypes.guess_extension(content_type.split(";", 1)[0].strip()) or ""
+        target_dir = self.config.media_dir / sha[:2] / sha[2:4]
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir / f"{sha}{ext}"
 
     def _refresh_fts(self, conn: sqlite3.Connection, snapshot_id: int) -> None:
         if not self._has_fts(conn):
@@ -1088,6 +1157,45 @@ def _iter_raw_attachments(raw: Any) -> Iterable[dict[str, Any]]:
             for element in elements:
                 if isinstance(element, dict):
                     yield from _iter_raw_attachments(element)
+        media_urls = raw.get("mediaUrls")
+        if isinstance(media_urls, list):
+            for index, value in enumerate(media_urls):
+                media_ref = str(value or "")
+                if not media_ref:
+                    continue
+                is_remote = media_ref.startswith(("http://", "https://", "//"))
+                filename = str(raw.get("fileName") or "")
+                if not filename and not is_remote:
+                    filename = Path(media_ref).name
+                yield {
+                    "id": str(raw.get("messageId") or ""),
+                    "content_type": str(raw.get("mime") or raw.get("mediaType") or ""),
+                    "filename": filename,
+                    "url": media_ref if is_remote else "",
+                    "local_path": "" if is_remote else media_ref,
+                    "media_index": index,
+                    "baileys_native_type": str(raw.get("nativeType") or ""),
+                }
+        if raw.get("hasMedia") and not media_urls:
+            # Preserve the fact that Baileys observed media even when its CDN
+            # download/reupload retry failed and no decrypted cache path exists.
+            yield {
+                "id": str(raw.get("messageId") or ""),
+                "content_type": str(raw.get("mime") or raw.get("mediaType") or ""),
+                "filename": str(raw.get("fileName") or ""),
+                "baileys_native_type": str(raw.get("nativeType") or ""),
+                "download_status": "unavailable_at_capture",
+            }
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    byte_size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            byte_size += len(chunk)
+    return digest.hexdigest(), byte_size
 
 
 def _iter_embedded_local_paths(text: str) -> Iterable[tuple[str, str, str]]:

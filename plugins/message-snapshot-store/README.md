@@ -1,8 +1,9 @@
 # Message Snapshot Store
 
-Persistent, queryable message snapshots for Hermes gateways. The plugin is
-separate from Hermes session transcripts: ordinary QQ group context is bounded,
-while the snapshot database remains available until the operator deletes it.
+Persistent, queryable QQ and WhatsApp message snapshots for Hermes gateways.
+The plugin is separate from Hermes session transcripts: ordinary group context
+is bounded, while the snapshot database remains available until the operator
+deletes it.
 
 ## Why this plugin exists
 
@@ -17,6 +18,26 @@ order, and later enriches the same logical row when a normalized `MessageEvent`
 is available. Repeated observation by nested wrappers is deduplicated by event
 type and canonical payload hash. It does not modify files inside the Hermes
 installation.
+
+For WhatsApp, the plugin wraps Hermes' deferred `WhatsAppAdapter` factory and
+captures each normalized Baileys `messages.upsert` bridge event before
+`_build_message_event` applies the mention-response gate. An unmentioned group
+message is therefore snapshotted but does not trigger the agent. If a later
+message mentions or replies to the bot, the same bounded durable context is
+available to that turn.
+
+Baileys emits `proto.IWebMessageInfo` updates and Hermes' Node bridge decrypts
+media with `downloadMediaMessage()` before the Python adapter sees it. The
+bridge event contains a local decrypted cache path rather than a durable
+plaintext CDN URL. The plugin therefore mirrors WhatsApp media immediately into
+the content-addressed archive, using streaming SHA-256/copy operations so a
+large video is not loaded into Python memory a second time.
+
+References:
+
+- <https://baileys.wiki/docs/socket/receiving-updates/>
+- <https://baileys.wiki/docs/socket/handling-messages/>
+- <https://baileys.wiki/docs/api/functions/downloadMediaMessage/>
 
 ### QQ official group-event boundary
 
@@ -49,8 +70,9 @@ The SQLite database contains:
 - `messages`: one canonical logical message per platform/chat/message ID;
 - `raw_events`: immutable transport payload snapshots, including duplicate
   event forms for the same logical message;
-- `attachments`: per-file QQ URL, remote ID, filename, MIME type, declared
-  size, cache/archive state, and SHA-256 when bytes have been observed;
+- `attachments`: per-file QQ URL or WhatsApp decrypted cache/archive path,
+  remote ID, filename, MIME type, declared size, cache/archive state, and
+  SHA-256 when bytes have been observed;
 - `message_values`: flattened raw JSON scalar paths and values for exact
   indexed lookup;
 - `message_fts`: FTS5 text index used for BM25 retrieval. Signed URLs and
@@ -92,6 +114,12 @@ Link storage has important limits:
 - signed URLs are sensitive and the database must not be shared casually;
 - URLs are not fetched during search or context construction.
 
+`link` applies to QQ. WhatsApp media is always mirrored at capture time because
+Baileys' decrypted local file is the only reliable plaintext artifact exposed
+by the current Hermes bridge. If Baileys reports media but download/reupload
+recovery fails, the snapshot still records an unavailable attachment marker;
+it cannot fabricate a durable link or restore bytes that were never decrypted.
+
 For offline permanence, set `MESSAGE_SNAPSHOT_MEDIA_STORAGE=mirror`. This
 downloads each observed attachment immediately. Mirrored bytes are deduplicated
 by SHA-256 under `media/<sha-prefix>/<sha256>.<ext>`, but large videos and files
@@ -99,8 +127,11 @@ will still consume real storage.
 
 ## Recent context
 
-QQ group events visible to the bot receive a database-backed context block. It
-includes unmentioned traffic only for groups whose owner enabled **获取全部群消息**.
+QQ and WhatsApp group events visible to the bot receive a database-backed
+context block. QQ includes unmentioned traffic only for groups whose owner
+enabled **获取全部群消息**. WhatsApp includes all group traffic admitted by the
+Baileys bridge, while `WHATSAPP_REQUIRE_MENTION=true` independently controls
+whether a particular message triggers the agent.
 Defaults:
 
 ```text
@@ -153,15 +184,18 @@ The agent also receives these tools by default:
 - `message_snapshot_get`
 - `message_snapshot_restore`
 
-`restore` is the explicit human reminder/action that may cause linked media to
-be downloaded and pinned locally.
+`restore` is the explicit human reminder/action that may cause linked QQ media
+to be downloaded and pinned locally. WhatsApp media is already pinned during
+capture and restore creates a readable hard-link/copy plus a manifest.
 
 ## Install and rollback
 
-Enable both plugins. Capture is independent of their runtime load order:
+Enable the snapshot plugin plus the connector compatibility plugins in use.
+Capture is independent of runtime load order:
 
 ```bash
 hermes plugins enable qqbot-connect-hotfix
+hermes plugins enable whatsapp-bridge-policy-hotfix
 hermes plugins enable message-snapshot-store
 hermes gateway restart
 ```
@@ -183,4 +217,5 @@ python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py
 python plugins/message-snapshot-store/test_materialize.py
 python plugins/message-snapshot-store/test_quoted_attachment.py
+python plugins/message-snapshot-store/test_whatsapp_capture.py
 ```

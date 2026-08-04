@@ -1,4 +1,4 @@
-"""QQ raw-event capture and durable recent-context injection."""
+"""QQ/WhatsApp raw capture and durable recent-context injection."""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ from .store import SnapshotStore, canonical_json
 logger = logging.getLogger(__name__)
 
 _active_qq_adapter: Any = None
+_active_whatsapp_adapter: Any = None
 _RAW_CAPTURE_CACHE_SIZE = 2048
+_WHATSAPP_BUILD_PATCH = "_message_snapshot_whatsapp_build_wrapped"
+_WHATSAPP_HANDLE_PATCH = "_message_snapshot_whatsapp_context_wrapped"
+_WHATSAPP_FACTORY_PATCH = "_message_snapshot_whatsapp_factory_wrapped"
 
 
 def _profile_name() -> str:
@@ -122,6 +126,119 @@ def patch_qq_snapshot_capture(QQAdapter, store: SnapshotStore) -> None:
     logger.info("message-snapshot-store: patched QQ raw capture and durable context")
 
 
+def patch_whatsapp_snapshot_capture(WhatsAppAdapter, store: SnapshotStore) -> bool:
+    """Capture Baileys bridge events before Hermes' mention-response gate.
+
+    The Node bridge has already decrypted/downloaded media by this seam.  Raw
+    capture therefore sees every policy-admitted group event, including an
+    unmentioned event that ``_build_message_event`` subsequently rejects.
+    """
+    patched = False
+    current_build = WhatsAppAdapter._build_message_event
+    if not getattr(current_build, _WHATSAPP_BUILD_PATCH, False):
+
+        async def _build_message_event(self, data):
+            global _active_whatsapp_adapter
+            _active_whatsapp_adapter = self
+            try:
+                await asyncio.to_thread(
+                    store.record_raw,
+                    profile=_profile_name(),
+                    platform="whatsapp",
+                    event_type="messages.upsert",
+                    raw=data,
+                )
+            except Exception:
+                logger.exception("message-snapshot-store: raw WhatsApp snapshot failed")
+            return await current_build(self, data)
+
+        _build_message_event.__name__ = getattr(current_build, "__name__", "_build_message_event")
+        _build_message_event.__qualname__ = getattr(
+            current_build, "__qualname__", "WhatsAppAdapter._build_message_event"
+        )
+        setattr(_build_message_event, _WHATSAPP_BUILD_PATCH, True)
+        WhatsAppAdapter._build_message_event = _build_message_event
+        patched = True
+
+    current_handle = WhatsAppAdapter.handle_message
+    if not getattr(current_handle, _WHATSAPP_HANDLE_PATCH, False):
+
+        async def handle_message(self, event) -> None:
+            try:
+                snapshot_id = await asyncio.to_thread(
+                    store.record_normalized,
+                    event,
+                    _profile_name(),
+                )
+                source = getattr(event, "source", None)
+                if str(getattr(source, "chat_type", "") or "") == "group":
+                    context = await asyncio.to_thread(
+                        store.recent_context,
+                        platform="whatsapp",
+                        chat_id=str(getattr(source, "chat_id", "") or ""),
+                        exclude_snapshot_id=snapshot_id,
+                    )
+                    if context:
+                        event.channel_context = context
+            except Exception:
+                logger.exception("message-snapshot-store: normalized WhatsApp snapshot failed")
+            return await current_handle(self, event)
+
+        handle_message.__name__ = getattr(current_handle, "__name__", "handle_message")
+        handle_message.__qualname__ = getattr(
+            current_handle, "__qualname__", "WhatsAppAdapter.handle_message"
+        )
+        setattr(handle_message, _WHATSAPP_HANDLE_PATCH, True)
+        WhatsAppAdapter.handle_message = handle_message
+        patched = True
+
+    if patched:
+        logger.info(
+            "message-snapshot-store: patched WhatsApp pre-mention capture and durable context"
+        )
+    return patched
+
+
+def patch_whatsapp_snapshot_factory(store: SnapshotStore) -> bool:
+    """Patch Hermes 0.20's deferred WhatsApp factory and known module aliases."""
+    patched = False
+    try:
+        from gateway.platform_registry import platform_registry
+
+        entry = platform_registry.get("whatsapp")
+    except ImportError:
+        entry = None
+    if entry is not None:
+        original_factory = entry.adapter_factory
+        if not getattr(original_factory, _WHATSAPP_FACTORY_PATCH, False):
+
+            def adapter_factory(config):
+                adapter = original_factory(config)
+                patch_whatsapp_snapshot_capture(type(adapter), store)
+                return adapter
+
+            setattr(adapter_factory, _WHATSAPP_FACTORY_PATCH, True)
+            entry.adapter_factory = adapter_factory
+        # The registry entry is authoritative on Hermes 0.20. Patching module
+        # aliases as well can import the same file under multiple names and
+        # wrap duplicate class objects; the factory will patch the live class
+        # exactly once when the adapter is constructed.
+        return True
+
+    for module_name in (
+        "hermes_plugins.whatsapp_platform.adapter",
+        "plugins.platforms.whatsapp.adapter",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["WhatsAppAdapter"])
+        except ImportError:
+            continue
+        adapter_class = getattr(module, "WhatsAppAdapter", None)
+        if adapter_class is not None:
+            patched = patch_whatsapp_snapshot_capture(adapter_class, store) or patched
+    return patched
+
+
 def _raw_capture_key(event_type: str, raw: Any) -> tuple[str, str]:
     payload = raw if isinstance(raw, dict) else {"value": raw}
     raw_sha = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
@@ -133,7 +250,8 @@ async def materialize_snapshot(store: SnapshotStore, identifier: str | int) -> d
     snapshot = await asyncio.to_thread(store.get_snapshot, identifier)
     if not snapshot:
         return None
-    adapter = _active_qq_adapter
+    platform = str(snapshot.get("platform") or "")
+    adapter = _active_qq_adapter if platform == "qqbot" else _active_whatsapp_adapter
     errors: list[dict[str, Any]] = []
     for attachment in snapshot.get("attachments", []):
         ordinal = int(attachment.get("ordinal") or 0)
@@ -158,6 +276,15 @@ async def materialize_snapshot(store: SnapshotStore, identifier: str | int) -> d
 
         url = str(attachment.get("remote_url") or "")
         client = getattr(adapter, "_http_client", None) if adapter is not None else None
+        if platform == "whatsapp":
+            errors.append(
+                {
+                    "ordinal": ordinal,
+                    "stage": "baileys-media",
+                    "error": "decrypted media was unavailable at capture time and WhatsApp exposes no durable plaintext URL",
+                }
+            )
+            continue
         if not url or client is None:
             errors.append(
                 {

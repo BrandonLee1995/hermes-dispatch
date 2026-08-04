@@ -24,9 +24,11 @@ Restart Hermes gateway after enabling or updating plugins.
 
 ## Permanent Message Snapshots
 
-`message-snapshot-store` 1.0.1 registers an explicit raw-event hook that
+`message-snapshot-store` 1.1.0 registers an explicit raw-event hook that
 `qqbot-connect-hotfix` 1.5.3 invokes before suppressing passive group routing.
-It therefore captures raw QQ events regardless of plugin load order into:
+It also wraps Hermes 0.20's deferred WhatsApp adapter and captures the
+normalized Baileys bridge event before the mention-response gate. It therefore
+captures raw QQ and WhatsApp events regardless of plugin load order into:
 
 ```text
 $HERMES_HOME/message-snapshots/snapshots.sqlite3
@@ -57,6 +59,13 @@ metadata without copying bytes. `/message-snapshot restore <id>` explicitly down
 and pins an attachment when the current QQ credentials can still access its
 URL. Set `MESSAGE_SNAPSHOT_MEDIA_STORAGE=mirror` only when offline permanence
 is worth the storage cost.
+
+WhatsApp is different: Baileys decrypts inbound media into a local cache file,
+and the current Hermes bridge does not expose a durable plaintext CDN URL.
+WhatsApp media is therefore always streamed into the SHA-256 archive at capture
+time, even when QQ remains in `link` mode. If Baileys cannot download media,
+the database records an unavailable attachment marker but cannot restore bytes
+that never reached the bridge.
 
 Recent group context defaults to 20 messages and approximately 4000 tokens:
 
@@ -139,6 +148,18 @@ Use:
 WHATSAPP_REQUIRE_MENTION=true
 ```
 
+The canonical YAML equivalent is:
+
+```yaml
+platforms:
+  whatsapp:
+    require_mention: true
+```
+
+`display.platforms.whatsapp.require_mention` is not an adapter routing setting.
+Hotfix 0.2.2 accepts that Hermes 0.20 Dashboard placement only as a fallback;
+new deployments should use the canonical key or environment variable.
+
 When enabled, group messages are processed only if one of these is true:
 
 - the message mentions the bot
@@ -182,6 +203,7 @@ python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py
 python plugins/message-snapshot-store/test_materialize.py
 python plugins/message-snapshot-store/test_quoted_attachment.py
+python plugins/message-snapshot-store/test_whatsapp_capture.py
 python plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
 ```
 

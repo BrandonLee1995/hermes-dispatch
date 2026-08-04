@@ -1,5 +1,5 @@
 name: whatsapp-bridge-policy-hotfix
-version: 0.1.0
+version: 0.2.2
 description: "Local hotfix: make WhatsApp bridge group access follow group_policy/group_allow_from instead of DM allowlist, and expose group/admin controls for dashboard configuration. Remove after upstream Hermes includes equivalent behavior."
 author: local
 kind: standalone
@@ -42,5 +42,20 @@ optional_env:
   - name: WHATSAPP_GROUP_USER_ALLOWED_COMMANDS
     description: "Comma-separated slash commands non-admin WhatsApp group users may run"
     prompt: "WhatsApp group user commands"
+    password: false
+    category: messaging
+  - name: WHATSAPP_BRIDGE_HOTFIX_SOURCE_DIR
+    description: "Optional source WhatsApp bridge directory override; normally auto-discovered from the active Hermes install"
+    prompt: "WhatsApp hotfix source bridge directory"
+    password: false
+    category: messaging
+  - name: WHATSAPP_BRIDGE_HOTFIX_RUNTIME_DIR
+    description: "Optional patched runtime directory override; defaults below the installed hotfix plugin"
+    prompt: "WhatsApp hotfix runtime directory"
+    password: false
+    category: messaging
+  - name: WHATSAPP_BRIDGE_HOTFIX_DATA_BRIDGE_DIR
+    description: "Optional writable Hermes data bridge directory override"
+    prompt: "WhatsApp hotfix data bridge directory"
     password: false
     category: messaging

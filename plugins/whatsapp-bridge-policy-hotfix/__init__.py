@@ -17,6 +17,10 @@ def register(ctx) -> None:
     runtime_bridge = None
     try:
         runtime_bridge = install_runtime_bridge()
+        logger.info(
+            "whatsapp-bridge-policy-hotfix: runtime bridge installed: %s",
+            runtime_bridge,
+        )
     except BridgePatchError as exc:
         logger.warning(
             "whatsapp-bridge-policy-hotfix: bridge runtime not installed: %s",
@@ -25,6 +29,11 @@ def register(ctx) -> None:
 
     try:
         patch_whatsapp_adapter(runtime_bridge)
+        if runtime_bridge is not None:
+            logger.info(
+                "whatsapp-bridge-policy-hotfix: adapter factory redirected to: %s",
+                runtime_bridge,
+            )
     except ImportError as exc:
         logger.warning(
             "whatsapp-bridge-policy-hotfix: could not import WhatsAppAdapter: %s",

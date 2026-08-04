@@ -87,6 +87,13 @@ WHATSAPP_REQUIRE_MENTION=true
 group policy. With `WHATSAPP_DM_POLICY=allowlist`, private chats still require
 `WHATSAPP_ALLOWED_USERS`.
 
+`message-snapshot-store` hooks the Python side of the Baileys bridge before the
+mention-response decision. Passive group events are persisted but cannot wake
+the agent. Because the bridge has already used Baileys `downloadMediaMessage()`
+to decrypt media into local cache paths, WhatsApp attachments are streamed into
+the content-addressed archive immediately; QQ can continue to use signed-link
+metadata until explicit restore.
+
 ## MCP Area
 
 `mcp/http-gateway` exposes Hermes MCP over streamable HTTP with bearer-token
