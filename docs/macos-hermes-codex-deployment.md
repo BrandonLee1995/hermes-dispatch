@@ -134,6 +134,7 @@ hermes config set display.platforms.qqbot.tool_progress false
 
 hermes config set group_sessions_per_user false
 hermes config set session_reset.mode none
+hermes config set approvals.mode smart
 hermes config set approvals.mcp_reload_confirm false
 
 hermes config set platforms.qqbot.enabled true
@@ -154,8 +155,25 @@ hermes config check
 - WhatsApp 的 mention 路由必须写在 `platforms.whatsapp.require_mention`；不要写到
   `display.platforms.whatsapp`。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
+- `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
+  请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
 - 标量使用 `hermes config set`。工具集列表使用第 7 节的 `hermes tools enable`，不要把
   JSON 字符串写进 `platform_toolsets`。
+
+审批历史积累后，可生成命令 allowlist 建议。默认只展示建议，不写入配置：
+
+```bash
+hermes approvals suggest
+```
+
+人工审核编号后，再选择性应用，例如：
+
+```bash
+hermes approvals suggest --apply 1,2
+```
+
+`suggest` 是 `hermes approvals` 的子命令，不是 `approvals.mode` 的取值；破坏性命令
+不会被加入建议列表。
 
 ## 6. 配置 `.env`
 
@@ -172,9 +190,9 @@ nano "$(hermes config env-path)"
 # QQ
 QQ_APP_ID=<当前部门QQ机器人AppID>
 QQ_CLIENT_SECRET=<当前部门QQ机器人密钥>
-QQ_ALLOWED_USERS=<允许私聊的用户ID，逗号分隔>
+QQ_ALLOWED_USERS=
 QQ_GROUP_ALLOWED_USERS=*
-QQ_ALLOW_ALL_USERS=false
+QQ_ALLOW_ALL_USERS=true
 QQBOT_GROUP_RECEIVE_MODE=all
 QQBOT_GROUP_MESSAGE_CREATE_MODE=mention
 QQBOT_GROUP_CONTEXT_MESSAGES=20
@@ -204,6 +222,8 @@ chmod 600 "$(hermes config env-path)"
 说明：
 
 - `QQ_GROUP_ALLOWED_USERS=*` 是 QQ 群聊启用的关键本地设置。
+- `QQ_ALLOW_ALL_USERS=true` 与空的 `QQ_ALLOWED_USERS` 表示不再使用 QQ 私聊用户白名单；
+  机器人可接收所有 QQ 用户的私聊消息。
 - QQ 群主还必须在群机器人设置中开启“获取全部群消息”。未送达 Gateway 的消息无法
   被任何 hotfix 或数据库捕获。
 - `QQBOT_GROUP_MESSAGE_CREATE_MODE=mention` 表示未 mention 消息只进入上下文和快照，
