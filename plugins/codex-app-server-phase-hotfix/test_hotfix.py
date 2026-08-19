@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -43,6 +44,106 @@ def completed(text: str, phase=None):
 
 
 def main():
+    # Long turns: 0 means no Codex wall-clock deadline. The wrapper keeps all
+    # completion and callback state on the individual session/call.
+    assert math.isinf(mod.long_turn.configured_turn_timeout("0"))
+    assert math.isinf(mod.long_turn.configured_turn_timeout("invalid"))
+    assert mod.long_turn.configured_turn_timeout("7200") == 7200
+
+    class TurnResult:
+        def __init__(self, text):
+            self.final_text = text
+            self.turn_id = f"turn-{text}"
+            self.interrupted = False
+            self.error = None
+            self.should_retire = False
+
+    concurrent_barrier = threading.Barrier(2)
+
+    def isolated_original(
+        session,
+        user_input,
+        *,
+        turn_timeout,
+        notification_poll_timeout,
+        post_tool_quiet_timeout,
+    ):
+        session.received_timeout = turn_timeout
+        concurrent_barrier.wait(timeout=2)
+        session._on_event(
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": f"turn-{user_input}"}},
+            }
+        )
+        return TurnResult(user_input)
+
+    isolated_wrapper = mod.long_turn.wrap_session_run_turn(isolated_original)
+
+    class IsolatedSession:
+        def __init__(self, name):
+            self.name = name
+            self.events = []
+            self._on_event = self.events.append
+            self.interrupts = []
+
+        def _issue_interrupt(self, turn_id):
+            self.interrupts.append(turn_id)
+
+    sessions = [IsolatedSession("alpha"), IsolatedSession("beta")]
+    results = {}
+
+    def exercise(session, timeout):
+        results[session.name] = isolated_wrapper(
+            session,
+            session.name,
+            turn_timeout=timeout,
+        )
+
+    threads = [
+        threading.Thread(target=exercise, args=(sessions[0], 31)),
+        threading.Thread(target=exercise, args=(sessions[1], 47)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert sessions[0].received_timeout == 31
+    assert sessions[1].received_timeout == 47
+    assert results["alpha"].final_text == "alpha"
+    assert results["beta"].final_text == "beta"
+    assert "alpha" not in str(sessions[1].events)
+    assert "beta" not in str(sessions[0].events)
+    assert not sessions[0].interrupts and not sessions[1].interrupts
+
+    # If an operator deliberately restores a finite timeout, an assistant
+    # commentary item at the deadline must not be accepted as final success.
+    def deadline_original(
+        session,
+        user_input,
+        *,
+        turn_timeout,
+        notification_poll_timeout,
+        post_tool_quiet_timeout,
+    ):
+        time.sleep(turn_timeout)
+        return TurnResult("still working")
+
+    import time
+
+    deadline_session = IsolatedSession("deadline")
+    deadline_result = mod.long_turn.wrap_session_run_turn(deadline_original)(
+        deadline_session,
+        "work",
+        turn_timeout=0.03,
+        notification_poll_timeout=0.001,
+    )
+    assert deadline_result.interrupted is True
+    assert deadline_result.should_retire is True
+    assert "without turn/completed" in deadline_result.error
+    assert deadline_session.interrupts == ["turn-still working"]
+
     delegated = []
 
     def original_factory(_agent):
@@ -379,6 +480,11 @@ def main():
     assert "Computer Use elicitations patched" in approval_status
     assert "already patched" in approval_status_again
 
+    long_turn_status = mod.long_turn.patch_codex_app_server_turn_timeout()
+    long_turn_status_again = mod.long_turn.patch_codex_app_server_turn_timeout()
+    assert "patched Codex turn wall deadline" in long_turn_status
+    assert long_turn_status_again == "already patched"
+
     # Verify all four live session request methods after the class patch.
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
@@ -479,6 +585,9 @@ def main():
     print("permission_deny_empty_subset=true")
     print("computer_use_elicitation_bridge=true")
     print("unrelated_elicitation_delegated=true")
+    print("long_turn_unlimited=true")
+    print("long_turn_deadline_terminal_guard=true")
+    print("long_turn_session_isolation=true")
     print(f"install_status={status}")
 
 

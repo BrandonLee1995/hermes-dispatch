@@ -1,6 +1,6 @@
 # Codex App-Server Compatibility Hotfix
 
-Persistent Hermes plugin for four Hermes 0.18.2 Codex app-server integration
+Persistent Hermes plugin for five Hermes Codex app-server integration
 gaps:
 
 1. A completed Codex `final_answer` is also emitted through the gateway
@@ -19,6 +19,9 @@ gaps:
    accepts only `hermes-tools` elicitations and silently declines every other
    server, so CLI-hosted Computer Use reports `was not approved` without
    presenting the Gateway user with an approval request.
+5. Hermes 0.20.0 stops every Codex app-server turn at a fixed 600-second wall
+   deadline. If commentary already exists, it is incorrectly accepted as the
+   final answer while a foreground tool can remain alive.
 
 The plugin forwards explicit `commentary`, suppresses explicit `final_answer`,
 and defers unknown-phase messages until later turn activity proves they are
@@ -78,6 +81,44 @@ runtime never emit this elicitation and remain blocked.
 This behavior follows the current upstream [Codex app-server approval
 contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#approvals).
 
+## Long-turn deadline
+
+Version 1.5.0 makes the app-server turn deadline configurable. The default is
+unlimited, equivalent to:
+
+```dotenv
+HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS=0
+```
+
+A positive value restores a finite wall deadline in seconds. When that finite
+deadline is reached without `turn/completed`, the plugin interrupts and retires
+the Codex subprocess instead of delivering the latest commentary as success.
+This does not disable `/stop`, message interrupt/steer, subprocess-death checks,
+or Hermes' post-tool quiet watchdog.
+
+Hermes Gateway has a separate inactivity watchdog. For deliberately silent
+foreground work lasting more than 30 minutes, set it above the longest valid
+task, for example:
+
+```bash
+hermes config set agent.gateway_timeout 7200
+```
+
+Use a large finite inactivity timeout so genuinely wedged work is eventually
+released. Restart draining is a separate setting; on multi-session gateways,
+configure it explicitly instead of accepting Hermes 0.20.0's zero-second
+default:
+
+```bash
+hermes config set agent.restart_drain_timeout 300
+```
+
+Each Hermes conversation owns a separate `CodexAppServerSession`, Codex thread,
+callback wrapper, terminal flag, and deadline value. The plugin stores none of
+that per-turn state globally, so concurrent private chats/groups cannot complete
+or interrupt one another. A single fixed chat still serializes or interrupts
+new input according to `display.busy_input_mode`.
+
 Install under the Hermes data directory and enable it:
 
 ```bash
@@ -107,3 +148,5 @@ once upstream projects `imageGeneration` into a normal deliverable media result
 and handles media-only turns before its empty response return. Remove the
 approval bridge once Hermes passes Gateway approval callbacks into Codex, uses
 the current permission response schema, and forwards Computer Use elicitations.
+Remove the long-turn portion once upstream exposes a configurable/unlimited
+turn deadline and never promotes an unterminated assistant message to final.

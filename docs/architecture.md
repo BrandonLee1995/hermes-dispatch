@@ -18,6 +18,7 @@ delivery:
 - emoji-only group mentions
 - group context buffering and deterministic compaction
 - plain-text retry for markdown/body compatibility
+- one standalone text/keyboard retry when QQ explicitly expires a reply anchor
 - media send retry without incompatible captions
 - requester-bound approval buttons for shared group sessions
 
@@ -27,13 +28,21 @@ workarounds.
 ## Codex App-Server Area
 
 `plugins/codex-app-server-phase-hotfix` is the mounted compatibility boundary
-between Hermes' Codex runtime and Gateway adapters. It has four independent,
+between Hermes' Codex runtime and Gateway adapters. It has five independent,
 removable patches:
 
 - phase-aware interim/final message routing
 - `imageGeneration` projection into normal gateway media delivery
 - blocking approval routing through Hermes' existing per-session queue
 - Computer Use application authorization through MCP elicitation
+- configurable Codex app-server wall deadlines with terminal-event validation
+
+Long-turn state is call-local and session-local. Each cached Hermes agent owns
+one `CodexAppServerSession`, one Codex thread and one event callback. The timeout
+wrapper adds no global current-session/current-result variable; `turn/completed`
+from another thread cannot satisfy the active turn because upstream notification
+filtering checks both thread and turn identifiers. The same chat remains
+serialized by Hermes' turn lease, while different chats can run independently.
 
 The approval bridge does not implement a second authorization database. During
 an active Gateway turn it resolves the current session key, reuses the notifier

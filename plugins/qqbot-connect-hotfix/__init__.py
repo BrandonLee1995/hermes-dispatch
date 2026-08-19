@@ -27,6 +27,8 @@ from .group_config_interaction import (
     patch_group_config_interactions as _patch_group_config_interactions,
 )
 from .outbound import (
+    is_expired_reply_error as _is_expired_reply_error,
+    patch_expired_reply_fallback as _patch_expired_reply_fallback,
     patch_media_caption_retry as _patch_media_caption_retry,
     patch_plain_text_retry as _patch_plain_text_retry,
     send_plain_text as _send_plain_text,
@@ -57,6 +59,7 @@ def register(ctx):
     _patch_group_message_create_event(QQAdapter)
     _patch_group_channel_context(QQAdapter)
     _patch_plain_text_retry(QQAdapter)
+    _patch_expired_reply_fallback(QQAdapter)
     _patch_media_caption_retry(QQAdapter)
     choices_status = _patch_codex_approval_choices(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", choices_status)

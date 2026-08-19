@@ -74,6 +74,20 @@ MESSAGE_SNAPSHOT_CONTEXT_MESSAGES=20
 MESSAGE_SNAPSHOT_CONTEXT_TOKENS=4000
 ```
 
+## QQ Long-Turn Reply Delivery
+
+`qqbot-connect-hotfix` 1.7.0 compensates for QQ reply anchors expiring while an
+agent turn is still running. The first send remains a normal reply. If QQ
+explicitly reports the `msg_id` or `message_id` as expired, the plugin retries
+the same C2C, group, approval-keyboard, or guild text once as a standalone
+message. Keyboard data is retained; unrelated errors are not retried.
+
+This is only a channel-delivery fallback. It does not itself extend Codex
+app-server's wall-clock limit, persist a running task, or cover media sends. A successful
+live check is a long turn whose final text appears without a reply relationship
+after the initial referenced send is rejected. The Gateway log should contain
+`reply anchor expired` followed by no second send error.
+
 ## Codex App-Server Compatibility
 
 `codex-app-server-phase-hotfix` converts completed Codex app-server
@@ -91,6 +105,29 @@ non-Hermes MCP elicitation requests to decline. On Codex 0.145.0, permission
 approval returns the requested, schema-filtered subset; denial or timeout
 returns an empty subset. Computer Use approval returns the MCP elicitation
 response and lets Codex own session/permanent app policy.
+
+Version 1.5.0 compensates for Hermes 0.20.0's fixed 600-second Codex
+app-server wall deadline. With
+`HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS=0` (the plugin default), a healthy
+turn waits for `turn/completed`; `/stop`, steer/interrupt, process-exit checks
+and the post-tool watchdog remain active. A positive value restores a finite
+deadline. At that deadline, unterminated commentary is converted to a failed
+turn and the Codex subprocess is retired rather than returned as final output.
+
+Hermes' outer Gateway timeout is inactivity-based and independent. Set it above
+the longest legitimate silent task, for example:
+
+```bash
+hermes config set agent.gateway_timeout 7200
+```
+
+Restart draining is independent. Hermes 0.20.0 defaults
+`agent.restart_drain_timeout` to zero, which makes an explicit restart force
+immediately. Set it to a bounded value such as 300 seconds on a multi-session
+Gateway. Timeout/terminal tracking is local to each Codex session, and
+regression tests run two sessions concurrently to ensure results and callbacks
+do not cross. Messages arriving in the same chat still follow
+`display.busy_input_mode`.
 
 `qqbot-connect-hotfix` 1.6.0 renders **本次允许**, **会话允许**, and **拒绝**
 for every bridged request. It adds **始终允许同类** only when Codex supplied a
@@ -180,12 +217,15 @@ hermes plugins disable codex-app-server-phase-hotfix
 hermes plugins disable message-snapshot-store
 ```
 
-Disabling `codex-app-server-phase-hotfix` restores Hermes 0.18.2 behavior:
+Disabling `codex-app-server-phase-hotfix` restores the affected upstream
+behavior:
 Codex Gateway approvals are no longer sent to QQ, permission requests fail
 closed, Computer Use app elicitations are declined, duplicate-final protection
-is removed, and Codex media-only image turns may again be dropped. Disabling
+is removed, Codex media-only image turns may again be dropped, and Hermes
+0.20.0's fixed 600-second Codex turn deadline is restored. Disabling
 `qqbot-connect-hotfix` restores the shared-group approval rejection when group
-sessions are not user-isolated. Restart the gateway after rollback.
+sessions are not user-isolated and removes the expired-reply standalone retry.
+Restart the gateway after rollback.
 
 For script-level MCP changes, stop the `http-mcp` container or point the compose
 service back to the upstream Hermes MCP command.
@@ -196,6 +236,7 @@ Run plugin tests on the host:
 
 ```bash
 python plugins/qqbot-connect-hotfix/test_hotfix.py
+python plugins/qqbot-connect-hotfix/test_expired_reply.py
 python plugins/qqbot-connect-hotfix/test_media_reply.py
 python plugins/qqbot-connect-hotfix/test_group_roundtrip.py
 python plugins/codex-app-server-phase-hotfix/test_hotfix.py

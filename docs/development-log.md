@@ -1,5 +1,171 @@
 # Development Log
 
+## 2026-08-19 — Codex app-server long-turn deadline compatibility
+
+### Problem
+
+Hermes 0.20.0 calls `CodexAppServerSession.run_turn()` without overriding its
+fixed 600-second wall deadline. A live QQ C2C test reached that deadline while
+a 1,900-second foreground command was healthy. Because Codex had already sent
+commentary, upstream Hermes promoted the latest assistant message to terminal
+output without receiving `turn/completed`; the tool process continued after
+the Gateway released the turn.
+
+The Gateway also has a separate 1,800-second inactivity watchdog. It is not a
+wall clock—tool/API/stream activity resets it—but a deliberately silent
+foreground command longer than 30 minutes can still reach it.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.5.0.
+- Added `HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS`; `0` (the default)
+  disables only the Codex turn wall deadline, while a positive value restores
+  a finite limit.
+- A finite deadline without `turn/completed` now interrupts and retires the
+  session rather than delivering commentary as a successful final answer.
+- The current long-turn test profile uses `agent.gateway_timeout=7200` so the
+  independent Gateway inactivity watchdog does not preempt the 30-minute run.
+  A live deployment check also exposed the independent
+  `agent.restart_drain_timeout=0` default, which forces an explicit restart
+  without draining other sessions; the test host now uses 300 seconds.
+- Completion flags, deadlines and callbacks remain local to each
+  `CodexAppServerSession`. A concurrent two-session regression verifies that
+  final events, timeout values and results do not cross sessions.
+
+The change does not disable `/stop`, `turn/steer`, incoming-message interrupt,
+subprocess-exit detection, or the existing post-tool completion watchdog. One
+fixed chat is still serialized by Hermes and follows `display.busy_input_mode`;
+only distinct session keys run independently.
+
+### Enable and verify
+
+```bash
+scripts/install-plugins.sh "$HOME/.hermes" codex-app-server-phase-hotfix
+hermes plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
+hermes config set agent.gateway_timeout 7200
+hermes config set agent.restart_drain_timeout 300
+hermes gateway restart
+
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/codex-app-server-phase-hotfix/test_hotfix.py
+```
+
+The live acceptance test is one QQ private-chat turn containing a foreground
+wait longer than 30 minutes followed by a unique final marker. Success requires
+the marker persisted after `turn/completed` and a successful QQ send path, no 600-second
+deadline warning, no interim text treated as final, no orphan child process,
+and an independent second-session probe that does not alter the long turn.
+
+The 2026-08-19 live QQ C2C acceptance passed. The effective turn began at
+11:01:31, started `python3 -c 'import time; time.sleep(1900)'` at approximately
+11:01:46, and returned at 11:33:27. Gateway recorded 1,916.5 seconds end to end
+and persisted the exact final text `LONG_TASK_30M_QQ_V2_FINAL_OK`. Checkpoints
+at 5, 10, 15, 20, 25 and 30 minutes all showed the same tool PID and parent
+Codex app-server, one active private-session agent, no final delivery, and no
+deadline/idle/session-retirement/stale-result event. In particular, the old
+600-second `accepting the assistant text as the terminal response` warning did
+not recur.
+
+At 15 minutes, Gateway sent its expected non-conversational inactivity warning:
+the 7,200-second outer watchdog still had 105 minutes remaining. That warning
+did not enter the final-delivery ledger or release the turn. At 11:27:19 QQ
+requested a WebSocket reconnect with code 4009; the adapter reconnected and
+resumed the session in about 2.4 seconds. The final QQ send path ran at
+11:33:27.918 with no send/fallback/retry error. QQ did not reject the original
+reply anchor, so the expired-anchor standalone fallback remained unexercised in
+this live run.
+
+During the private turn, a group mention entered distinct Hermes session
+`20260812_105439_64454baf` and distinct Codex thread `01a017fb`. It returned
+`ISOLATION_OK` in 11.0 seconds while the private `sleep(1900)` continued under
+its original PID/parent. No interrupt or stale result was emitted. After the
+private final, `active_agents` returned to zero and no `sleep(1900)` process
+remained; the surviving app-server children were its normal MCP, Computer Use,
+live-server and code-mode hosts.
+
+### Rollback
+
+Disable `codex-app-server-phase-hotfix`, unset
+`HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS`, restore a positive
+`agent.gateway_timeout`, and restart the Gateway. This restores Hermes 0.20.0's
+fixed Codex 600-second deadline together with its upstream terminal behavior.
+
+## 2026-08-19 — QQ expired reply-anchor fallback
+
+### Problem
+
+QQ associates a passive reply with the inbound message's `msg_id`. During a
+long agent turn that reply anchor can expire before the final text is sent, so
+QQ rejects the referenced send even though the Hermes task produced a result.
+Upstream Hermes PR
+[#85221](https://github.com/NousResearch/hermes-agent/pull/85221) uses a narrow
+delivery fallback: retry once without the expired reply relationship.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.7.0.
+- C2C text, group text, approval keyboards, and guild text keep their reply
+  anchor on the first attempt.
+- Only an explicit expired `msg_id`/`message_id` error triggers one standalone
+  retry. Approval keyboard data is passed through unchanged.
+- Detection includes QQ's Chinese error wording and conservative English field
+  aliases. Unrelated send failures are returned unchanged, and a failed retry
+  retains both the original and fallback diagnostics.
+
+This first-stage workaround intentionally does not change Codex app-server's
+wall-clock limit, add persistent task probing, or retry media. Those require a
+separate task-lifecycle design rather than a channel-send compatibility patch.
+
+### Enable and verify
+
+Install the persistent plugin, restart the Gateway, and run the QQ regressions:
+
+```bash
+scripts/install-plugins.sh "$HOME/.hermes" qqbot-connect-hotfix
+hermes plugins enable qqbot-connect-hotfix --no-allow-tool-override
+hermes gateway restart
+
+HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_expired_reply.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_hotfix.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_media_reply.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+```
+
+The focused regression verifies C2C, group, guild, and keyboard retries,
+idempotent patching, conservative error matching, and two-error diagnostics.
+For a live check, inspect `~/.hermes/logs/agent.log` for
+`reply anchor expired`; the following standalone send must succeed.
+
+The 2026-08-19 macOS C2C live check used one real QQ inbound message at
+10:22:15 and held the same Codex app-server turn open with a 370-second
+foreground command. Hermes produced the fixed final text at 10:28:50 after
+394.9 seconds, and the delivery ledger recorded `delivered`, zero retries, and
+no error. QQ accepted the original reply anchor, so this proves that the final
+result survived a greater-than-five-minute turn on that private channel but
+does **not** prove that the live expired-anchor fallback branch was exercised.
+That branch remains covered by the focused adapter regression until QQ returns
+an explicit expired `msg_id` in production.
+
+A second live test attempted a 1,900-second foreground command in the same QQ
+turn. The inbound message arrived at 10:31:58, but at 10:42:04 the installed
+Codex app-server transport hit its hard-coded 600-second turn deadline. Hermes
+reported the turn ready after 605.9 seconds and delivered the last interim
+assistant text, `仍在等待前台命令完成。`, as though it were the final response.
+The requested `LONG_TASK_30M_QQ_FINAL_OK` result was never produced. The
+foreground tool process also remained alive after Gateway released the active
+turn and required explicit cleanup. This confirms that the QQ expired-anchor
+fallback alone cannot support 30-minute tasks: the app-server deadline,
+interim-as-terminal behavior, and orphaned tool cleanup must be addressed
+before a longer end-to-end retry is meaningful.
+
+### Rollback
+
+Disable `qqbot-connect-hotfix` and restart the Gateway to restore upstream send
+behavior. This removes all QQ compatibility patches, not just the new retry. To
+roll back only this change, reinstall plugin version 1.6.1 from repository
+history and restart. No message database or task state is migrated.
+
 ## 2026-08-04 — WhatsApp mention routing and durable Baileys snapshots
 
 ### Problem

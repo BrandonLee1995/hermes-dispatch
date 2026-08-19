@@ -136,6 +136,9 @@ hermes config set group_sessions_per_user false
 hermes config set session_reset.mode none
 hermes config set approvals.mode smart
 hermes config set approvals.mcp_reload_confirm false
+hermes config set agent.gateway_timeout 7200
+hermes config set agent.gateway_timeout_warning 900
+hermes config set agent.restart_drain_timeout 300
 
 hermes config set platforms.qqbot.enabled true
 hermes config set platforms.qqbot.extra.group_policy open
@@ -157,6 +160,12 @@ hermes config check
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
+- `agent.gateway_timeout=7200` 将 Gateway 的无活动保护延长到 2 小时；`/stop` 和消息
+  interrupt/steer 仍可终止或调整任务。
+- `agent.gateway_timeout_warning=900` 会在连续 15 分钟无活动时发送状态提醒；它不是
+  Agent final，也不会释放会话。需要减少提醒时可改为 `3600`，设为 `0` 则关闭提醒。
+- `agent.restart_drain_timeout=300` 是独立的重启排空窗口。Hermes 0.20.0 默认值为 0，
+  显式重启会立即强制结束其他会话；设为 300 后先等待最多 5 分钟再强制退出。
 - 标量使用 `hermes config set`。工具集列表使用第 7 节的 `hermes tools enable`，不要把
   JSON 字符串写进 `platform_toolsets`。
 
@@ -211,6 +220,9 @@ MESSAGE_SNAPSHOT_MEDIA_STORAGE=link
 MESSAGE_SNAPSHOT_CONTEXT_MESSAGES=20
 MESSAGE_SNAPSHOT_CONTEXT_TOKENS=4000
 MESSAGE_SNAPSHOT_SEARCH_CANDIDATES=200
+
+# Codex app-server 长周期任务（0 = 不设墙钟截止）
+HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS=0
 ```
 
 保存后收紧权限：
@@ -234,6 +246,9 @@ chmod 600 "$(hermes config env-path)"
   `WHATSAPP_REQUIRE_MENTION`，避免环境变量覆盖第 5 节的配置。
 - `MESSAGE_SNAPSHOT_MEDIA_STORAGE=link` 对 QQ 保存链接和元数据；WhatsApp 经 Baileys
   解密后的媒体会被插件强制镜像到内容寻址归档，因为临时缓存路径不能长期恢复。
+- Hermes 0.20.0 原生 Codex app-server 固定在 600 秒截止；上面的变量由
+  `codex-app-server-phase-hotfix` 1.5.0 读取。多个聊天各自持有独立 Codex session，
+  不共享 deadline 或 final 状态；同一聊天仍服从 `display.busy_input_mode`。
 
 可选的 WhatsApp 管理命令权限变量：
 
@@ -287,7 +302,7 @@ hermes tools list --platform whatsapp
 
 四个兼容层分别用于：
 
-- Codex app-server 阶段消息、媒体回传和审批兼容；
+- Codex app-server 阶段消息、长周期等待、媒体回传和审批兼容；
 - QQ 单次 final、群被动消息上下文、引用媒体和审批按钮兼容；
 - QQ/WhatsApp SQLite 长期快照、精确过滤、FTS5/BM25、模糊召回和恢复；
 - WhatsApp DM allowlist、开放群聊、require-mention 与 Baileys bridge 兼容。
@@ -300,6 +315,7 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 
 "$HERMES_PY" plugins/codex-app-server-phase-hotfix/test_hotfix.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_hotfix.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_expired_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_media_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
 "$HERMES_PY" plugins/message-snapshot-store/test_store.py
@@ -419,6 +435,9 @@ scripts/install-plugins.sh "$HOME/.hermes/profiles/finance"
 ```bash
 hermes -p sales config set platforms.qqbot.enabled true
 hermes -p sales config set platforms.whatsapp.require_mention true
+hermes -p sales config set agent.gateway_timeout 7200
+hermes -p sales config set agent.gateway_timeout_warning 900
+hermes -p sales config set agent.restart_drain_timeout 300
 hermes -p sales plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
 hermes -p sales plugins enable qqbot-connect-hotfix --no-allow-tool-override
 hermes -p sales plugins enable message-snapshot-store --no-allow-tool-override
@@ -464,7 +483,9 @@ hermes profile use default
 5. WhatsApp 图片/文件：SQLite 有附件记录，媒体归档存在且可恢复。
 6. 从 QQ/WhatsApp 触发联网、文件写入或 Computer Use：审批卡能回传并由发起人审批。
 7. Codex 会话实际调用一次 `hermes-tools` 工具。
-8. 重启 Mac 并登录该部门账号：Gateway 自动恢复，日志无重复实例和端口冲突。
+8. QQ 私聊运行一次超过 30 分钟的前台任务：10 分钟处不出现 600 秒 deadline，最终
+   只回传一次；任务运行时从另一个群发起短任务，两个 session 分别完成且不串线。
+9. 重启 Mac 并登录该部门账号：Gateway 自动恢复，日志无重复实例和端口冲突。
 
 常用检查：
 
@@ -475,6 +496,9 @@ hermes tools --summary
 hermes gateway status
 codex mcp list
 hermes logs errors
+hermes config get agent.gateway_timeout
+hermes config get agent.gateway_timeout_warning
+hermes config get agent.restart_drain_timeout
 ```
 
 ## 13. 更新与回滚
@@ -490,6 +514,20 @@ scripts/install-plugins.sh "$HOME/.hermes"
 ```
 
 命名 profile 也要分别重新安装插件，然后重复第 8、9、12 节并重启对应 Gateway。
+
+只回滚 Codex 长任务机制：
+
+```bash
+hermes plugins disable codex-app-server-phase-hotfix
+hermes config unset agent.gateway_timeout
+hermes config unset agent.gateway_timeout_warning
+hermes config unset agent.restart_drain_timeout
+nano "$(hermes config env-path)"  # 删除 HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
+hermes gateway restart
+```
+
+这会同时移除该插件提供的 Codex 阶段消息、图片与审批兼容；若仍需要这些能力，不要只为
+恢复 600 秒墙钟而停用整个插件，可把环境变量改为明确的正秒数并保留插件。
 
 只回滚兼容层而保留消息数据：
 

@@ -23,6 +23,15 @@ channel-directory chat routing,
 structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, markdown fallback, and media caption compatibility.
 
+Version 1.7.0 adds the narrow expired-reply fallback used by upstream Hermes
+PR [#85221](https://github.com/NousResearch/hermes-agent/pull/85221). QQ can
+reject a valid inbound `msg_id` after a long-running turn. Text sends now keep
+the reply anchor on the first attempt and, only when QQ explicitly reports that
+`msg_id`/`message_id` expired, retry once as a standalone message. The same
+low-level wrapper covers C2C text, group text, approval keyboards, and guild
+text while preserving the keyboard payload. It does not change task lifetime,
+Codex app-server timeouts, or media delivery; those remain separate concerns.
+
 Version 1.6.1 keeps the shared-group approval wrapper compatible with both
 Hermes 0.18.2 and the newer 0.19-era cross-adapter contract. New Gateway code
 passes an explicit `allow_session` keyword to `send_exec_approval`; the old
@@ -94,8 +103,11 @@ Compatibility contract:
   compatibility patch responds with `claw_cfg` only when QQ sends a connector
   configuration interaction; owners do not need to toggle or reconfirm an
   already effective native permission just to activate snapshot capture.
-- QQ group passive replies must carry a valid recent `msg_id`. This plugin does
-  not reuse stale `_last_msg_id` values; explicit `reply_to` is preserved.
+- QQ replies use the explicit inbound `reply_to` while it remains valid and do
+  not reuse stale `_last_msg_id` values. If QQ explicitly rejects that anchor as
+  expired, version 1.7.0 retries text or keyboard delivery once without the
+  reply relationship. Unrelated errors are returned unchanged. Media does not
+  use this fallback yet.
 - QQ may label a message that mentions another member as
   `GROUP_AT_MESSAGE_CREATE`. Version 1.5.2 and later check the authoritative
   `mentions[].is_you` field, so @owner/@member traffic is captured as context
