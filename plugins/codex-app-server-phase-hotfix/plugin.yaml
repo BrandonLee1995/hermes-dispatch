@@ -1,5 +1,5 @@
 name: codex-app-server-phase-hotfix
-version: 1.5.0
-description: "Fix Codex final routing, long-turn deadlines, image delivery, and scope-complete Gateway approvals for Hermes adapters."
+version: 1.8.2
+description: "Fix Codex final routing, long-turn deadlines, image delivery, approvals, and persistent Hermes-session project/thread/App mapping."
 author: local
 kind: standalone

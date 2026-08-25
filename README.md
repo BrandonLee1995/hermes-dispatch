@@ -12,7 +12,7 @@ edit container-internal source files.
 
 ```text
 plugins/
-  codex-app-server-phase-hotfix/     Codex routing, media, and approval bridge
+  codex-app-server-phase-hotfix/     Codex routing, media, approvals, and persistent session projects
   message-snapshot-store/            Persistent snapshots and hybrid retrieval
   qqbot-connect-hotfix/              QQ Bot adapter compatibility plugin
   whatsapp-bridge-policy-hotfix/     WhatsApp bridge/policy/admin plugin
@@ -43,7 +43,9 @@ docs/
 - Codex app server: preserve commentary without duplicate final replies,
   convert completed `imageGeneration` results into native gateway media, and
   bridge execution, file-change, permission, and Computer Use application
-  authorization requests into Hermes' existing Gateway approval queue.
+  authorization requests into Hermes' existing Gateway approval queue. Stable
+  channel projects can optionally be registered in Codex Desktop through the
+  CLI-owned cross-platform `codex app <path>` entrypoint.
 - WhatsApp: split private-chat allowlist from group openness, enforce mention
   response policy, capture passive Baileys events before that response gate,
   and persist text/media in the same structured + BM25 snapshot store as QQ.

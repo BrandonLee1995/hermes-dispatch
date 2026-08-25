@@ -1,5 +1,187 @@
 # Development Log
 
+## 2026-08-25 — Cross-platform Codex Desktop project registration
+
+### Problem
+
+Codex app-server correctly stored Hermes threads with the session project's
+`cwd`, but Codex Desktop did not automatically add that directory to its
+sidebar. The app maintains a separate local-project registry, so cwd/thread
+creation alone was insufficient. Editing the private Desktop global-state JSON
+would be version-fragile and would bypass the running app's window updates.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.8.2.
+- Added opt-in `HERMES_CODEX_APP_REGISTER_PROJECTS=true`. After the first
+  successful thread start/resume for a project, the plugin schedules the
+  supported Codex CLI entrypoint `codex app <project-path>` outside the Agent
+  turn and records success in the existing mapping SQLite database.
+- Linux and Windows invoke that CLI entrypoint directly. On macOS, a detached
+  Gateway may not inherit the logged-in Aqua bootstrap namespace, so the
+  worker uses `launchctl asuser <uid> codex app <project-path>`. The plugin
+  never edits Codex Desktop's private state file.
+- Registration is best-effort and cannot fail or delay the Agent turn. Child
+  stdio is detached so a Desktop process cannot keep Gateway pipes open. A
+  successful path is not launched again after later turns or Gateway restarts;
+  failures retry only after a cooldown.
+- Added startup backfill from Hermes' authoritative `sessions/sessions.json`.
+  Existing channel routes receive missing project scaffolds/mappings without
+  waiting for `/new` or a management command. Their next real message creates
+  the named thread lazily, avoiding empty threads and startup/inbound races.
+- Windows replaces the filesystem-forbidden ASCII `:` with the compatible
+  full-width `：` only in the physical directory basename. The database,
+  manifest and logical project name retain the exact Hermes `session_key`.
+- Headless/container deployments keep registration disabled. Their host
+  desktop user can run `codex app <host-project-path>` explicitly.
+
+### Verify and roll back
+
+Enable registration on a desktop host, restart Gateway, and send one channel
+message that reaches Codex. `/codex-project status` must show
+`codex_app_registration.status: registered`, and the project must appear in
+Codex Desktop. Disable `HERMES_CODEX_APP_REGISTER_PROJECTS` to stop future
+registration; already registered Desktop projects and mapping rows are
+retained for audit and can be removed separately through the Desktop UI.
+
+The macOS live regression backfilled five missing routes, retained two existing
+routes, and skipped none. A QQ group turn resumed its stored thread, registered
+the project through the detached worker, and returned exactly one final reply.
+The deployment guide now keeps the unused WhatsApp channel and plugin disabled
+by default and documents that long-turn/project settings belong to Hermes
+`config.yaml`/`.env`, not private keys in Codex `config.toml`.
+
+## 2026-08-25 — Codex project name equals Hermes session key
+
+### Problem
+
+The initial mapping correctly grouped multiple Hermes `session_id` values under
+one project per stable `session_key`, but named the physical project folder
+after the first session id. That made the Codex project label describe only the
+first thread instead of the durable channel route that owns every thread.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.7.0.
+- New default project folders use the exact `session_key` as their basename;
+  each `session_id` remains only the Codex thread name.
+- Added an atomic, ownership-checked migration for 1.6.x folders. It renames
+  the directory and updates `channel_projects`, `session_threads`,
+  `thread_history`, and `.hermes-dispatch.json` without changing thread ids or
+  shared project memory.
+- Explicit user bindings remain unchanged; `/codex-project default` returns to
+  the session-key-named default project.
+- Unsafe or overlong session keys fail explicitly instead of being silently
+  converted into a different visible project name.
+
+### Verify and roll back
+
+Run `test_hotfix.py`, then verify `/codex-project status` reports the complete
+session key as `project_name`, while `/new` changes only `session_id` and later
+creates a new thread under the same `project_path`. To roll back the code,
+disable the plugin and restart Gateway; the migrated directory is retained and
+can be renamed manually using the SQLite mapping if an older plugin must be
+restored.
+
+## 2026-08-25 — Channel-neutral `/codex-project` command context
+
+### Problem
+
+Hermes 0.20.0 clears session ContextVars when an inbound Gateway task starts,
+but dispatches plugin slash commands before the normal Agent path binds the
+current `session_key` and `session_id`. The 1.6.0 `/codex-project` handler
+therefore returned `no active Hermes channel session` even though the QQ or
+WhatsApp chat already had a valid routing entry. Version 1.6.1 captured that
+route, but still preferred Hermes' process-global fallback values; immediately
+after `/new`, `status` could therefore report the old session and thread.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.6.2.
+- Added a read-only `pre_gateway_dispatch` capture using Hermes' own
+  `_session_key_for_source` and routing entry; no QQ- or WhatsApp-specific ID
+  format is duplicated.
+- If `/codex-project` is the first message in a channel route, the async command
+  handler creates the session through Hermes' normal `async_session_store` only
+  after the Gateway authorization checks have passed.
+- Normal prompt-callable tool invocations continue using Hermes' official
+  task-local session ContextVars, preserving concurrent channel isolation.
+- The captured inbound route is authoritative for plugin slash commands;
+  process-global fallback values left by an Agent before `/new` cannot replace
+  the newly rotated Gateway `session_id`.
+- Added regression coverage proving independent QQ and WhatsApp command routes.
+
+### Verify and roll back
+
+Run `test_hotfix.py`, then invoke `/codex-project status` in both an authorized
+QQ chat and an authorized WhatsApp chat. Disable the plugin and restart the
+Gateway to roll back; the mapping database and generated projects are retained.
+
+## 2026-08-25 — Hermes channel session to Codex project/thread continuity
+
+### Problem
+
+Hermes 0.20.0 derives a stable `session_key` from a QQ private/group route and
+stores the current durable conversation in a separate `session_id`. `/new` and
+`/reset` preserve the routing key while rotating the session id. The Codex
+app-server adapter, however, stores its thread id only on the process-local
+cached `AIAgent`; rebuilding that object always calls `thread/start`. One QQ
+chat therefore accumulated unrelated Codex threads and cwd/project groupings.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.6.0.
+- Added a WAL SQLite mapping at
+  `$HERMES_HOME/state/codex-session-projects.sqlite3`.
+- The first `session_id` names a default project below
+  `$HERMES_HOME/codex-projects`; every later session id under the same
+  `session_key` creates a separately named thread in that project.
+- An unchanged session id uses Codex `thread/resume` after Gateway restart,
+  Agent-cache eviction or app-server retirement. A missing/deleted stored
+  thread is archived in mapping history before one replacement is started.
+- Default projects receive non-destructive `AGENTS.md` and
+  `PROJECT_MEMORY.md` scaffolding; existing files are never overwritten.
+- Added the `codex_session_project` tool and `/codex-project` command. Explicit
+  project changes are admin-gated and limited to configured aliases/roots.
+  A changed cwd is applied on the next turn by resuming the current thread;
+  only the current Hermes session's app-server client is retired.
+
+The implementation uses the locally generated Codex 0.145.0 app-server schema:
+`thread/resume` accepts `threadId` and `cwd`, `thread/name/set` assigns the
+Hermes session id, and `thread/list` groups by exact cwd. An unsupported or
+transient resume error is surfaced rather than silently starting duplicates;
+only an explicit missing-thread error permits replacement.
+
+### Enable and verify
+
+```dotenv
+HERMES_CODEX_SESSION_PROJECTS_ENABLED=true
+HERMES_CODEX_PROJECT_ADMIN_USERS=<authorized-platform-user-id>
+HERMES_CODEX_PROJECT_ALIASES={"finance":"/absolute/path/to/finance"}
+```
+
+```bash
+scripts/install-plugins.sh "$HOME/.hermes" codex-app-server-phase-hotfix
+hermes plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
+hermes tools enable --platform qqbot codex_session_project
+hermes gateway restart
+
+"$HOME/.hermes/hermes-agent/venv/bin/python" \
+  plugins/codex-app-server-phase-hotfix/test_hotfix.py
+```
+
+Verify one QQ chat across a Gateway restart (same thread), then `/new` (same
+project, new session-id-named thread). If aliases are configured, verify an
+authorized bind preserves thread history on the next turn and another QQ user
+cannot change the mapping.
+
+### Rollback
+
+Disable `codex-app-server-phase-hotfix` and restart Gateway. This restores
+Hermes 0.20.0's start-only Codex behavior. Mapping SQLite, generated project
+directories and project memory files are deliberately retained; remove them
+only as a separate, explicit data-destruction operation.
+
 ## 2026-08-19 — Codex app-server long-turn deadline compatibility
 
 ### Problem

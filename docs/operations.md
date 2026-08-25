@@ -129,6 +129,66 @@ regression tests run two sessions concurrently to ensure results and callbacks
 do not cross. Messages arriving in the same chat still follow
 `display.busy_input_mode`.
 
+Version 1.7.0 also compensates for Hermes 0.20.0 keeping the Codex thread id
+only on the cached `AIAgent`. It persists one Codex project per stable Gateway
+`session_key` and one Codex thread per Hermes `session_id`. `/new` and `/reset`
+therefore create a new session-id-named thread in the same project; Gateway
+restart and cache eviction resume the existing thread. The default project's
+folder name is the exact `session_key` on macOS/Linux; Windows uses the same
+readable key with `:` replaced by `：`. Legacy 1.6.x folders are migrated on
+their next access. Inspect the current mapping with:
+
+```text
+/codex-project status
+/codex-project list_threads
+```
+
+Codex app-server cwd grouping is separate from Codex Desktop's sidebar list.
+On a desktop host, enable one-time registration through the CLI-owned,
+cross-platform launcher:
+
+```dotenv
+HERMES_CODEX_APP_REGISTER_PROJECTS=true
+# Default true; set false only to skip old-route project scaffolding:
+HERMES_CODEX_SESSION_PROJECTS_BACKFILL=true
+# Optional when Hermes uses a non-default Codex executable:
+HERMES_CODEX_APP_CLI=/absolute/path/to/codex
+```
+
+After the next Codex turn, `/codex-project status` reports registration state.
+The plugin schedules `codex app <project-path>` outside the Agent turn and runs
+it once per successfully registered path; this may launch or focus Codex
+Desktop but does not delay the channel reply. Leave it disabled on headless
+Linux, services without an interactive desktop, and containers. For Docker,
+run `codex app <host-mounted-project-path>` on the host as the same desktop
+account. A detached macOS Gateway is bridged into the logged-in Aqua session
+with `launchctl asuser`; Linux and Windows desktop processes invoke the CLI
+directly. Registration failure is logged and retried after a cooldown.
+
+At Gateway/plugin load, existing routes from Hermes' own `sessions.json` get
+missing project directories and mappings automatically. Their first later
+message creates the correctly named Codex thread. Historical Codex threads
+whose old cwd did not identify a route are deliberately not guessed or moved.
+
+For an operator-approved project alias, use:
+
+```text
+/codex-project bind finance
+/codex-project default
+```
+
+The command route is channel-neutral: a pre-dispatch hook resolves the current
+Hermes routing entry with the Gateway's own session-key generator before plugin
+slash-command dispatch. Test `status` independently in every enabled channel
+(for example QQ and Baileys WhatsApp); no platform-specific identifier parsing
+is used by this plugin.
+
+The same operations are available to the Agent through
+`codex_session_project`, but `bind`/`default` require the sender to be listed in
+`HERMES_CODEX_PROJECT_ADMIN_USERS`. Paths must be aliases or fall below
+`HERMES_CODEX_PROJECT_ALLOWED_ROOTS`. A binding change takes effect on the next
+Codex turn and must not interrupt another channel's task.
+
 `qqbot-connect-hotfix` 1.6.0 renders **本次允许**, **会话允许**, and **拒绝**
 for every bridged request. It adds **始终允许同类** only when Codex supplied a
 persistent exec-policy/network-policy amendment or an elicitation advertised
@@ -222,7 +282,9 @@ behavior:
 Codex Gateway approvals are no longer sent to QQ, permission requests fail
 closed, Computer Use app elicitations are declined, duplicate-final protection
 is removed, Codex media-only image turns may again be dropped, and Hermes
-0.20.0's fixed 600-second Codex turn deadline is restored. Disabling
+0.20.0's fixed 600-second Codex turn deadline is restored. Codex project/thread
+mapping also stops, but `$HERMES_HOME/state/codex-session-projects.sqlite3`
+and `$HERMES_HOME/codex-projects` are retained for re-enable or audit. Disabling
 `qqbot-connect-hotfix` restores the shared-group approval rejection when group
 sessions are not user-isolated and removes the expired-reply standalone retry.
 Restart the gateway after rollback.

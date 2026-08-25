@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import hashlib
 import importlib.util
 import json
 import math
@@ -12,6 +14,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def load_plugin_module():
@@ -44,6 +47,447 @@ def completed(text: str, phase=None):
 
 
 def main():
+    # Session projects: a channel routing key owns one project named exactly
+    # after its session_key. /new or /reset produces a new session/thread in
+    # the same project; process restart with the same id resumes the thread.
+    old_session_project_env = {
+        key: os.environ.get(key)
+        for key in (
+            "HERMES_HOME",
+            mod.session_project.ROOT_ENV,
+            mod.session_project.ALIASES_ENV,
+            mod.session_project.ALLOWED_ROOTS_ENV,
+            mod.session_project.ADMIN_USERS_ENV,
+            mod.session_project.BACKFILL_ENV,
+            mod.session_project.REGISTER_APP_ENV,
+            mod.session_project.REGISTER_APP_CLI_ENV,
+            mod.session_project.REGISTER_APP_TIMEOUT_ENV,
+            mod.session_project.REGISTER_APP_RETRY_ENV,
+            "HERMES_SESSION_KEY",
+            "HERMES_SESSION_ID",
+            "HERMES_SESSION_USER_ID",
+        )
+    }
+    with tempfile.TemporaryDirectory() as session_tmp:
+        os.environ["HERMES_HOME"] = session_tmp
+        backfill_key = "agent:main:qqbot:group:old-route"
+        backfill_session = "20260701_010203_backfill"
+        sessions_dir = Path(session_tmp, "sessions")
+        sessions_dir.mkdir()
+        Path(sessions_dir, "sessions.json").write_text(
+            json.dumps(
+                {
+                    "_README": "ignored metadata",
+                    backfill_key: {
+                        "session_key": backfill_key,
+                        "session_id": backfill_session,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        backfill_status = mod.session_project.backfill_existing_session_projects()
+        assert "backfilled=1" in backfill_status
+        store = mod.session_project.get_store()
+        backfilled = store.get_binding(backfill_key, backfill_session)
+        assert backfilled is not None
+        assert Path(backfilled.project_path).is_dir()
+        assert backfilled.thread_id is None
+        key = "agent:main:qqbot:dm:test-user"
+        session_a = "20260825_100000_aaaaaaaa"
+        session_b = "20260825_110000_bbbbbbbb"
+        binding_a = store.ensure_binding(key, session_a)
+        assert binding_a.project_name == key
+        assert Path(binding_a.project_path).name == key
+        assert Path(binding_a.project_path, "AGENTS.md").is_file()
+        assert Path(binding_a.project_path, "PROJECT_MEMORY.md").is_file()
+        manifest = json.loads(
+            Path(binding_a.project_path, ".hermes-dispatch.json").read_text()
+        )
+        assert manifest["project_name"] == key
+        assert manifest["schema_version"] == 2
+        assert mod.session_project._session_key_project_basename(
+            key, platform="win32"
+        ) == "agent：main：qqbot：dm：test-user"
+        assert mod.session_project._session_key_project_basename(
+            key, platform="linux"
+        ) == key
+
+        # Existing 1.6.x databases and folders used the first session_id as
+        # the project name. Migrate them in place, preserving every thread id
+        # while changing the shared project path to the exact session_key.
+        legacy_key = "agent:main:whatsapp:dm:legacy-user"
+        legacy_session = "20260825_090000_legacy00"
+        legacy_thread = "thread-legacy"
+        legacy_path = Path(session_tmp, "codex-projects", legacy_session)
+        store._scaffold_default_project(legacy_path, legacy_key, legacy_session)
+        with store._connect() as conn:
+            now = mod.session_project._now()
+            conn.execute(
+                """
+                INSERT INTO channel_projects (
+                    session_key, default_project_name, default_project_path,
+                    active_project_name, active_project_path, binding_mode,
+                    created_from_session_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'auto', ?, ?, ?)
+                """,
+                (
+                    legacy_key,
+                    legacy_session,
+                    str(legacy_path.resolve()),
+                    legacy_session,
+                    str(legacy_path.resolve()),
+                    legacy_session,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO session_threads (
+                    session_key, session_id, project_path, thread_id,
+                    thread_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    legacy_key,
+                    legacy_session,
+                    str(legacy_path.resolve()),
+                    legacy_thread,
+                    legacy_session,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        migrated = store.ensure_binding(legacy_key, legacy_session)
+        migrated_path = Path(session_tmp, "codex-projects", legacy_key).resolve()
+        assert migrated.project_name == legacy_key
+        assert Path(migrated.project_path) == migrated_path
+        assert migrated.thread_id == legacy_thread
+        assert migrated_path.is_dir()
+        assert not legacy_path.exists()
+        migrated_manifest = json.loads(
+            Path(migrated.project_path, ".hermes-dispatch.json").read_text()
+        )
+        assert migrated_manifest["schema_version"] == 2
+        assert migrated_manifest["project_name"] == legacy_key
+
+        store.record_thread(binding_a, "thread-a")
+        resumed_a = store.ensure_binding(key, session_a)
+        assert resumed_a.thread_id == "thread-a"
+
+        binding_b = store.ensure_binding(key, session_b)
+        assert binding_b.project_path == binding_a.project_path
+        assert binding_b.thread_id is None
+        store.record_thread(binding_b, "thread-b")
+        assert [row["session_id"] for row in store.list_threads(key)] == [
+            session_b,
+            session_a,
+        ]
+
+        class FakeClient:
+            def __init__(self, resume_payload=None, resume_error=None):
+                self.resume_payload = resume_payload
+                self.resume_error = resume_error
+                self.calls = []
+
+            def initialize(self, **kwargs):
+                self.calls.append(("initialize", kwargs))
+
+            def request(self, method, params, timeout):
+                self.calls.append((method, params, timeout))
+                if method == "thread/resume":
+                    if self.resume_error is not None:
+                        raise self.resume_error
+                    return self.resume_payload or {
+                        "thread": {"id": params["threadId"]}
+                    }
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-new"}}
+                if method == "thread/name/set":
+                    return {}
+                raise AssertionError(method)
+
+        class FakeCodexSession:
+            def __init__(self, binding, client):
+                self._dispatch_session_binding = binding
+                self._dispatch_resume_thread_id = binding.thread_id
+                self._thread_id = None
+                self._client = client
+                self._client_factory = None
+                self._codex_bin = "codex"
+                self._codex_home = None
+
+        wrapped_ensure = mod.session_project.wrap_ensure_started(
+            lambda self: "upstream-start"
+        )
+        backfill_client = FakeClient()
+        backfill_session_obj = FakeCodexSession(backfilled, backfill_client)
+        assert wrapped_ensure(backfill_session_obj) == "thread-new"
+        assert any(call[0] == "thread/start" for call in backfill_client.calls)
+        assert (
+            store.ensure_binding(backfill_key, backfill_session).thread_id
+            == "thread-new"
+        )
+
+        resume_client = FakeClient()
+        resumed_session = FakeCodexSession(resumed_a, resume_client)
+        assert wrapped_ensure(resumed_session) == "thread-a"
+        assert any(call[0] == "thread/resume" for call in resume_client.calls)
+        assert not any(call[0] == "thread/start" for call in resume_client.calls)
+        name_call = next(
+            call for call in resume_client.calls if call[0] == "thread/name/set"
+        )
+        assert name_call[1]["name"] == session_a
+
+        unsupported_client = FakeClient(
+            resume_error=RuntimeError("JSON-RPC method not found: thread/resume")
+        )
+        unsupported_session = FakeCodexSession(resumed_a, unsupported_client)
+        try:
+            wrapped_ensure(unsupported_session)
+        except RuntimeError as exc:
+            assert "method not found" in str(exc)
+        else:
+            raise AssertionError("unsupported resume must not create a duplicate thread")
+        assert not any(
+            call[0] == "thread/start" for call in unsupported_client.calls
+        )
+
+        missing_client = FakeClient(
+            resume_error=RuntimeError("thread not found: thread-a")
+        )
+        missing_session = FakeCodexSession(resumed_a, missing_client)
+        assert wrapped_ensure(missing_session) == "thread-new"
+        assert any(call[0] == "thread/start" for call in missing_client.calls)
+        assert store.ensure_binding(key, session_a).thread_id == "thread-new"
+
+        start_client = FakeClient()
+        new_session = FakeCodexSession(binding_b, start_client)
+        # Clear the row recorded above to model the first turn after /new.
+        store.clear_thread(binding_b, "test-new-session")
+        binding_b = store.ensure_binding(key, session_b)
+        new_session._dispatch_session_binding = binding_b
+        new_session._dispatch_resume_thread_id = None
+        assert wrapped_ensure(new_session) == "thread-new"
+        assert any(call[0] == "thread/start" for call in start_client.calls)
+        assert store.ensure_binding(key, session_b).thread_id == "thread-new"
+
+        # Desktop visibility uses the Codex CLI's supported, cross-platform
+        # `codex app <path>` entrypoint. It is opt-in and recorded after one
+        # success so later turns/restarts do not repeatedly focus the app.
+        os.environ[mod.session_project.REGISTER_APP_ENV] = "true"
+        completed_app = SimpleNamespace(returncode=0)
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, **kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        with patch.object(
+            mod.session_project.subprocess, "run", return_value=completed_app
+        ) as run_app, patch.object(
+            mod.session_project.threading, "Thread", ImmediateThread
+        ):
+            mod.session_project._register_project_with_codex_app_best_effort(
+                binding_a, "/opt/codex/bin/codex"
+            )
+            mod.session_project._register_project_with_codex_app_best_effort(
+                binding_a, "/opt/codex/bin/codex"
+            )
+        assert run_app.call_count == 1
+        assert run_app.call_args.args[0] == mod.session_project._codex_app_command(
+            "/opt/codex/bin/codex", binding_a.project_path
+        )
+        assert store.app_registration_status(binding_a.project_path)["status"] == (
+            "registered"
+        )
+        assert mod.session_project._codex_app_command(
+            "/opt/codex/bin/codex",
+            binding_a.project_path,
+            platform="linux",
+        ) == ["/opt/codex/bin/codex", "app", binding_a.project_path]
+        assert mod.session_project._codex_app_command(
+            r"C:\\Codex\\codex.exe",
+            binding_a.project_path,
+            platform="win32",
+        ) == [r"C:\\Codex\\codex.exe", "app", binding_a.project_path]
+        assert mod.session_project._codex_app_command(
+            "/opt/codex/bin/codex",
+            binding_a.project_path,
+            platform="darwin",
+            user_id=501,
+        ) == [
+            "/bin/launchctl",
+            "asuser",
+            "501",
+            "/opt/codex/bin/codex",
+            "app",
+            binding_a.project_path,
+        ]
+        os.environ[mod.session_project.REGISTER_APP_ENV] = "false"
+
+        # A prompt-callable project bind is admin-gated, resolves only an
+        # operator-configured alias/allowed path, and carries the current
+        # thread so the next turn resumes it with the new cwd.
+        external = Path(session_tmp, "department-finance")
+        external.mkdir()
+        os.environ[mod.session_project.ALIASES_ENV] = json.dumps(
+            {"finance": str(external)}
+        )
+        os.environ[mod.session_project.ADMIN_USERS_ENV] = "owner-openid"
+        os.environ["HERMES_SESSION_KEY"] = key
+        os.environ["HERMES_SESSION_ID"] = session_b
+        os.environ["HERMES_SESSION_USER_ID"] = "owner-openid"
+
+        class FakeContext:
+            def __init__(self):
+                self.tools = {}
+                self.commands = {}
+                self.hooks = {}
+
+            def register_tool(self, **kwargs):
+                self.tools[kwargs["name"]] = kwargs["handler"]
+
+            def register_command(self, name, handler, **kwargs):
+                self.commands[name] = handler
+
+            def register_hook(self, name, handler):
+                self.hooks[name] = handler
+
+        fake_ctx = FakeContext()
+        mod.session_project.register_session_project_interfaces(fake_ctx)
+        project_tool = fake_ctx.tools["codex_session_project"]
+        bound = json.loads(project_tool({"action": "bind", "project": "finance"}))
+        assert bound["binding"]["project_path"] == str(external.resolve())
+        assert bound["binding"]["thread_id"] == "thread-new"
+        assert bound["effective"] == "next Codex turn"
+        restored = json.loads(project_tool({"action": "default"}))
+        assert restored["binding"]["project_path"] == binding_a.project_path
+        assert restored["binding"]["thread_id"] == "thread-new"
+
+        os.environ["HERMES_SESSION_USER_ID"] = "not-owner"
+        denied = json.loads(project_tool({"action": "bind", "project": "finance"}))
+        assert "restricted" in denied["error"]
+
+        # Hermes dispatches plugin slash commands before it binds the normal
+        # Agent session ContextVars. The pre-dispatch hook must resolve the
+        # same channel-neutral route for both QQ and WhatsApp rather than
+        # relying on process-global environment variables.
+        # Reproduce Hermes 0.20.0's pre-Agent slash-command window: the
+        # task-local variables are not bound yet and get_session_env() can
+        # fall back to process-global values left by the previous Agent.
+        os.environ["HERMES_SESSION_KEY"] = "agent:main:qqbot:dm:stale-user"
+        os.environ["HERMES_SESSION_ID"] = "stale-before-new"
+        os.environ["HERMES_SESSION_USER_ID"] = "stale-owner"
+
+        class FakeGatewayStore:
+            def __init__(self, entries):
+                self._entries = entries
+
+        class FakeGateway:
+            def __init__(self, routes):
+                self.routes = routes
+                self.session_store = FakeGatewayStore(
+                    {
+                        route_key: SimpleNamespace(session_id=session_value)
+                        for route_key, session_value in routes.values()
+                    }
+                )
+
+            def _session_key_for_source(self, source):
+                return self.routes[source.platform][0]
+
+        routes = {
+            "qqbot": ("agent:main:qqbot:dm:qq-user", "qq-session"),
+            "whatsapp": (
+                "agent:main:whatsapp:dm:wa-user",
+                "whatsapp-session",
+            ),
+        }
+        fake_gateway = FakeGateway(routes)
+        pre_dispatch = fake_ctx.hooks["pre_gateway_dispatch"]
+        for platform, (route_key, route_session_id) in routes.items():
+            source = SimpleNamespace(platform=platform, user_id=f"{platform}-owner")
+            event = SimpleNamespace(
+                source=source,
+                get_command=lambda: "codex-project",
+            )
+            pre_dispatch(
+                event=event,
+                gateway=fake_gateway,
+                session_store=fake_gateway.session_store,
+            )
+            command_result = json.loads(
+                asyncio.run(fake_ctx.commands["codex-project"]("status"))
+            )
+            assert command_result["binding"]["session_id"] == route_session_id
+            assert command_result["binding"]["session_key_sha256"] == hashlib.sha256(
+                route_key.encode("utf-8")
+            ).hexdigest()
+
+        qq_key, _qq_old_session = routes["qqbot"]
+        qq_new_session = "qq-session-after-new"
+        fake_gateway.session_store._entries[qq_key] = SimpleNamespace(
+            session_id=qq_new_session
+        )
+        qq_source = SimpleNamespace(platform="qqbot", user_id="qqbot-owner")
+        pre_dispatch(
+            event=SimpleNamespace(
+                source=qq_source,
+                get_command=lambda: "codex-project",
+            ),
+            gateway=fake_gateway,
+            session_store=fake_gateway.session_store,
+        )
+        after_new = json.loads(
+            asyncio.run(fake_ctx.commands["codex-project"]("status"))
+        )
+        assert after_new["binding"]["session_id"] == qq_new_session
+        assert after_new["binding"]["project_name"] == qq_key
+        assert after_new["binding"]["thread_id"] is None
+
+        # A binding change observed after a completed turn retires only the
+        # current Agent's app-server client. Another session remains untouched.
+        class LiveSession:
+            def __init__(self, binding):
+                self._dispatch_session_binding = binding
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        isolated_other = LiveSession(binding_a)
+        switching_agent = SimpleNamespace(
+            _gateway_session_key=key,
+            session_id=session_b,
+            _codex_session=None,
+        )
+
+        def switch_during_turn(agent, *args, **kwargs):
+            active = store.ensure_binding(key, session_b)
+            agent._codex_session = LiveSession(active)
+            store.bind_project(key, session_b, "finance", external)
+            return {"codex_thread_id": active.thread_id, "completed": True}
+
+        wrapped_runtime = mod.session_project.wrap_codex_runtime_turn(
+            switch_during_turn
+        )
+        result = wrapped_runtime(switching_agent)
+        assert result["completed"] is True
+        assert switching_agent._codex_session is None
+        assert isolated_other.closed is False
+
+    for key, value in old_session_project_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
     # Long turns: 0 means no Codex wall-clock deadline. The wrapper keeps all
     # completion and callback state on the individual session/call.
     assert math.isinf(mod.long_turn.configured_turn_timeout("0"))
@@ -184,6 +628,16 @@ def main():
         "already patched",
         "upstream already filters final_answer; skipped",
     }
+    original_backfill = os.environ.get(mod.session_project.BACKFILL_ENV)
+    os.environ[mod.session_project.BACKFILL_ENV] = "false"
+    session_project_status = mod.session_project.patch_codex_session_projects()
+    session_project_status_again = mod.session_project.patch_codex_session_projects()
+    if original_backfill is None:
+        os.environ.pop(mod.session_project.BACKFILL_ENV, None)
+    else:
+        os.environ[mod.session_project.BACKFILL_ENV] = original_backfill
+    assert "patched" in session_project_status or "skipped" in session_project_status
+    assert "already patched" in session_project_status_again or "skipped" in session_project_status_again
 
     old_home = os.environ.get("HERMES_HOME")
     with tempfile.TemporaryDirectory() as tmp:
@@ -588,7 +1042,16 @@ def main():
     print("long_turn_unlimited=true")
     print("long_turn_deadline_terminal_guard=true")
     print("long_turn_session_isolation=true")
+    print("session_project_stable_route=true")
+    print("session_thread_resume=true")
+    print("session_project_admin_gate=true")
+    print("session_project_switch_isolation=true")
+    print("session_project_channel_command_context=true")
+    print("session_project_new_command_rotation=true")
+    print("session_key_project_name_migration=true")
+    print("codex_app_cross_platform_registration=true")
     print(f"install_status={status}")
+    print(f"session_project_install_status={session_project_status}")
 
 
 if __name__ == "__main__":

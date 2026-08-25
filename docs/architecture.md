@@ -28,7 +28,7 @@ workarounds.
 ## Codex App-Server Area
 
 `plugins/codex-app-server-phase-hotfix` is the mounted compatibility boundary
-between Hermes' Codex runtime and Gateway adapters. It has five independent,
+between Hermes' Codex runtime and Gateway adapters. It has seven independent,
 removable patches:
 
 - phase-aware interim/final message routing
@@ -36,6 +36,47 @@ removable patches:
 - blocking approval routing through Hermes' existing per-session queue
 - Computer Use application authorization through MCP elicitation
 - configurable Codex app-server wall deadlines with terminal-event validation
+- durable Hermes channel-project and session-thread mapping
+- optional Codex Desktop sidebar registration through `codex app <path>`
+
+Session identity is deliberately split into two levels:
+
+```text
+stable channel session_key -> stable Codex project
+  durable Hermes session_id -> named Codex thread
+```
+
+QQ `/new` and `/reset` rotate `session_id` while preserving `session_key`.
+Consequently they create a new thread under the existing project. Rebuilding an
+Agent while both identifiers are unchanged resumes the stored thread. The
+stable `session_key` names the logical default project; session ids name its
+threads. SQLite under `$HERMES_HOME/state` is the authoritative mapping. On
+macOS/Linux the ordinary colon-delimited key is also the directory basename.
+Windows replaces forbidden ASCII colons with full-width colons only in the
+physical basename. The manifest retains the exact key; raw transcripts and
+credentials are not written into that project.
+
+An app-server `thread/start(cwd=...)` does not register that cwd in Codex
+Desktop's local-project sidebar. When explicitly enabled, the plugin invokes
+the Codex CLI's cross-platform `codex app <path>` entrypoint in a detached
+worker and persists success. The Agent turn never waits for Desktop launch. It
+never edits Codex Desktop's private global-state file. Headless and container
+deployments leave this disabled and perform host-side registration under the
+matching desktop user when needed. Linux and Windows call the CLI directly;
+macOS detached Gateways use `launchctl asuser` so the launch reaches the
+logged-in Aqua desktop session.
+
+On plugin load, the current entries in Hermes' authoritative
+`sessions/sessions.json` are idempotently backfilled into missing project
+mappings/scaffolds. Backfill does not guess which historical cwd-less Codex
+thread belonged to a route. The next real turn creates its named thread in the
+new project, avoiding empty-thread creation and startup races.
+
+An authorized explicit bind changes only the project cwd associated with one
+channel `session_key`. The current thread id is carried forward and resumed
+with the new cwd on the next turn; the wrapper closes only that Agent's
+`CodexAppServerSession`. Other channel sessions retain their clients, mappings
+and active turns.
 
 Long-turn state is call-local and session-local. Each cached Hermes agent owns
 one `CodexAppServerSession`, one Codex thread and one event callback. The timeout
