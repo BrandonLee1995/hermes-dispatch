@@ -1,5 +1,38 @@
 # Development Log
 
+## 2026-08-25 — Release idle Codex thread writers on Agent cache eviction
+
+### Problem
+
+Hermes 0.20.5 hard Agent teardown closes `_codex_session`, but its soft
+`release_clients()` path does not. After a slash command such as `/reload-mcp`
+updates the durable transcript, Gateway detects a cross-process message-count
+change, soft-evicts the cached Agent and immediately rebuilds it. The abandoned
+Codex app-server remains alive as the thread's writer, so the replacement
+Agent's `thread/resume` fails with JSON-RPC `-32600` and `already has an active
+writer` on every later message.
+
+### Change
+
+- Bumped `codex-app-server-phase-hotfix` to 1.8.3.
+- Wrapped `AIAgent.release_clients()` to close and clear an idle
+  `_codex_session`, while preserving a session whose turn is still active.
+- Added a process-local weak thread-owner registry. Before `thread/resume`, the
+  plugin synchronously closes only a known idle Hermes owner left in the same
+  Gateway process. External writers remain untouched and retain Codex's native
+  single-writer protection.
+- Added regression coverage for idle cleanup, active-turn preservation and
+  stale-owner retirement before resume.
+
+### Verify and roll back
+
+Run `python plugins/codex-app-server-phase-hotfix/test_hotfix.py`. In a mapped
+QQ session, complete one Codex turn, run `/reload-mcp`, then send another
+message. The stored thread id must resume without `active writer`, and only one
+app-server child may own that thread. Disable the plugin and restart Gateway to
+roll back; this restores upstream lifecycle behavior without modifying Hermes'
+installation directory or the persisted session/thread mapping.
+
 ## 2026-08-25 — Cross-platform Codex Desktop project registration
 
 ### Problem

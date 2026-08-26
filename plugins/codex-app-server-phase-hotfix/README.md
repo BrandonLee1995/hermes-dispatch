@@ -142,6 +142,16 @@ thread in the same project. A Gateway restart, Agent-cache eviction or
 app-server retirement with an unchanged `session_id` uses `thread/resume`
 instead of `thread/start`.
 
+Version 1.8.3 closes an idle Hermes-owned Codex app-server when Hermes
+soft-evicts its `AIAgent` after an LRU/TTL event or a cross-process transcript
+write such as `/reload-mcp`. Hermes 0.20.5 closes `_codex_session` during hard
+Agent teardown but omits it from `release_clients()`, leaving the old process
+as the Codex thread's active writer while the replacement Agent immediately
+tries `thread/resume`. The plugin preserves any session with an active turn,
+and synchronously retires only a known idle writer from this Gateway process
+before resume. Writers owned by Codex Desktop or another process remain
+untouched and still fail with Codex's normal single-writer protection.
+
 The logical default project name is the exact Hermes `session_key`, created at:
 
 ```text

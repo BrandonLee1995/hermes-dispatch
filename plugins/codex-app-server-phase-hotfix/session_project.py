@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -58,6 +59,48 @@ _CURRENT_BINDING: contextvars.ContextVar[Optional["SessionBinding"]] = (
 _CHANNEL_COMMAND_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("codex_session_project_channel_command", default=None)
 )
+_THREAD_OWNER_LOCK = threading.Lock()
+_THREAD_OWNERS: "weakref.WeakValueDictionary[str, Any]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _claim_thread_owner(thread_id: str, session: Any) -> None:
+    with _THREAD_OWNER_LOCK:
+        _THREAD_OWNERS[str(thread_id)] = session
+
+
+def _retire_idle_thread_owner(thread_id: str, claimant: Any) -> bool:
+    """Close a stale in-process writer before another Agent resumes it.
+
+    A real active Hermes turn is never interrupted. Writers outside this
+    Gateway process are deliberately untouched and remain protected by
+    Codex's own single-writer error.
+    """
+    from .lifecycle import _has_active_turn
+
+    key = str(thread_id)
+    with _THREAD_OWNER_LOCK:
+        owner = _THREAD_OWNERS.get(key)
+        if owner is None or owner is claimant or _has_active_turn(owner):
+            return False
+        _THREAD_OWNERS.pop(key, None)
+    try:
+        owner.close()
+    except Exception:
+        logger.warning(
+            "codex session project: failed to retire idle in-process owner "
+            "for thread=%s",
+            key[:8],
+            exc_info=True,
+        )
+        return False
+    logger.info(
+        "codex session project: retired idle in-process owner before "
+        "resuming thread=%s",
+        key[:8],
+    )
+    return True
 
 
 def _enabled() -> bool:
@@ -1084,6 +1127,7 @@ def wrap_ensure_started(original: Callable) -> Callable:
         thread_id = None
         resume_id = getattr(self, "_dispatch_resume_thread_id", None)
         if resume_id:
+            _retire_idle_thread_owner(str(resume_id), self)
             try:
                 resumed = self._client.request(
                     "thread/resume",
@@ -1133,6 +1177,7 @@ def wrap_ensure_started(original: Callable) -> Callable:
 
         self._thread_id = thread_id
         self._dispatch_resume_thread_id = thread_id
+        _claim_thread_owner(thread_id, self)
         get_store().record_thread(binding, thread_id)
         _set_thread_name_best_effort(self, binding)
         _register_project_with_codex_app_best_effort(binding, self._codex_bin)
