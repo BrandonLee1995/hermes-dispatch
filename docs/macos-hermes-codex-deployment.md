@@ -254,9 +254,9 @@ chmod 600 "$(hermes config env-path)"
   中的 `WHATSAPP_ENABLED=true`。
 - `MESSAGE_SNAPSHOT_MEDIA_STORAGE=link` 对 QQ 保存链接和元数据。
 - Hermes 0.20.0 原生 Codex app-server 固定在 600 秒截止；上面的变量由
-  `codex-app-server-phase-hotfix` 1.8.2 读取。多个聊天各自持有独立 Codex session，
+  `codex-app-server-phase-hotfix` 1.8.3 读取。多个聊天各自持有独立 Codex session，
   不共享 deadline 或 final 状态；同一聊天仍服从 `display.busy_input_mode`。
-- 1.8.2 默认在 `$HERMES_HOME/codex-projects/<session_key>` 创建同名 Codex 项目；
+- 1.8.3 默认在 `$HERMES_HOME/codex-projects/<session_key>` 创建同名 Codex 项目；
   同一 `session_key` 后续经 `/new`、`/reset` 产生的新 `session_id` 会在该项目中创建
   同名 thread，Gateway 重启或缓存淘汰则恢复原 thread。1.6.x 的首次 session ID
   目录会在首次访问时自动迁移。

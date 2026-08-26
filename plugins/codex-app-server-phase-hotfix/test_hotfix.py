@@ -47,6 +47,33 @@ def completed(text: str, phase=None):
 
 
 def main():
+    # Soft Agent eviction must release an idle Codex app-server writer, while
+    # leaving a genuinely active turn untouched.
+    lifecycle_calls = []
+
+    class LifecycleSession:
+        def __init__(self, active_turn_id=None):
+            self._active_turn_id = active_turn_id
+            self._active_turn_lock = threading.Lock()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    wrapped_release = mod.lifecycle.wrap_release_clients(
+        lambda agent: lifecycle_calls.append(agent)
+    )
+    idle_agent = SimpleNamespace(_codex_session=LifecycleSession())
+    wrapped_release(idle_agent)
+    assert idle_agent._codex_session is None
+    assert lifecycle_calls == [idle_agent]
+
+    active_session = LifecycleSession("turn-live")
+    active_agent = SimpleNamespace(_codex_session=active_session)
+    wrapped_release(active_agent)
+    assert active_agent._codex_session is active_session
+    assert active_session.closed is False
+
     # Session projects: a channel routing key owns one project named exactly
     # after its session_key. /new or /reset produces a new session/thread in
     # the same project; process restart with the same id resumes the thread.
@@ -218,6 +245,19 @@ def main():
                 self._client_factory = None
                 self._codex_bin = "codex"
                 self._codex_home = None
+                self._active_turn_id = None
+                self._active_turn_lock = threading.Lock()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                self._thread_id = None
+
+        # A stale Agent may still own the persisted thread after Hermes has
+        # removed it from the cache. The resume wrapper closes that known idle
+        # in-process owner synchronously before asking Codex to resume.
+        stale_owner = LifecycleSession()
+        mod.session_project._claim_thread_owner("thread-a", stale_owner)
 
         wrapped_ensure = mod.session_project.wrap_ensure_started(
             lambda self: "upstream-start"
@@ -234,6 +274,7 @@ def main():
         resume_client = FakeClient()
         resumed_session = FakeCodexSession(resumed_a, resume_client)
         assert wrapped_ensure(resumed_session) == "thread-a"
+        assert stale_owner.closed is True
         assert any(call[0] == "thread/resume" for call in resume_client.calls)
         assert not any(call[0] == "thread/start" for call in resume_client.calls)
         name_call = next(
@@ -939,6 +980,11 @@ def main():
     assert "patched Codex turn wall deadline" in long_turn_status
     assert long_turn_status_again == "already patched"
 
+    lifecycle_status = mod.lifecycle.patch_codex_agent_soft_eviction()
+    lifecycle_status_again = mod.lifecycle.patch_codex_agent_soft_eviction()
+    assert "soft-eviction patched" in lifecycle_status
+    assert lifecycle_status_again == "already patched"
+
     # Verify all four live session request methods after the class patch.
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
@@ -1042,6 +1088,8 @@ def main():
     print("long_turn_unlimited=true")
     print("long_turn_deadline_terminal_guard=true")
     print("long_turn_session_isolation=true")
+    print("idle_codex_writer_soft_eviction=true")
+    print("active_codex_writer_preserved=true")
     print("session_project_stable_route=true")
     print("session_thread_resume=true")
     print("session_project_admin_gate=true")
