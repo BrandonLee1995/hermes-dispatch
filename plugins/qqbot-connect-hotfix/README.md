@@ -24,6 +24,25 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.4 gives QQ native streams their own overflow lifecycle. When a
+cumulative C2C reply exceeds QQ's per-message limit, the plugin seals the full
+active stream chunk and opens a new stream for only the remaining suffix.
+Every stream therefore keeps an independent prefix-stable `replace` sequence;
+Hermes' generic ordinary-message overflow path is bypassed only for an active
+QQ C2C native lane. The turn-final seal covers the last stream, so the sealed
+chunks concatenate to the authoritative final response without an ordinary
+duplicate.
+
+The 1.8.4 route gate also distinguishes QQ C2C from guild direct messages.
+Both arrive with `chat_type="dm"`, but only the adapter's explicit `"c2c"`
+route may use `/v2/users/{openid}/stream_messages`. A live configuration
+transition from enabled to disabled removes the chat from the native lane on
+the next turn; an already-open stream remains addressable through the stream
+map until it is sealed or abandoned. `test_streaming.py` covers continued
+output beyond one message, final sealing, guild-DM rejection, and the
+enabled-to-disabled transition. Roll back this release by restoring 1.8.3
+from outside the plugin discovery tree and restarting the affected profile.
+
 Version 1.8.3 activates the native QQ lane only after resolving both Hermes'
 global streaming switch and `display.platforms.qqbot.streaming`. Consumer
 creation for `interim_assistant_messages=true` is not treated as evidence that
@@ -137,7 +156,7 @@ does not seal the stream, and logs contain neither error `40034128` nor a
 second final send.  Roll back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.3 code change,
+typing budget is also removed. To roll back the complete 1.8.4 code change,
 restore the previous plugin directory from outside the plugin discovery tree
 and restart that profile.
 

@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.3 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.4 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,12 +194,14 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.3 在稳定版 Hermes 0.20.5 或更高版本上让 QQ 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.4 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
-  不使用该 C2C 端点，仍走原有被动回复路径。只有 Gateway 已为该私聊选择 native lane
+  和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
+  当前 stream，再为剩余后缀打开新 stream，避免普通分片与短 replace 帧混用。只有 Gateway 已为该私聊选择 native lane
   或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
   streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
-  native lane，并保留 Hermes 原始 typing 和 final-only 行为。
+  native lane；同一 Gateway 进程的下一轮配置解析还会撤销旧 lane，并保留 Hermes 原始
+  typing 和 final-only 行为。已打开的 stream 仍保留到封口或取消。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。

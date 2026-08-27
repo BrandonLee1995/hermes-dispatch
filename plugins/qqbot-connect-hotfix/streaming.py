@@ -23,9 +23,11 @@ logger = logging.getLogger(__name__)
 
 _STREAM_PATCHED = "_qqbot_native_c2c_streaming_patched"
 _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
+_OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
 _MAX_TYPING_ANCHORS = 1024
+_NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
 
 
@@ -77,6 +79,8 @@ class _QQC2CStream:
     stream_msg_id: Optional[str] = None
     next_index: int = 0
     last_content: str = ""
+    committed_prefix: str = ""
+    last_completed_stream_id: Optional[str] = None
     sealed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -140,6 +144,11 @@ def _native_lane_chats(adapter) -> set[str]:
 def _mark_native_lane(adapter, chat_id: str) -> None:
     if chat_id:
         _native_lane_chats(adapter).add(str(chat_id))
+
+
+def _unmark_native_lane(adapter, chat_id: str) -> None:
+    if chat_id:
+        _native_lane_chats(adapter).discard(str(chat_id))
 
 
 def _typing_budget_applies(adapter, chat_id: str) -> bool:
@@ -227,6 +236,11 @@ def _patch_gateway_stream_gate(QQAdapter) -> str:
             )
             if native_c2c:
                 _mark_native_lane(adapter, chat_id)
+            else:
+                # Config is resolved for every new turn. Revoke a lane that
+                # was selected before a live enabled -> disabled transition;
+                # any already-open stream remains protected by _stream_maps.
+                _unmark_native_lane(adapter, chat_id)
             if (
                 native_c2c
                 and on_missing_cursor == "raise"
@@ -257,6 +271,47 @@ def _patch_gateway_stream_gate(QQAdapter) -> str:
     return "QQ C2C Gateway streaming gate patched"
 
 
+def _patch_gateway_overflow_limit(QQAdapter) -> str:
+    """Keep QQ C2C cumulative text intact for adapter-owned rollover.
+
+    Hermes' generic overflow path seals a head as an ordinary message and
+    resets its accumulator to the tail. QQ native replace streams instead need
+    each active stream to retain its own accepted prefix. Defer splitting only
+    for an active QQ C2C native lane; the adapter then seals full stream chunks
+    and opens a fresh stream for the remaining cumulative suffix.
+    """
+
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch native overflow limit: %s",
+            exc,
+        )
+        return "QQ C2C native overflow patch unavailable"
+
+    original_limit = GatewayStreamConsumer._raw_message_limit
+    if getattr(original_limit, _OVERFLOW_PATCHED, False):
+        return "QQ C2C native overflow already patched"
+
+    @functools.wraps(original_limit)
+    def _raw_message_limit(self):
+        base = original_limit(self)
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        if (
+            isinstance(adapter, QQAdapter)
+            and chat_id in _native_lane_chats(adapter)
+            and _is_c2c(adapter, chat_id)
+        ):
+            return max(int(base), _NATIVE_STREAM_ACCUMULATION_LIMIT)
+        return base
+
+    setattr(_raw_message_limit, _OVERFLOW_PATCHED, True)
+    GatewayStreamConsumer._raw_message_limit = _raw_message_limit
+    return "QQ C2C native overflow patched"
+
+
 def _reply_anchor(metadata: Optional[Dict[str, Any]]) -> str:
     if not isinstance(metadata, dict):
         return ""
@@ -264,13 +319,16 @@ def _reply_anchor(metadata: Optional[Dict[str, Any]]) -> str:
 
 
 def _is_c2c(adapter, chat_id: str, chat_type: Optional[str] = None) -> bool:
-    normalized = str(chat_type or "").strip().lower()
-    if normalized in {"dm", "c2c", "private"}:
-        return True
     try:
+        # QQ uses source.chat_type="dm" for both C2C and guild direct
+        # messages. The adapter route map is the authoritative distinction:
+        # only "c2c" supports /v2/users/{openid}/stream_messages.
         return str(adapter._guess_chat_type(chat_id)).lower() == "c2c"
     except Exception:
-        return False
+        # A literal c2c value remains a safe compatibility fallback for test
+        # or relay adapters that do not expose QQ's route helper. Generic
+        # dm/private values are intentionally insufficient.
+        return str(chat_type or "").strip().lower() == "c2c"
 
 
 def _stream_body(
@@ -332,6 +390,136 @@ async def _post_stream_frame(
     return data
 
 
+def _active_content(
+    state: _QQC2CStream,
+    content: str,
+    *,
+    require_committed_prefix: bool,
+) -> str:
+    """Return the portion belonging to the currently open stream chunk."""
+
+    full = str(content or "")
+    committed = str(state.committed_prefix or "")
+    if not committed:
+        return full
+    if full.startswith(committed):
+        return full[len(committed):]
+    if require_committed_prefix:
+        raise RuntimeError(
+            "QQ cumulative draft no longer preserves its sealed overflow prefix"
+        )
+    # Turn-final text can legitimately contain only the final assistant answer
+    # while commentary was already streamed. Let _seal_content append that
+    # authoritative suffix to the current visible chunk.
+    return full
+
+
+async def _post_seal_with_retries(
+    adapter,
+    state: _QQC2CStream,
+    content: str,
+):
+    data = None
+    last_error = None
+    for attempt, delay in enumerate(_SEAL_RETRY_DELAYS, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            data = await _post_stream_frame(
+                adapter,
+                state,
+                content,
+                input_state=10,
+            )
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "qqbot-connect-hotfix: QQ C2C stream seal attempt %s/%s "
+                "failed for chat=%s draft=%s index=%s: %s",
+                attempt,
+                len(_SEAL_RETRY_DELAYS),
+                state.chat_id,
+                state.draft_id,
+                state.next_index,
+                exc,
+            )
+    return data, last_error
+
+
+def _replace_active_stream(adapter, state: _QQC2CStream) -> None:
+    streams, anchors = _stream_maps(adapter)
+    streams[state.draft_id] = state
+    anchors[(state.chat_id, state.reply_to)] = state.draft_id
+
+
+async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
+    """Send a cumulative frame, rolling full chunks into new QQ streams.
+
+    Every stream independently obeys QQ's replace-prefix rule. Once the active
+    suffix exceeds the per-message cap, its full head is sealed and recorded
+    as ``committed_prefix``; a new stream then owns only the remaining suffix.
+    """
+
+    active = _active_content(
+        state,
+        content,
+        require_committed_prefix=True,
+    )
+    max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 4000))
+    if max_length <= 0:
+        raise RuntimeError("QQ native stream message limit must be positive")
+
+    current = state
+    data = None
+    while len(active) > max_length:
+        head = active[:max_length]
+        if not current.stream_msg_id:
+            data = await _post_stream_frame(
+                adapter,
+                current,
+                head,
+                input_state=1,
+            )
+        data, seal_error = await _post_seal_with_retries(
+            adapter,
+            current,
+            head,
+        )
+        if seal_error is not None:
+            raise seal_error
+
+        current.sealed = True
+        committed = current.committed_prefix + head
+        completed_id = current.stream_msg_id or current.last_completed_stream_id
+        logger.info(
+            "qqbot-connect-hotfix: QQ C2C overflow chunk sealed "
+            "draft=%s committed=%s",
+            current.draft_id,
+            len(committed),
+        )
+        current = _QQC2CStream(
+            chat_id=current.chat_id,
+            draft_id=current.draft_id,
+            reply_to=current.reply_to,
+            msg_seq=int(adapter._next_msg_seq(current.reply_to)),
+            committed_prefix=committed,
+            last_completed_stream_id=completed_id,
+        )
+        _replace_active_stream(adapter, current)
+        active = active[max_length:]
+
+    if active and (not current.stream_msg_id or active != current.last_content):
+        data = await _post_stream_frame(
+            adapter,
+            current,
+            active,
+            input_state=1,
+        )
+    return current, data
+
+
 def _seal_content(adapter, state: _QQC2CStream, content: str) -> str:
     """Compose a legal final replace body without removing QQ's prefix.
 
@@ -377,38 +565,16 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
                 message_id=state.stream_msg_id,
             )
         if not state.stream_msg_id:
-            _remove_stream(adapter, state)
             return _send_result(
                 success=False,
                 error="QQ stream cannot be sealed before its first frame",
             )
         seal_content = _seal_content(adapter, state, content)
-        data = None
-        last_error = None
-        for attempt, delay in enumerate(_SEAL_RETRY_DELAYS, start=1):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                data = await _post_stream_frame(
-                    adapter,
-                    state,
-                    seal_content,
-                    input_state=10,
-                )
-                last_error = None
-                break
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "qqbot-connect-hotfix: QQ C2C stream seal attempt %s/%s "
-                    "failed for chat=%s draft=%s index=%s: %s",
-                    attempt,
-                    len(_SEAL_RETRY_DELAYS),
-                    state.chat_id,
-                    state.draft_id,
-                    state.next_index,
-                    exc,
-                )
+        data, last_error = await _post_seal_with_retries(
+            adapter,
+            state,
+            seal_content,
+        )
         if last_error is not None:
             # Keep both maps intact. A later turn-final retry or
             # abandon_open_draft can still seal this already-visible stream.
@@ -531,14 +697,11 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=False,
                     error="QQ native stream is already sealed",
                 )
-            if str(content or "") == state.last_content and state.stream_msg_id:
-                return _send_result(success=True)
             try:
-                data = await _post_stream_frame(
+                state, data = await _send_cumulative_draft(
                     self,
                     state,
                     content,
-                    input_state=1,
                 )
             except Exception as exc:
                 logger.warning(
@@ -575,7 +738,20 @@ def patch_qq_c2c_streaming(QQAdapter):
         state = streams.get(draft_id) if draft_id is not None else None
         if state is None:
             return _send_result(success=True)
-        return await _seal_stream(self, state, content or state.last_content)
+        active_content = _active_content(
+            state,
+            content or state.last_content,
+            require_committed_prefix=False,
+        )
+        if not state.stream_msg_id and state.committed_prefix and not active_content:
+            completed_id = state.last_completed_stream_id
+            _remove_stream(self, state)
+            return _send_result(success=True, message_id=completed_id)
+        return await _seal_stream(
+            self,
+            state,
+            active_content or state.last_content,
+        )
 
     @functools.wraps(original_send)
     async def send(
@@ -603,7 +779,43 @@ def patch_qq_c2c_streaming(QQAdapter):
             draft_id = anchors.get((str(chat_id), anchor))
             state = streams.get(draft_id) if draft_id is not None else None
             if state is not None:
-                sealed = await _seal_stream(self, state, content)
+                # A successful overflow rollover stores sealed heads in
+                # committed_prefix. Keep the final seal scoped to the current
+                # stream's suffix so every replace request preserves its own
+                # accepted prefix.
+                if state.committed_prefix and str(content or "").startswith(
+                    state.committed_prefix
+                ):
+                    try:
+                        async with state.lock:
+                            state, _data = await _send_cumulative_draft(
+                                self,
+                                state,
+                                content,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "qqbot-connect-hotfix: final overflow rollover "
+                            "failed for chat=%s draft=%s: %s",
+                            chat_id,
+                            state.draft_id,
+                            exc,
+                        )
+                active_content = _active_content(
+                    state,
+                    content,
+                    require_committed_prefix=False,
+                )
+                if (
+                    not state.stream_msg_id
+                    and state.committed_prefix
+                    and not active_content
+                ):
+                    completed_id = state.last_completed_stream_id
+                    _remove_stream(self, state)
+                    return _send_result(success=True, message_id=completed_id)
+
+                sealed = await _seal_stream(self, state, active_content)
                 if sealed.success:
                     return sealed
                 logger.warning(
@@ -617,10 +829,20 @@ def patch_qq_c2c_streaming(QQAdapter):
                 if state.stream_msg_id:
                     recovery_state = state
 
+        normal_content = content
+        if (
+            recovery_state is not None
+            and recovery_state.committed_prefix
+            and str(content or "").startswith(recovery_state.committed_prefix)
+        ):
+            normal_content = str(content or "")[
+                len(recovery_state.committed_prefix):
+            ]
+
         normal_result = await original_send(
             self,
             chat_id,
-            content,
+            normal_content,
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -680,5 +902,7 @@ def patch_qq_c2c_streaming(QQAdapter):
     QQAdapter.send = send
     QQAdapter.send_typing = send_typing
     gate_status = _patch_gateway_stream_gate(QQAdapter)
+    overflow_status = _patch_gateway_overflow_limit(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
+    logger.info("qqbot-connect-hotfix: %s", overflow_status)
     return "QQ C2C native streaming patched"

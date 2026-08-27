@@ -50,7 +50,12 @@ class DummyAdapter:
         self.fail_seal_attempts = 0
 
     def _guess_chat_type(self, chat_id):
-        return "group" if str(chat_id).startswith("group-") else "c2c"
+        chat_id = str(chat_id)
+        if chat_id.startswith("group-"):
+            return "group"
+        if chat_id.startswith("guild-dm-"):
+            return "dm"
+        return "c2c"
 
     def _next_msg_seq(self, key):
         return 73
@@ -135,10 +140,18 @@ async def main():
     )
     assert adapter.stream_is_message_for_chat("user-1")
     assert not adapter.stream_is_message_for_chat("group-1")
+    assert not adapter.stream_is_message_for_chat("guild-dm-1")
     rejected_group = await adapter.send_draft(
         "group-1", 999, "不应发送", {"reply_to_message_id": "group-msg"}
     )
     assert not rejected_group.success
+    rejected_guild_dm = await adapter.send_draft(
+        "guild-dm-1",
+        998,
+        "不应发送",
+        {"reply_to_message_id": "guild-dm-msg"},
+    )
+    assert not rejected_guild_dm.success
     assert not adapter.api_calls
 
     metadata = {"reply_to_message_id": "inbound-1"}
@@ -462,6 +475,27 @@ async def main():
         else:
             raise AssertionError("QQ group unexpectedly bypassed edit-only gate")
 
+        # QQ guild direct messages also use source.chat_type="dm", but the
+        # adapter's authoritative route is "dm", not "c2c".
+        try:
+            runner._build_stream_consumer_config(
+                SimpleNamespace(
+                    platform=Platform.QQBOT,
+                    chat_id="guild-dm-gate",
+                    chat_type="dm",
+                ),
+                scfg,
+                gate_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError as exc:
+            assert "non-editable platform" in str(exc)
+        else:
+            raise AssertionError("QQ guild DM unexpectedly entered C2C lane")
+        assert "guild-dm-gate" not in streaming_mod._native_lane_chats(
+            gate_adapter
+        )
+
         # Real in-process Runner combination: interim messages alone can cause
         # this builder call while both global and QQ streaming are false. The
         # native lane must remain disabled and upstream's non-editable gate
@@ -519,6 +553,103 @@ async def main():
         assert "user-platform-opt-out" not in streaming_mod._native_lane_chats(
             disabled_gate_adapter
         )
+
+        # A live enabled -> disabled transition must revoke a lane selected
+        # for an earlier turn on the same adapter.
+        gateway_run._load_gateway_config = lambda: {
+            "display": {"platforms": {"qqbot": {"streaming": True}}}
+        }
+        toggle_adapter = GatewayDummyAdapter()
+        toggle_source = SimpleNamespace(
+            platform=Platform.QQBOT,
+            chat_id="toggle-user",
+            chat_type="dm",
+        )
+        runner._build_stream_consumer_config(
+            toggle_source,
+            StreamingConfig(enabled=True, transport="auto"),
+            toggle_adapter,
+            on_missing_cursor="raise",
+        )
+        assert toggle_adapter.supports_draft_streaming(
+            chat_type="dm", chat_id="toggle-user"
+        )
+        gateway_run._load_gateway_config = lambda: {
+            "display": {"platforms": {"qqbot": {"streaming": False}}}
+        }
+        try:
+            runner._build_stream_consumer_config(
+                toggle_source,
+                StreamingConfig(enabled=True, transport="auto"),
+                toggle_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError as exc:
+            assert "non-editable platform" in str(exc)
+        else:
+            raise AssertionError("disabled QQ lane unexpectedly stayed active")
+        assert "toggle-user" not in streaming_mod._native_lane_chats(toggle_adapter)
+        assert not toggle_adapter.supports_draft_streaming(
+            chat_type="dm", chat_id="toggle-user"
+        )
+        toggle_adapter._last_msg_id["toggle-user"] = "toggle-typing"
+        await toggle_adapter.send_typing("toggle-user")
+        await toggle_adapter.send_typing("toggle-user")
+        assert len(toggle_adapter.typing_calls) == 2
+
+        # Revoking the lane must not discard an already-visible stream. Its
+        # map entry keeps the passive-reply budget protected until close.
+        gateway_run._load_gateway_config = lambda: {
+            "display": {"platforms": {"qqbot": {"streaming": True}}}
+        }
+        open_toggle_adapter = GatewayDummyAdapter()
+        open_toggle_source = SimpleNamespace(
+            platform=Platform.QQBOT,
+            chat_id="toggle-open-user",
+            chat_type="dm",
+        )
+        runner._build_stream_consumer_config(
+            open_toggle_source,
+            StreamingConfig(enabled=True, transport="auto"),
+            open_toggle_adapter,
+            on_missing_cursor="raise",
+        )
+        await open_toggle_adapter.send_draft(
+            "toggle-open-user",
+            3401,
+            "处理中",
+            {"reply_to_message_id": "toggle-open-msg"},
+        )
+        gateway_run._load_gateway_config = lambda: {
+            "display": {"platforms": {"qqbot": {"streaming": False}}}
+        }
+        try:
+            runner._build_stream_consumer_config(
+                open_toggle_source,
+                StreamingConfig(enabled=True, transport="auto"),
+                open_toggle_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("open stream config disable bypassed gate")
+        assert "toggle-open-user" not in streaming_mod._native_lane_chats(
+            open_toggle_adapter
+        )
+        assert not open_toggle_adapter.supports_draft_streaming(
+            chat_type="dm", chat_id="toggle-open-user"
+        )
+        assert streaming_mod._typing_budget_applies(
+            open_toggle_adapter, "toggle-open-user"
+        )
+        closed_toggle = await open_toggle_adapter.abandon_open_draft(
+            "toggle-open-user",
+            "处理中",
+            {"reply_to_message_id": "toggle-open-msg"},
+        )
+        assert closed_toggle.success
+
         disabled_gate_adapter._last_msg_id["user-interim-only"] = "typing-off"
         await disabled_gate_adapter.send_typing("user-interim-only")
         await disabled_gate_adapter.send_typing("user-interim-only")
@@ -563,6 +694,54 @@ async def main():
     assert consumer.final_response_sent is True
     assert consumer.delivered_final_matches("阶段一，阶段二，完成") is True
 
+    # A response beyond one QQ message must roll over as complete native
+    # stream chunks. Generic Hermes overflow would emit an ordinary head and
+    # then reuse the draft id with a shorter tail, violating replace-prefix.
+    overflow = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(overflow, "user-overflow")
+    overflow_cfg = StreamConsumerConfig(
+        transport="auto",
+        chat_type="dm",
+        edit_interval=0.01,
+        buffer_threshold=1,
+        cursor="",
+    )
+    overflow_consumer = GatewayStreamConsumer(
+        overflow,
+        "user-overflow",
+        overflow_cfg,
+        initial_reply_to_id="inbound-overflow",
+    )
+    overflow_final = "A" * 2000 + "B" * 2100 + "C" * 300
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(overflow_consumer.run)
+        overflow_consumer.on_delta("A" * 2000)
+        await anyio.sleep(0.05)
+        overflow_consumer.on_delta("B" * 2100)
+        await anyio.sleep(0.05)
+        overflow_consumer.on_delta("C" * 300)
+        await anyio.sleep(0.05)
+        overflow_consumer.finish(overflow_final)
+
+    overflow_bodies = [call[2] for call in overflow.api_calls]
+    assert not overflow.normal_sends
+    assert sum(body["index"] == 0 for body in overflow_bodies) == 2
+    sealed_chunks = [
+        body["content_raw"]
+        for body in overflow_bodies
+        if body["input_state"] == 10
+    ]
+    assert len(sealed_chunks) == 2
+    assert "".join(sealed_chunks) == overflow_final
+    active_prefix = ""
+    for body in overflow_bodies:
+        if body["index"] == 0:
+            active_prefix = ""
+        assert body["content_raw"].startswith(active_prefix)
+        active_prefix = body["content_raw"]
+    assert overflow_consumer.final_response_sent is True
+    assert overflow_consumer.delivered_final_matches(overflow_final) is True
+
     # A stale/cancelled consumer can close the same visible stream through
     # Hermes' real three-argument abandon_open_draft contract.
     cancelled = GatewayDummyAdapter()
@@ -596,6 +775,9 @@ async def main():
     print("qq_c2c_typing_budget=ok")
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
+    print("qq_c2c_guild_dm_rejected=ok")
+    print("qq_c2c_runtime_disable_revokes_lane=ok")
+    print("qq_c2c_overflow_rollover=ok")
 
 
 anyio.run(main)
