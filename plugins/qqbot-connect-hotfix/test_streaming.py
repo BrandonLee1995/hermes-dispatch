@@ -284,16 +284,43 @@ async def main():
     retry_streams, _retry_anchors = streaming_mod._stream_maps(seal_retry)
     assert not retry_streams
 
-    # A persistent seal failure may use one ordinary visible final, but the
-    # opened native-stream state remains available for an explicit close retry.
+    # After a failed final seal, the ordinary visible final lands first and a
+    # second bounded attempt closes the old partial without duplicating final
+    # content in that stream.
+    seal_degrade = DummyAdapter()
+    await seal_degrade.send_draft(
+        "user-seal-degrade",
+        3102,
+        "处理中",
+        {"reply_to_message_id": "msg-seal-degrade"},
+    )
+    seal_degrade.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS)
+    degraded = await seal_degrade.send(
+        "user-seal-degrade",
+        "最终回退",
+        reply_to="msg-seal-degrade",
+        metadata={
+            "notify": True,
+            "reply_to_message_id": "msg-seal-degrade",
+        },
+    )
+    assert degraded.success
+    assert seal_degrade.normal_sends[-1][1] == "最终回退"
+    degrade_streams, _degrade_anchors = streaming_mod._stream_maps(seal_degrade)
+    assert not degrade_streams
+    assert seal_degrade.api_calls[-1][2]["input_state"] == 10
+    assert seal_degrade.api_calls[-1][2]["content_raw"] == "处理中"
+
+    # If both the final seal and post-fallback close remain unavailable, the
+    # state is still addressable for an explicit later close retry.
     seal_recover = DummyAdapter()
     await seal_recover.send_draft(
         "user-seal-recover",
-        3102,
+        3103,
         "处理中",
         {"reply_to_message_id": "msg-seal-recover"},
     )
-    seal_recover.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS)
+    seal_recover.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS) * 2
     recovered_fallback = await seal_recover.send(
         "user-seal-recover",
         "最终回退",
@@ -306,14 +333,14 @@ async def main():
     assert recovered_fallback.success
     assert seal_recover.normal_sends[-1][1] == "最终回退"
     recover_streams, _recover_anchors = streaming_mod._stream_maps(seal_recover)
-    assert 3102 in recover_streams
+    assert 3103 in recover_streams
     closed_after_failure = await seal_recover.abandon_open_draft(
         "user-seal-recover",
         "最终回退",
         {"reply_to_message_id": "msg-seal-recover"},
     )
     assert closed_after_failure.success
-    assert 3102 not in recover_streams
+    assert 3103 not in recover_streams
 
     # Capacity pressure never discards an opened stream. The extra turn stays
     # final-only, while both existing streams remain sealable.
@@ -459,6 +486,7 @@ async def main():
     print("qq_c2c_stream_abandon_close=ok")
     print("qq_c2c_stream_fallback=ok")
     print("qq_c2c_stream_seal_retry=ok")
+    print("qq_c2c_stream_safe_final_fallback_close=ok")
     print("qq_c2c_stream_seal_state_retained=ok")
     print("qq_c2c_stream_capacity_preserves_opened=ok")
     print("qq_c2c_disabled_typing_unchanged=ok")

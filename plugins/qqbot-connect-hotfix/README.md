@@ -37,13 +37,15 @@ The 1.8.2 typing budget applies only after the Gateway has selected a native
 C2C lane for that chat (or a native stream is actually open). With streaming
 disabled, the plugin leaves Hermes' original periodic `send_typing` behavior
 unchanged. A transient final-seal error is retried at the same unacknowledged
-index. If all bounded retries fail, the ordinary final remains available and
-the opened stream state is retained so `abandon_open_draft` or a later seal
-attempt can close it. Capacity pressure removes only streams whose first frame
-never opened; it never discards a client-visible stream. The extra turn stays
+index. If those retries fail, the complete ordinary final is sent first; the
+plugin then tries to close the older stream with its last acknowledged partial
+body, avoiding a second copy of the final answer. If QQ remains unavailable,
+the opened state is retained so `abandon_open_draft` or a later seal attempt can
+still close it. Capacity pressure removes only streams whose first frame never
+opened; it never discards a client-visible stream. The extra turn stays
 final-only when all 128 slots are opened. These disabled-mode, retry, recovery,
-and capacity contracts are covered by `test_streaming.py` against the official
-Hermes 0.20.0 and 0.20.5 release sources.
+safe-degradation, and capacity contracts are covered by `test_streaming.py`
+against the official Hermes 0.20.0 and 0.20.5 release sources.
 
 Version 1.8.1 preserves QQ's already-submitted stream prefix when Hermes seals
 a tool-using private-chat turn. Hermes' cumulative draft can contain commentary

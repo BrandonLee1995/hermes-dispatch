@@ -546,6 +546,7 @@ def patch_qq_c2c_streaming(QQAdapter):
         # GatewayStreamConsumer marks its turn-final send with notify=True.
         # Only intercept that exact path: approvals, slash-command replies,
         # heartbeats, and steering acknowledgements must remain independent.
+        recovery_state = None
         if (
             isinstance(metadata, dict)
             and metadata.get("notify") is True
@@ -571,14 +572,35 @@ def patch_qq_c2c_streaming(QQAdapter):
                 )
                 # The normal final is a safe visible fallback, but the opened
                 # stream stays addressable so abandon/retry can still seal it.
+                if state.stream_msg_id:
+                    recovery_state = state
 
-        return await original_send(
+        normal_result = await original_send(
             self,
             chat_id,
             content,
             reply_to=reply_to,
             metadata=metadata,
         )
+        if recovery_state is not None and getattr(normal_result, "success", False):
+            # Once the complete ordinary final is visible, best-effort close
+            # the older stream with its last acknowledged partial body. This
+            # avoids duplicating the final answer in two bubbles. If QQ is
+            # still unavailable, _seal_stream leaves the state retryable.
+            recovery = await _seal_stream(
+                self,
+                recovery_state,
+                recovery_state.last_content,
+            )
+            if not recovery.success:
+                logger.warning(
+                    "qqbot-connect-hotfix: QQ C2C fallback final sent but "
+                    "stream close remains pending for chat=%s draft=%s: %s",
+                    chat_id,
+                    recovery_state.draft_id,
+                    recovery.error,
+                )
+        return normal_result
 
     @functools.wraps(original_send_typing)
     async def send_typing(
