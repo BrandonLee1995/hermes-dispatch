@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -22,8 +23,31 @@ logger = logging.getLogger(__name__)
 
 _STREAM_PATCHED = "_qqbot_native_c2c_streaming_patched"
 _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
+_MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
 _MAX_TYPING_ANCHORS = 1024
+_SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
+
+
+def _hermes_version_tuple() -> tuple[int, ...]:
+    """Return the running Hermes version without consulting package metadata.
+
+    Profile installs can place a newer distribution metadata record beside an
+    older source checkout.  ``hermes_cli.__version__`` follows the code that is
+    actually imported by the Gateway, which is the compatibility boundary that
+    matters here.
+    """
+
+    try:
+        from hermes_cli import __version__
+    except Exception:
+        return ()
+    return tuple(int(part) for part in re.findall(r"\d+", str(__version__))[:3])
+
+
+def _hermes_streaming_supported() -> bool:
+    version = _hermes_version_tuple()
+    return bool(version) and version >= _MIN_HERMES_VERSION
 
 
 def _send_result(*, success: bool, message_id=None, error=None, raw_response=None):
@@ -71,15 +95,53 @@ def _remove_stream(adapter, state: _QQC2CStream) -> None:
         anchors.pop(anchor_key, None)
 
 
-def _evict_streams(adapter) -> None:
+def _evict_unopened_streams(adapter, *, limit: int) -> None:
+    """Reclaim only streams that never became visible on QQ.
+
+    An opened stream must remain addressable until it is sealed.  Silently
+    dropping its local state can strand a client-visible message in the
+    generating state.  If all slots are opened, the new turn stays final-only
+    instead of sacrificing an existing stream.
+    """
+
     streams, anchors = _stream_maps(adapter)
-    while len(streams) > _MAX_OPEN_STREAMS:
-        _draft_id, state = next(iter(streams.items()))
-        _remove_stream(adapter, state)
+    while len(streams) > max(0, limit):
+        removable = next(
+            (
+                state
+                for state in streams.values()
+                if not state.stream_msg_id and not state.lock.locked()
+            ),
+            None,
+        )
+        if removable is None:
+            break
+        _remove_stream(adapter, removable)
     # Defensive cleanup for anchors whose stream was removed independently.
     for anchor_key, draft_id in list(anchors.items()):
         if draft_id not in streams:
             anchors.pop(anchor_key, None)
+
+
+def _native_lane_chats(adapter) -> set[str]:
+    chats = getattr(adapter, "_qq_native_c2c_lane_chats", None)
+    if chats is None:
+        chats = set()
+        adapter._qq_native_c2c_lane_chats = chats
+    return chats
+
+
+def _mark_native_lane(adapter, chat_id: str) -> None:
+    if chat_id:
+        _native_lane_chats(adapter).add(str(chat_id))
+
+
+def _typing_budget_applies(adapter, chat_id: str) -> bool:
+    chat_id = str(chat_id)
+    if chat_id in _native_lane_chats(adapter):
+        return True
+    streams, _anchors = _stream_maps(adapter)
+    return any(state.chat_id == chat_id for state in streams.values())
 
 
 def _patch_gateway_stream_gate(QQAdapter) -> str:
@@ -128,6 +190,10 @@ def _patch_gateway_stream_gate(QQAdapter) -> str:
             except Exception:
                 native_c2c = False
             if native_c2c:
+                _mark_native_lane(
+                    adapter,
+                    str(getattr(source, "chat_id", "") or ""),
+                )
                 config, pause_typing = original_build(
                     self,
                     source,
@@ -278,23 +344,37 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
                 success=False,
                 error="QQ stream cannot be sealed before its first frame",
             )
-        try:
-            seal_content = _seal_content(adapter, state, content)
-            data = await _post_stream_frame(
-                adapter,
-                state,
-                seal_content,
-                input_state=10,
-            )
-        except Exception as exc:
-            logger.warning(
-                "qqbot-connect-hotfix: QQ C2C stream seal failed for chat=%s "
-                "draft=%s: %s",
-                state.chat_id,
-                state.draft_id,
-                exc,
-            )
-            return _send_result(success=False, error=str(exc))
+        seal_content = _seal_content(adapter, state, content)
+        data = None
+        last_error = None
+        for attempt, delay in enumerate(_SEAL_RETRY_DELAYS, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                data = await _post_stream_frame(
+                    adapter,
+                    state,
+                    seal_content,
+                    input_state=10,
+                )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "qqbot-connect-hotfix: QQ C2C stream seal attempt %s/%s "
+                    "failed for chat=%s draft=%s index=%s: %s",
+                    attempt,
+                    len(_SEAL_RETRY_DELAYS),
+                    state.chat_id,
+                    state.draft_id,
+                    state.next_index,
+                    exc,
+                )
+        if last_error is not None:
+            # Keep both maps intact. A later turn-final retry or
+            # abandon_open_draft can still seal this already-visible stream.
+            return _send_result(success=False, error=str(last_error))
 
         state.sealed = True
         logger.info(
@@ -322,6 +402,14 @@ def patch_qq_c2c_streaming(QQAdapter):
     * QQ's passive ``input_notify`` is emitted at most once per inbound
       ``msg_id`` so a fallback path still has reply budget for the final.
     """
+
+    if not _hermes_streaming_supported():
+        found = _hermes_version_tuple()
+        found_text = ".".join(str(part) for part in found) or "unknown"
+        return (
+            "QQ C2C native streaming disabled: requires Hermes >=0.20.5 "
+            f"(found {found_text})"
+        )
 
     original_send = QQAdapter.send
     if getattr(original_send, _STREAM_PATCHED, False):
@@ -367,6 +455,19 @@ def patch_qq_c2c_streaming(QQAdapter):
         streams, anchors = _stream_maps(self)
         state = streams.get(int(draft_id))
         if state is None:
+            _evict_unopened_streams(self, limit=_MAX_OPEN_STREAMS - 1)
+            if len(streams) >= _MAX_OPEN_STREAMS:
+                logger.warning(
+                    "qqbot-connect-hotfix: native C2C stream capacity reached; "
+                    "keeping %s opened streams retryable and using final-only "
+                    "delivery for chat=%s",
+                    len(streams),
+                    chat_id,
+                )
+                # Reporting success keeps GatewayStreamConsumer on the native
+                # lane without emitting an uneditable partial. Since no anchor
+                # is registered, the turn-final wrapper sends one normal final.
+                return _send_result(success=True)
             state = _QQC2CStream(
                 chat_id=chat_id,
                 draft_id=int(draft_id),
@@ -375,7 +476,7 @@ def patch_qq_c2c_streaming(QQAdapter):
             )
             streams[state.draft_id] = state
             anchors[(chat_id, reply_to)] = state.draft_id
-            _evict_streams(self)
+            _mark_native_lane(self, chat_id)
         elif state.chat_id != chat_id or state.reply_to != reply_to:
             return _send_result(
                 success=False,
@@ -468,7 +569,8 @@ def patch_qq_c2c_streaming(QQAdapter):
                     chat_id,
                     sealed.error,
                 )
-                _remove_stream(self, state)
+                # The normal final is a safe visible fallback, but the opened
+                # stream stays addressable so abandon/retry can still seal it.
 
         return await original_send(
             self,
@@ -485,6 +587,8 @@ def patch_qq_c2c_streaming(QQAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ):
         chat_id = str(chat_id)
+        if not _typing_budget_applies(self, chat_id):
+            return await original_send_typing(self, chat_id, metadata=metadata)
         msg_id = str(getattr(self, "_last_msg_id", {}).get(chat_id) or "")
         if not msg_id:
             return await original_send_typing(self, chat_id, metadata=metadata)

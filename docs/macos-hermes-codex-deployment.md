@@ -117,6 +117,37 @@ hermes gateway stop
 先运行向导，让当前 Hermes 生成完整配置结构，再用命令调整。不要直接复制旧版本的
 整份 `config.yaml`。
 
+QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。0.20.0 的
+`GatewayStreamConsumer.finish()` 和 draft capability probe 契约不完整，不能启用本文的
+QQ streaming 设置。先检查实际运行源码版本：
+
+```bash
+hermes --version
+HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+"$HERMES_PY" - <<'PY'
+import re
+from hermes_cli import __version__
+
+version = tuple(int(part) for part in re.findall(r"\d+", __version__)[:3])
+if version < (0, 20, 5):
+    raise SystemExit(f"Hermes {__version__} is too old; require >= 0.20.5")
+print(f"Hermes {__version__}: QQ native streaming compatible")
+PY
+```
+
+旧环境先查看更新范围和所有 profile 的重启计划，再执行带备份的官方更新：
+
+```bash
+hermes update --check
+hermes update --plan
+hermes update --backup
+hermes --version
+```
+
+版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
+Gateway。`qqbot-connect-hotfix` 1.8.2 在旧版或无法识别版本的 Hermes 上会 fail-closed，
+不会替换 `send`、`send_typing` 或 Gateway streaming gate。
+
 ## 5. 用命令配置 `config.yaml`
 
 以下命令均写入当前部门账号的 `~/.hermes/config.yaml`：
@@ -155,10 +186,11 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.0 起，QQ 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.2 在 Hermes 0.20.5 或更高版本上让 QQ 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
-  不使用该 C2C 端点，仍走原有被动回复路径。插件会把同一入站消息的 `input_notify`
-  限制为一次，避免长任务在 final 前耗尽被动回复额度。
+  不使用该 C2C 端点，仍走原有被动回复路径。只有 Gateway 已为该私聊选择 native lane
+  或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
+  streaming 后保留 Hermes 原始 typing 行为。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -519,7 +551,10 @@ rg -n '^(WHATSAPP_ENABLED|HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS|HERMES_CO
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
-hermes update --yes
+hermes update --check
+hermes update --plan
+hermes update --backup
+hermes --version  # QQ native streaming 要求 >= 0.20.5
 git -C "$HOME/src/hermes-dispatch" pull --ff-only origin main
 cd "$HOME/src/hermes-dispatch"
 scripts/install-plugins.sh "$HOME/.hermes"

@@ -24,6 +24,27 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.2 requires Hermes 0.20.5 or newer for native C2C streaming. Hermes
+0.20.0 does not pass `chat_id` to the draft-capability probe and its
+`GatewayStreamConsumer.finish()` cannot accept the authoritative final text.
+On an older or unknown runtime the streaming patch now fails closed: it does
+not replace `send`, `send_typing`, or the Gateway stream gate, while the other
+QQ hotfix modules continue to load. Check with `hermes --version`; on an older
+installation run `hermes update --plan`, then `hermes update --backup`, and
+verify 0.20.5 or newer before enabling the settings below.
+
+The 1.8.2 typing budget applies only after the Gateway has selected a native
+C2C lane for that chat (or a native stream is actually open). With streaming
+disabled, the plugin leaves Hermes' original periodic `send_typing` behavior
+unchanged. A transient final-seal error is retried at the same unacknowledged
+index. If all bounded retries fail, the ordinary final remains available and
+the opened stream state is retained so `abandon_open_draft` or a later seal
+attempt can close it. Capacity pressure removes only streams whose first frame
+never opened; it never discards a client-visible stream. The extra turn stays
+final-only when all 128 slots are opened. These disabled-mode, retry, recovery,
+and capacity contracts are covered by `test_streaming.py` against the official
+Hermes 0.20.0 and 0.20.5 release sources.
+
 Version 1.8.1 preserves QQ's already-submitted stream prefix when Hermes seals
 a tool-using private-chat turn. Hermes' cumulative draft can contain commentary
 and tool progress before the final answer, while its turn-final `send()` may
@@ -75,6 +96,10 @@ fails, Hermes falls back to its normal final-message path.
 
 Enable the feature per profile:
 
+```bash
+hermes --version  # must report 0.20.5 or newer
+```
+
 ```yaml
 streaming:
   enabled: true
@@ -100,8 +125,11 @@ In a real QQ private chat, start a tool-using task and verify that one message
 updates in place, the last frame is sealed rather than duplicated, `/steer`
 does not seal the stream, and logs contain neither error `40034128` nor a
 second final send.  Roll back by setting
-`display.platforms.qqbot.streaming: false`, restoring the previous plugin
-directory, and restarting only the affected profile's Gateway.
+`display.platforms.qqbot.streaming: false` and restarting only the affected
+profile's Gateway. The restart creates a fresh adapter, so the native-lane
+typing budget is also removed. To roll back the complete 1.8.2 code change,
+restore the previous plugin directory from outside the plugin discovery tree
+and restart that profile.
 
 Version 1.7.0 adds the narrow expired-reply fallback used by upstream Hermes
 PR [#85221](https://github.com/NousResearch/hermes-agent/pull/85221). QQ can

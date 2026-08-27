@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,13 @@ def load_plugin_module():
 
 
 mod = load_plugin_module()
+streaming_mod = sys.modules[mod.__name__ + ".streaming"]
+
+
+def hermes_version_tuple():
+    from hermes_cli import __version__
+
+    return tuple(int(part) for part in re.findall(r"\d+", __version__)[:3])
 
 
 class DummyAdapter:
@@ -41,6 +49,7 @@ class DummyAdapter:
         self.typing_calls = []
         self.stream_counter = 0
         self.fail_next_stream = False
+        self.fail_seal_attempts = 0
 
     def _guess_chat_type(self, chat_id):
         return "group" if str(chat_id).startswith("group-") else "c2c"
@@ -53,6 +62,9 @@ class DummyAdapter:
         if self.fail_next_stream:
             self.fail_next_stream = False
             raise RuntimeError("stream unavailable")
+        if body["input_state"] == 10 and self.fail_seal_attempts:
+            self.fail_seal_attempts -= 1
+            raise RuntimeError("seal unavailable")
         self.stream_counter += 1
         if body["index"] == 0:
             return {"id": f"stream-{self.stream_counter}"}
@@ -80,6 +92,25 @@ GatewayDummyAdapter.SUPPORTS_MESSAGE_EDITING = False
 
 async def main():
     status = mod._patch_qq_c2c_streaming(DummyAdapter)
+    if hermes_version_tuple() < (0, 20, 5):
+        assert status.startswith(
+            "QQ C2C native streaming disabled: requires Hermes >=0.20.5"
+        )
+        assert not hasattr(DummyAdapter, "send_draft")
+        assert not getattr(
+            GatewayRunner._build_stream_consumer_config,
+            streaming_mod._RUNNER_PATCHED,
+            False,
+        )
+        legacy = DummyAdapter()
+        legacy._last_msg_id["user-disabled"] = "disabled-1"
+        await legacy.send_typing("user-disabled")
+        await legacy.send_typing("user-disabled")
+        assert len(legacy.typing_calls) == 2
+        print("qq_c2c_hermes_0_20_0_fail_closed=ok")
+        print("qq_c2c_disabled_typing_unchanged=ok")
+        return
+
     assert status == "QQ C2C native streaming patched"
     assert mod._patch_qq_c2c_streaming(DummyAdapter).endswith("already patched")
 
@@ -232,9 +263,106 @@ async def main():
     assert normal.success
     assert fallback.normal_sends[-1][1] == "最终回退"
 
-    # Typing is bounded to one passive input_notify per inbound msg_id.
+    # A transient seal error retries the same acknowledged index and closes
+    # the stream without emitting an ordinary duplicate final.
+    seal_retry = DummyAdapter()
+    await seal_retry.send_draft(
+        "user-seal-retry",
+        3101,
+        "处理中",
+        {"reply_to_message_id": "msg-seal-retry"},
+    )
+    seal_retry.fail_seal_attempts = 1
+    retried = await seal_retry.send(
+        "user-seal-retry",
+        "最终答案",
+        reply_to="msg-seal-retry",
+        metadata={"notify": True, "reply_to_message_id": "msg-seal-retry"},
+    )
+    assert retried.success
+    assert not seal_retry.normal_sends
+    retry_streams, _retry_anchors = streaming_mod._stream_maps(seal_retry)
+    assert not retry_streams
+
+    # A persistent seal failure may use one ordinary visible final, but the
+    # opened native-stream state remains available for an explicit close retry.
+    seal_recover = DummyAdapter()
+    await seal_recover.send_draft(
+        "user-seal-recover",
+        3102,
+        "处理中",
+        {"reply_to_message_id": "msg-seal-recover"},
+    )
+    seal_recover.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS)
+    recovered_fallback = await seal_recover.send(
+        "user-seal-recover",
+        "最终回退",
+        reply_to="msg-seal-recover",
+        metadata={
+            "notify": True,
+            "reply_to_message_id": "msg-seal-recover",
+        },
+    )
+    assert recovered_fallback.success
+    assert seal_recover.normal_sends[-1][1] == "最终回退"
+    recover_streams, _recover_anchors = streaming_mod._stream_maps(seal_recover)
+    assert 3102 in recover_streams
+    closed_after_failure = await seal_recover.abandon_open_draft(
+        "user-seal-recover",
+        "最终回退",
+        {"reply_to_message_id": "msg-seal-recover"},
+    )
+    assert closed_after_failure.success
+    assert 3102 not in recover_streams
+
+    # Capacity pressure never discards an opened stream. The extra turn stays
+    # final-only, while both existing streams remain sealable.
+    capacity = DummyAdapter()
+    previous_capacity = streaming_mod._MAX_OPEN_STREAMS
+    streaming_mod._MAX_OPEN_STREAMS = 2
+    try:
+        await capacity.send_draft(
+            "user-cap-a", 3201, "A", {"reply_to_message_id": "msg-cap-a"}
+        )
+        await capacity.send_draft(
+            "user-cap-b", 3202, "B", {"reply_to_message_id": "msg-cap-b"}
+        )
+        before_extra = len(capacity.api_calls)
+        extra = await capacity.send_draft(
+            "user-cap-c", 3203, "C", {"reply_to_message_id": "msg-cap-c"}
+        )
+        assert extra.success
+        assert len(capacity.api_calls) == before_extra
+        capacity_streams, _capacity_anchors = streaming_mod._stream_maps(capacity)
+        assert set(capacity_streams) == {3201, 3202}
+        capacity_final = await capacity.send(
+            "user-cap-c",
+            "C final",
+            reply_to="msg-cap-c",
+            metadata={"notify": True, "reply_to_message_id": "msg-cap-c"},
+        )
+        assert capacity_final.success
+        assert capacity.normal_sends[-1][1] == "C final"
+        assert set(capacity_streams) == {3201, 3202}
+    finally:
+        streaming_mod._MAX_OPEN_STREAMS = previous_capacity
+
+    # With streaming disabled/no native lane, preserve upstream periodic
+    # typing behavior exactly.
+    disabled_typing = DummyAdapter()
+    disabled_typing._last_msg_id["user-disabled"] = "typing-disabled"
+    await disabled_typing.send_typing("user-disabled")
+    await disabled_typing.send_typing("user-disabled")
+    await disabled_typing.send_typing("user-disabled")
+    assert len(disabled_typing.typing_calls) == 3
+
+    # An active native lane is bounded to one passive input_notify per inbound
+    # msg_id so the final retains its passive-reply budget.
     typing = DummyAdapter()
     typing._last_msg_id["user-t"] = "typing-1"
+    await typing.send_draft(
+        "user-t", 3301, "处理中", {"reply_to_message_id": "typing-1"}
+    )
     await typing.send_typing("user-t")
     await typing.send_typing("user-t")
     await typing.send_typing("user-t")
@@ -330,6 +458,10 @@ async def main():
     print("qq_c2c_stream_nonfinal_send_isolation=ok")
     print("qq_c2c_stream_abandon_close=ok")
     print("qq_c2c_stream_fallback=ok")
+    print("qq_c2c_stream_seal_retry=ok")
+    print("qq_c2c_stream_seal_state_retained=ok")
+    print("qq_c2c_stream_capacity_preserves_opened=ok")
+    print("qq_c2c_disabled_typing_unchanged=ok")
     print("qq_c2c_typing_budget=ok")
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
