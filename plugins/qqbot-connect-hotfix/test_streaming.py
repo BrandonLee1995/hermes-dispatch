@@ -1,5 +1,4 @@
 import importlib.util
-import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +6,8 @@ from types import SimpleNamespace
 import anyio
 
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.config import StreamingConfig
+from gateway.config import Platform, StreamingConfig
+import gateway.run as gateway_run
 from gateway.run import GatewayRunner
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
@@ -32,9 +32,7 @@ streaming_mod = sys.modules[mod.__name__ + ".streaming"]
 
 
 def hermes_version_tuple():
-    from hermes_cli import __version__
-
-    return tuple(int(part) for part in re.findall(r"\d+", __version__)[:3])
+    return streaming_mod._hermes_version_tuple()
 
 
 class DummyAdapter:
@@ -114,8 +112,24 @@ async def main():
     assert status == "QQ C2C native streaming patched"
     assert mod._patch_qq_c2c_streaming(DummyAdapter).endswith("already patched")
 
+    # Only an exact stable release version may enable the patch. Pre-release
+    # suffixes fail closed even when their numeric core is 0.20.5.
+    import hermes_cli
+
+    original_version = hermes_cli.__version__
+    try:
+        for candidate in ("0.20.5rc1", "0.20.5.dev0", "0.20.5+local"):
+            hermes_cli.__version__ = candidate
+            assert streaming_mod._hermes_version_tuple() == ()
+            assert not streaming_mod._hermes_streaming_supported()
+        hermes_cli.__version__ = "0.20.5"
+        assert streaming_mod._hermes_version_tuple() == (0, 20, 5)
+        assert streaming_mod._hermes_streaming_supported()
+    finally:
+        hermes_cli.__version__ = original_version
+
     adapter = DummyAdapter()
-    assert adapter.supports_draft_streaming(chat_type="dm", chat_id="user-1")
+    assert not adapter.supports_draft_streaming(chat_type="dm", chat_id="user-1")
     assert not adapter.supports_draft_streaming(
         chat_type="group", chat_id="group-1"
     )
@@ -130,6 +144,7 @@ async def main():
     metadata = {"reply_to_message_id": "inbound-1"}
     first = await adapter.send_draft("user-1", 1001, "正在读取", metadata)
     second = await adapter.send_draft("user-1", 1001, "正在读取知识库", metadata)
+    assert adapter.supports_draft_streaming(chat_type="dm", chat_id="user-1")
     assert first.success and second.success
     assert len(adapter.api_calls) == 2
     first_body = adapter.api_calls[0][2]
@@ -404,33 +419,119 @@ async def main():
     gate_adapter = GatewayDummyAdapter()
     runner = object.__new__(GatewayRunner)
     scfg = StreamingConfig(enabled=True, transport="auto")
-    c2c_cfg, _pause = runner._build_stream_consumer_config(
-        SimpleNamespace(platform="qqbot", chat_id="user-gate", chat_type="dm"),
-        scfg,
-        gate_adapter,
-        on_missing_cursor="raise",
-    )
-    assert c2c_cfg.transport == "auto"
-    assert c2c_cfg.cursor == ""
+    original_config_loader = gateway_run._load_gateway_config
     try:
-        runner._build_stream_consumer_config(
+        gateway_run._load_gateway_config = lambda: {
+            "display": {
+                "platforms": {
+                    "qqbot": {
+                        "streaming": True,
+                        "interim_assistant_messages": True,
+                    }
+                }
+            }
+        }
+        c2c_cfg, _pause = runner._build_stream_consumer_config(
             SimpleNamespace(
-                platform="qqbot", chat_id="group-gate", chat_type="group"
+                platform=Platform.QQBOT,
+                chat_id="user-gate",
+                chat_type="dm",
             ),
             scfg,
             gate_adapter,
             on_missing_cursor="raise",
         )
-    except RuntimeError as exc:
-        assert "non-editable platform" in str(exc)
-    else:
-        raise AssertionError("QQ group unexpectedly bypassed edit-only gate")
+        assert c2c_cfg.transport == "auto"
+        assert c2c_cfg.cursor == ""
+        assert gate_adapter.supports_draft_streaming(
+            chat_type="dm", chat_id="user-gate"
+        )
+        try:
+            runner._build_stream_consumer_config(
+                SimpleNamespace(
+                    platform=Platform.QQBOT,
+                    chat_id="group-gate",
+                    chat_type="group",
+                ),
+                scfg,
+                gate_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError as exc:
+            assert "non-editable platform" in str(exc)
+        else:
+            raise AssertionError("QQ group unexpectedly bypassed edit-only gate")
+
+        # Real in-process Runner combination: interim messages alone can cause
+        # this builder call while both global and QQ streaming are false. The
+        # native lane must remain disabled and upstream's non-editable gate
+        # must reject the consumer.
+        gateway_run._load_gateway_config = lambda: {
+            "display": {
+                "interim_assistant_messages": True,
+                "platforms": {
+                    "qqbot": {
+                        "streaming": False,
+                        "interim_assistant_messages": True,
+                    }
+                },
+            }
+        }
+        disabled_gate_adapter = GatewayDummyAdapter()
+        disabled_scfg = StreamingConfig(enabled=False, transport="auto")
+        try:
+            runner._build_stream_consumer_config(
+                SimpleNamespace(
+                    platform=Platform.QQBOT,
+                    chat_id="user-interim-only",
+                    chat_type="dm",
+                ),
+                disabled_scfg,
+                disabled_gate_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError as exc:
+            assert "non-editable platform" in str(exc)
+        else:
+            raise AssertionError("interim-only QQ unexpectedly opened native lane")
+        assert not streaming_mod._native_lane_chats(disabled_gate_adapter)
+        assert not disabled_gate_adapter.supports_draft_streaming(
+            chat_type="dm", chat_id="user-interim-only"
+        )
+
+        # A platform-level opt-out also wins when top-level streaming remains
+        # enabled. This exercises the complete resolved-setting precedence.
+        try:
+            runner._build_stream_consumer_config(
+                SimpleNamespace(
+                    platform=Platform.QQBOT,
+                    chat_id="user-platform-opt-out",
+                    chat_type="dm",
+                ),
+                StreamingConfig(enabled=True, transport="auto"),
+                disabled_gate_adapter,
+                on_missing_cursor="raise",
+            )
+        except RuntimeError as exc:
+            assert "non-editable platform" in str(exc)
+        else:
+            raise AssertionError("QQ platform streaming opt-out was ignored")
+        assert "user-platform-opt-out" not in streaming_mod._native_lane_chats(
+            disabled_gate_adapter
+        )
+        disabled_gate_adapter._last_msg_id["user-interim-only"] = "typing-off"
+        await disabled_gate_adapter.send_typing("user-interim-only")
+        await disabled_gate_adapter.send_typing("user-interim-only")
+        assert len(disabled_gate_adapter.typing_calls) == 2
+    finally:
+        gateway_run._load_gateway_config = original_config_loader
 
     # Exercise the actual Hermes native-draft consumer contract. The QQ
     # stream itself is the message: cumulative frames stay on one stream and
     # the consumer's notify=True final send becomes exactly one seal frame,
     # never a second ordinary QQ message.
     integrated = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(integrated, "user-integrated")
     cfg = StreamConsumerConfig(
         transport="auto",
         chat_type="dm",
@@ -490,6 +591,8 @@ async def main():
     print("qq_c2c_stream_seal_state_retained=ok")
     print("qq_c2c_stream_capacity_preserves_opened=ok")
     print("qq_c2c_disabled_typing_unchanged=ok")
+    print("qq_c2c_interim_only_runner_stays_disabled=ok")
+    print("qq_c2c_prerelease_version_fail_closed=ok")
     print("qq_c2c_typing_budget=ok")
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")

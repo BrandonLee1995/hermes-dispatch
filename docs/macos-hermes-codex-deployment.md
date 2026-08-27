@@ -128,7 +128,13 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 import re
 from hermes_cli import __version__
 
-version = tuple(int(part) for part in re.findall(r"\d+", __version__)[:3])
+match = re.fullmatch(r"\s*(\d+)\.(\d+)\.(\d+)\s*", __version__)
+if match is None:
+    raise SystemExit(
+        f"Hermes {__version__} is not a stable x.y.z release; native QQ "
+        "streaming must fail closed"
+    )
+version = tuple(int(part) for part in match.groups())
 if version < (0, 20, 5):
     raise SystemExit(f"Hermes {__version__} is too old; require >= 0.20.5")
 print(f"Hermes {__version__}: QQ native streaming compatible")
@@ -139,13 +145,15 @@ PY
 
 ```bash
 hermes update --check
-hermes update --plan
+if hermes update --help | rg -q -- '--plan'; then
+  hermes update --plan
+fi
 hermes update --backup
 hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.2 在旧版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.3 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -186,11 +194,12 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.2 在 Hermes 0.20.5 或更高版本上让 QQ 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.3 在稳定版 Hermes 0.20.5 或更高版本上让 QQ 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   不使用该 C2C 端点，仍走原有被动回复路径。只有 Gateway 已为该私聊选择 native lane
   或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
-  streaming 后保留 Hermes 原始 typing 行为。
+  streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
+  native lane，并保留 Hermes 原始 typing 和 final-only 行为。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -552,7 +561,9 @@ rg -n '^(WHATSAPP_ENABLED|HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS|HERMES_CO
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
 hermes update --check
-hermes update --plan
+if hermes update --help | rg -q -- '--plan'; then
+  hermes update --plan
+fi
 hermes update --backup
 hermes --version  # QQ native streaming 要求 >= 0.20.5
 git -C "$HOME/src/hermes-dispatch" pull --ff-only origin main

@@ -42,7 +42,13 @@ def _hermes_version_tuple() -> tuple[int, ...]:
         from hermes_cli import __version__
     except Exception:
         return ()
-    return tuple(int(part) for part in re.findall(r"\d+", str(__version__))[:3])
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)\.(\d+)\s*", str(__version__))
+    if match is None:
+        # Pre-releases (rc/dev/alpha/beta), local suffixes, and unknown version
+        # shapes fail closed. The streaming contract is guaranteed only by a
+        # stable Hermes release at or above the minimum.
+        return ()
+    return tuple(int(part) for part in match.groups())
 
 
 def _hermes_streaming_supported() -> bool:
@@ -144,6 +150,39 @@ def _typing_budget_applies(adapter, chat_id: str) -> bool:
     return any(state.chat_id == chat_id for state in streams.values())
 
 
+def _resolved_platform_streaming_enabled(source, scfg) -> bool:
+    """Mirror Hermes' global + per-platform streaming resolution.
+
+    Hermes can create a ``GatewayStreamConsumer`` solely for interim assistant
+    messages even when streaming itself is disabled. The native QQ lane must
+    therefore use the already-resolved display setting, not consumer creation
+    as evidence that streaming was enabled.
+    """
+
+    global_enabled = bool(
+        getattr(scfg, "enabled", False)
+        and str(getattr(scfg, "transport", "auto") or "auto").lower() != "off"
+    )
+    try:
+        from gateway.display_config import resolve_display_setting
+        from gateway.run import _load_gateway_config, _platform_config_key
+
+        platform_key = _platform_config_key(getattr(source, "platform", "qqbot"))
+        override = resolve_display_setting(
+            _load_gateway_config(),
+            platform_key,
+            "streaming",
+        )
+    except Exception:
+        logger.debug(
+            "qqbot-connect-hotfix: could not resolve per-platform streaming; "
+            "native QQ streaming stays disabled",
+            exc_info=True,
+        )
+        return False
+    return global_enabled if override is None else bool(override)
+
+
 def _patch_gateway_stream_gate(QQAdapter) -> str:
     """Let native QQ C2C drafts pass Hermes' legacy edit-only gate.
 
@@ -176,24 +215,23 @@ def _patch_gateway_stream_gate(QQAdapter) -> str:
         *,
         on_missing_cursor: str,
     ):
-        if (
-            on_missing_cursor == "raise"
-            and isinstance(adapter, QQAdapter)
-            and not getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
-        ):
-            try:
-                native_c2c = adapter.supports_draft_streaming(
-                    chat_type=getattr(source, "chat_type", "") or None,
-                    metadata=None,
-                    chat_id=str(getattr(source, "chat_id", "") or ""),
-                )
-            except Exception:
-                native_c2c = False
-            if native_c2c:
-                _mark_native_lane(
+        if isinstance(adapter, QQAdapter):
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            native_c2c = (
+                _resolved_platform_streaming_enabled(source, scfg)
+                and _is_c2c(
                     adapter,
-                    str(getattr(source, "chat_id", "") or ""),
+                    chat_id,
+                    getattr(source, "chat_type", "") or None,
                 )
+            )
+            if native_c2c:
+                _mark_native_lane(adapter, chat_id)
+            if (
+                native_c2c
+                and on_missing_cursor == "raise"
+                and not getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+            ):
                 config, pause_typing = original_build(
                     self,
                     source,
@@ -424,7 +462,11 @@ def patch_qq_c2c_streaming(QQAdapter):
         chat_id: Optional[str] = None,
     ) -> bool:
         del metadata
-        return bool(chat_id) and _is_c2c(self, str(chat_id), chat_type)
+        return bool(chat_id) and str(chat_id) in _native_lane_chats(self) and _is_c2c(
+            self,
+            str(chat_id),
+            chat_type,
+        )
 
     def stream_is_message_for_chat(self, chat_id: str) -> bool:
         return _is_c2c(self, str(chat_id))

@@ -24,14 +24,22 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
-Version 1.8.2 requires Hermes 0.20.5 or newer for native C2C streaming. Hermes
+Version 1.8.3 activates the native QQ lane only after resolving both Hermes'
+global streaming switch and `display.platforms.qqbot.streaming`. Consumer
+creation for `interim_assistant_messages=true` is not treated as evidence that
+streaming is enabled. This preserves the upstream typing and final-only path
+when a profile explicitly opts out of streaming. Version parsing is also
+strict: pre-release, local-suffix, and unknown version strings fail closed.
+
+Version 1.8.3 requires Hermes 0.20.5 or newer for native C2C streaming. Hermes
 0.20.0 does not pass `chat_id` to the draft-capability probe and its
 `GatewayStreamConsumer.finish()` cannot accept the authoritative final text.
 On an older or unknown runtime the streaming patch now fails closed: it does
 not replace `send`, `send_typing`, or the Gateway stream gate, while the other
 QQ hotfix modules continue to load. Check with `hermes --version`; on an older
-installation run `hermes update --plan`, then `hermes update --backup`, and
-verify 0.20.5 or newer before enabling the settings below.
+installation run `hermes update --check`, run `hermes update --plan` only when
+`hermes update --help` lists that option, then run `hermes update --backup` and
+verify a stable 0.20.5 or newer release before enabling the settings below.
 
 The 1.8.2 typing budget applies only after the Gateway has selected a native
 C2C lane for that chat (or a native stream is actually open). With streaming
@@ -129,7 +137,7 @@ does not seal the stream, and logs contain neither error `40034128` nor a
 second final send.  Roll back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.2 code change,
+typing budget is also removed. To roll back the complete 1.8.3 code change,
 restore the previous plugin directory from outside the plugin discovery tree
 and restart that profile.
 
