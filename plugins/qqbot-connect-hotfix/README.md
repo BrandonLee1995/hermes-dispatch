@@ -35,6 +35,16 @@ private sessions cannot share indices or `stream_msg_id` values.  Approval,
 slash-command, heartbeat, and steering messages bypass the seal path and remain
 independent messages.
 
+Hermes 0.20.5 still rejects adapters with
+`SUPPORTS_MESSAGE_EDITING=false` before its stream consumer probes native draft
+support. QQ ordinary messages are not editable, but C2C streams do not require
+ordinary-message editing. Version 1.8.0 therefore bypasses that legacy gate
+only when the active adapter is QQ and the source is a C2C chat. QQ groups and
+all other non-editable platforms retain the upstream guard. If a native frame
+cannot be opened, the adapter keeps the consumer in a buffered final-only lane
+so the user receives one ordinary final instead of an uneditable partial plus
+a duplicate final.
+
 QQ counts `input_notify` calls against the passive-reply budget associated with
 an inbound message.  Hermes normally refreshes that status every 50 seconds;
 long turns can therefore exhaust the budget before their final response.  The

@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _STREAM_PATCHED = "_qqbot_native_c2c_streaming_patched"
+_RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
 _MAX_OPEN_STREAMS = 128
 _MAX_TYPING_ANCHORS = 1024
 
@@ -79,6 +80,77 @@ def _evict_streams(adapter) -> None:
     for anchor_key, draft_id in list(anchors.items()):
         if draft_id not in streams:
             anchors.pop(anchor_key, None)
+
+
+def _patch_gateway_stream_gate(QQAdapter) -> str:
+    """Let native QQ C2C drafts pass Hermes' legacy edit-only gate.
+
+    Hermes currently rejects every non-editable adapter before
+    ``GatewayStreamConsumer`` can ask whether it supports a native draft
+    transport. QQ cannot edit ordinary messages, but its C2C stream endpoint
+    is exactly such a native transport. Narrow the exception to QQ C2C only;
+    groups and every other non-editable platform keep the upstream guard.
+    """
+
+    try:
+        from gateway.run import GatewayRunner
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch Gateway streaming gate: %s",
+            exc,
+        )
+        return "QQ C2C Gateway streaming gate unavailable"
+
+    original_build = GatewayRunner._build_stream_consumer_config
+    if getattr(original_build, _RUNNER_PATCHED, False):
+        return "QQ C2C Gateway streaming gate already patched"
+
+    @functools.wraps(original_build)
+    def _build_stream_consumer_config(
+        self,
+        source,
+        scfg,
+        adapter,
+        *,
+        on_missing_cursor: str,
+    ):
+        if (
+            on_missing_cursor == "raise"
+            and isinstance(adapter, QQAdapter)
+            and not getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+        ):
+            try:
+                native_c2c = adapter.supports_draft_streaming(
+                    chat_type=getattr(source, "chat_type", "") or None,
+                    metadata=None,
+                    chat_id=str(getattr(source, "chat_id", "") or ""),
+                )
+            except Exception:
+                native_c2c = False
+            if native_c2c:
+                config, pause_typing = original_build(
+                    self,
+                    source,
+                    scfg,
+                    adapter,
+                    on_missing_cursor="fallback",
+                )
+                # QQ renders its own native generating state. A text cursor
+                # is unnecessary and would break replace-prefix stability.
+                config.cursor = ""
+                return config, pause_typing
+
+        return original_build(
+            self,
+            source,
+            scfg,
+            adapter,
+            on_missing_cursor=on_missing_cursor,
+        )
+
+    setattr(_build_stream_consumer_config, _RUNNER_PATCHED, True)
+    GatewayRunner._build_stream_consumer_config = _build_stream_consumer_config
+    return "QQ C2C Gateway streaming gate patched"
 
 
 def _reply_anchor(metadata: Optional[Dict[str, Any]]) -> str:
@@ -287,17 +359,21 @@ def patch_qq_c2c_streaming(QQAdapter):
                 )
             except Exception as exc:
                 logger.warning(
-                    "qqbot-connect-hotfix: QQ C2C stream frame failed for "
-                    "chat=%s draft=%s index=%s: %s",
+                    "qqbot-connect-hotfix: QQ C2C stream frame deferred for "
+                    "chat=%s draft=%s index=%s; retaining final-only "
+                    "fallback: %s",
                     chat_id,
                     draft_id,
                     state.next_index,
                     exc,
                 )
-                # Disarm final interception. GatewayStreamConsumer will fall
-                # back to the normal message path for this turn.
-                _remove_stream(self, state)
-                return _send_result(success=False, error=str(exc))
+                # QQ ordinary messages cannot be edited. Reporting failure to
+                # GatewayStreamConsumer would make its generic fallback send a
+                # partial message immediately, then another final. Keep the
+                # native lane selected: a later frame can retry the same index;
+                # if no frame ever opens, the final send wrapper falls back to
+                # exactly one ordinary message.
+                return _send_result(success=True)
 
         return _send_result(
             success=True,
@@ -395,4 +471,6 @@ def patch_qq_c2c_streaming(QQAdapter):
     QQAdapter.abandon_open_draft = abandon_open_draft
     QQAdapter.send = send
     QQAdapter.send_typing = send_typing
+    gate_status = _patch_gateway_stream_gate(QQAdapter)
+    logger.info("qqbot-connect-hotfix: %s", gate_status)
     return "QQ C2C native streaming patched"

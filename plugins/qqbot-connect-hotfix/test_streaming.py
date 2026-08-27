@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import anyio
 
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.config import StreamingConfig
+from gateway.run import GatewayRunner
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -73,6 +75,7 @@ class GatewayDummyAdapter(DummyAdapter, BasePlatformAdapter):
 
 
 GatewayDummyAdapter.__abstractmethods__ = frozenset()
+GatewayDummyAdapter.SUPPORTS_MESSAGE_EDITING = False
 
 
 async def main():
@@ -173,13 +176,15 @@ async def main():
     assert abandoned.success
     assert adapter.api_calls[-1][2]["input_state"] == 10
 
-    # A failed first frame falls back to the original normal send path.
+    # A failed first frame stays on the native lane so Hermes cannot emit an
+    # uneditable partial. The turn-final wrapper then falls back to exactly
+    # one original normal message when no stream ever opened.
     fallback = DummyAdapter()
     fallback.fail_next_stream = True
     failed = await fallback.send_draft(
         "user-f", 3001, "处理中", {"reply_to_message_id": "msg-f"}
     )
-    assert not failed.success
+    assert failed.success
     normal = await fallback.send(
         "user-f",
         "最终回退",
@@ -199,6 +204,34 @@ async def main():
     typing._last_msg_id["user-t"] = "typing-2"
     await typing.send_typing("user-t")
     assert len(typing.typing_calls) == 2
+
+    # Hermes' in-process runner normally rejects non-editable adapters before
+    # the consumer can probe native draft support. The hotfix bypasses that
+    # legacy gate only for QQ C2C; group chats retain the rejection.
+    gate_adapter = GatewayDummyAdapter()
+    runner = object.__new__(GatewayRunner)
+    scfg = StreamingConfig(enabled=True, transport="auto")
+    c2c_cfg, _pause = runner._build_stream_consumer_config(
+        SimpleNamespace(platform="qqbot", chat_id="user-gate", chat_type="dm"),
+        scfg,
+        gate_adapter,
+        on_missing_cursor="raise",
+    )
+    assert c2c_cfg.transport == "auto"
+    assert c2c_cfg.cursor == ""
+    try:
+        runner._build_stream_consumer_config(
+            SimpleNamespace(
+                platform="qqbot", chat_id="group-gate", chat_type="group"
+            ),
+            scfg,
+            gate_adapter,
+            on_missing_cursor="raise",
+        )
+    except RuntimeError as exc:
+        assert "non-editable platform" in str(exc)
+    else:
+        raise AssertionError("QQ group unexpectedly bypassed edit-only gate")
 
     # Exercise the actual Hermes native-draft consumer contract. The QQ
     # stream itself is the message: cumulative frames stay on one stream and
@@ -259,6 +292,7 @@ async def main():
     print("qq_c2c_stream_abandon_close=ok")
     print("qq_c2c_stream_fallback=ok")
     print("qq_c2c_typing_budget=ok")
+    print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
 
 
