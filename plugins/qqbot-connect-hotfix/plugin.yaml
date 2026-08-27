@@ -1,5 +1,5 @@
 name: qqbot-connect-hotfix
-version: 1.8.5
+version: 1.8.6
 description: "Local hotfix: modular QQBot compatibility patches for connect signature, group interactions, complete Codex approval choices, owner-bound shared-group approvals, channel routing, snapshots/context, mention gating, native C2C streaming, bounded typing, expired reply msg_id fallback, markdown, and media compatibility. Remove after Hermes upgrade."
 author: local
 kind: standalone

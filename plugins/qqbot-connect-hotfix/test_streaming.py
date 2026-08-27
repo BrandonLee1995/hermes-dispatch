@@ -43,6 +43,7 @@ class DummyAdapter:
         self._markdown_support = True
         self._last_msg_id = {}
         self.api_calls = []
+        self.successful_api_calls = []
         self.normal_sends = []
         self.typing_calls = []
         self.stream_counter = 0
@@ -62,7 +63,8 @@ class DummyAdapter:
         return 73
 
     async def _api_request(self, method, path, body):
-        self.api_calls.append((method, path, dict(body)))
+        call = (method, path, dict(body))
+        self.api_calls.append(call)
         if self.fail_next_stream:
             self.fail_next_stream = False
             raise RuntimeError("stream unavailable")
@@ -78,8 +80,11 @@ class DummyAdapter:
             raise RuntimeError("seal unavailable")
         self.stream_counter += 1
         if body["index"] == 0:
-            return {"id": f"stream-{self.stream_counter}"}
-        return {"id": body["stream_msg_id"]}
+            data = {"id": f"stream-{self.stream_counter}"}
+        else:
+            data = {"id": body["stream_msg_id"]}
+        self.successful_api_calls.append(call)
+        return data
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.normal_sends.append((chat_id, content, reply_to, metadata))
@@ -99,6 +104,24 @@ class GatewayDummyAdapter(DummyAdapter, BasePlatformAdapter):
 
 GatewayDummyAdapter.__abstractmethods__ = frozenset()
 GatewayDummyAdapter.SUPPORTS_MESSAGE_EDITING = False
+
+
+def assert_exact_final_ownership(adapter, target):
+    """Every final character has exactly one successful visible owner."""
+
+    sealed = [
+        call[2]["content_raw"]
+        for call in adapter.successful_api_calls
+        if call[2]["input_state"] == 10
+    ]
+    streams, _anchors = streaming_mod._stream_maps(adapter)
+    visible_open = [
+        state.last_content
+        for state in streams.values()
+        if state.stream_msg_id and not state.sealed
+    ]
+    ordinary = [item[1] for item in adapter.normal_sends]
+    assert "".join(sealed + visible_open + ordinary) == target
 
 
 async def main():
@@ -320,9 +343,8 @@ async def main():
     retry_streams, _retry_anchors = streaming_mod._stream_maps(seal_retry)
     assert not retry_streams
 
-    # After a failed final seal, the ordinary visible final lands first and a
-    # second bounded attempt closes the old partial without duplicating final
-    # content in that stream.
+    # After one bounded close round fails, retry the already-visible composed
+    # final in place. Do not emit an ordinary duplicate.
     seal_degrade = DummyAdapter()
     await seal_degrade.send_draft(
         "user-seal-degrade",
@@ -341,14 +363,15 @@ async def main():
         },
     )
     assert degraded.success
-    assert seal_degrade.normal_sends[-1][1] == "最终回退"
+    assert not seal_degrade.normal_sends
     degrade_streams, _degrade_anchors = streaming_mod._stream_maps(seal_degrade)
     assert not degrade_streams
     assert seal_degrade.api_calls[-1][2]["input_state"] == 10
-    assert seal_degrade.api_calls[-1][2]["content_raw"] == "处理中"
+    assert seal_degrade.api_calls[-1][2]["content_raw"] == "处理中\n最终回退"
+    assert_exact_final_ownership(seal_degrade, "处理中\n最终回退")
 
-    # If both the final seal and post-fallback close remain unavailable, the
-    # state is still addressable for an explicit later close retry.
+    # If both close rounds remain unavailable, the complete visible stream is
+    # still a single owner and stays addressable for an explicit later retry.
     seal_recover = DummyAdapter()
     await seal_recover.send_draft(
         "user-seal-recover",
@@ -367,9 +390,10 @@ async def main():
         },
     )
     assert recovered_fallback.success
-    assert seal_recover.normal_sends[-1][1] == "最终回退"
+    assert not seal_recover.normal_sends
     recover_streams, _recover_anchors = streaming_mod._stream_maps(seal_recover)
     assert 3103 in recover_streams
+    assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
     closed_after_failure = await seal_recover.abandon_open_draft(
         "user-seal-recover",
         "最终回退",
@@ -377,6 +401,7 @@ async def main():
     )
     assert closed_after_failure.success
     assert 3103 not in recover_streams
+    assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
 
     # Capacity pressure never discards an opened stream. The extra turn stays
     # final-only, while both existing streams remain sealable.
@@ -776,6 +801,94 @@ async def main():
         if call[2]["input_state"] == 10
     ]
     assert "".join(final_growth_seals) == final_growth_text
+    assert_exact_final_ownership(final_growth, final_growth_text)
+
+    # A full 4000-character commentary followed by an independent short final
+    # must roll into another native message instead of silently dropping the
+    # final at the old seal-body cap.
+    independent_full = DummyAdapter()
+    independent_full_metadata = {
+        "reply_to_message_id": "inbound-independent-full"
+    }
+    independent_full_draft = "G" * 4000
+    independent_full_target = independent_full_draft + "\nFINAL"
+    await independent_full.send_draft(
+        "user-independent-full",
+        5103,
+        independent_full_draft,
+        independent_full_metadata,
+    )
+    independent_full_result = await independent_full.send(
+        "user-independent-full",
+        "FINAL",
+        reply_to="inbound-independent-full",
+        metadata={"notify": True, **independent_full_metadata},
+    )
+    assert independent_full_result.success
+    assert not independent_full.normal_sends
+    assert_exact_final_ownership(independent_full, independent_full_target)
+
+    # The same composition is lossless when an independent final is larger
+    # than the remaining capacity in a partially filled commentary stream.
+    independent_growth = DummyAdapter()
+    independent_growth_metadata = {
+        "reply_to_message_id": "inbound-independent-growth"
+    }
+    independent_growth_draft = "H" * 3900
+    independent_growth_final = "I" * 200
+    independent_growth_target = (
+        independent_growth_draft + "\n" + independent_growth_final
+    )
+    await independent_growth.send_draft(
+        "user-independent-growth",
+        5104,
+        independent_growth_draft,
+        independent_growth_metadata,
+    )
+    independent_growth_result = await independent_growth.send(
+        "user-independent-growth",
+        independent_growth_final,
+        reply_to="inbound-independent-growth",
+        metadata={"notify": True, **independent_growth_metadata},
+    )
+    assert independent_growth_result.success
+    assert not independent_growth.normal_sends
+    assert_exact_final_ownership(independent_growth, independent_growth_target)
+
+    # If every rollover-head seal retry fails, the old 3900-character stream
+    # remains the visible owner and the ordinary fallback receives only the
+    # 201-character unseen suffix. A recovered close must not absorb that
+    # suffix and duplicate it.
+    head_seal_failure = DummyAdapter()
+    head_seal_failure_metadata = {
+        "reply_to_message_id": "inbound-head-seal-failure"
+    }
+    head_seal_failure_draft = "J" * 3900
+    head_seal_failure_final = "K" * 200
+    head_seal_failure_target = (
+        head_seal_failure_draft + "\n" + head_seal_failure_final
+    )
+    await head_seal_failure.send_draft(
+        "user-head-seal-failure",
+        5105,
+        head_seal_failure_draft,
+        head_seal_failure_metadata,
+    )
+    head_seal_failure.fail_seal_attempts = len(
+        streaming_mod._SEAL_RETRY_DELAYS
+    )
+    head_seal_failure_result = await head_seal_failure.send(
+        "user-head-seal-failure",
+        head_seal_failure_final,
+        reply_to="inbound-head-seal-failure",
+        metadata={"notify": True, **head_seal_failure_metadata},
+    )
+    assert head_seal_failure_result.success
+    assert [len(item[1]) for item in head_seal_failure.normal_sends] == [201]
+    assert head_seal_failure.normal_sends[0][1] == (
+        "\n" + head_seal_failure_final
+    )
+    assert_exact_final_ownership(head_seal_failure, head_seal_failure_target)
 
     # If the head was sealed but the new tail stream cannot open, the ordinary
     # fallback owns only the uncommitted suffix. Sending the complete final
@@ -809,6 +922,43 @@ async def main():
         tail_failure
     )
     assert not tail_failure_streams
+    assert_exact_final_ownership(tail_failure, tail_failure_text)
+
+    # Once a rollover tail is visible, a failed first close round must retry
+    # that same tail rather than sending it again through the ordinary API.
+    tail_seal_failure = DummyAdapter()
+    tail_seal_failure_metadata = {
+        "reply_to_message_id": "inbound-tail-seal-failure"
+    }
+    tail_seal_failure_text = "L" * 4100
+    await tail_seal_failure.send_draft(
+        "user-tail-seal-failure",
+        5106,
+        "L" * 3900,
+        tail_seal_failure_metadata,
+    )
+    await tail_seal_failure.send_draft(
+        "user-tail-seal-failure",
+        5106,
+        tail_seal_failure_text,
+        tail_seal_failure_metadata,
+    )
+    tail_seal_failure.fail_seal_attempts = len(
+        streaming_mod._SEAL_RETRY_DELAYS
+    )
+    tail_seal_failure_result = await tail_seal_failure.send(
+        "user-tail-seal-failure",
+        tail_seal_failure_text,
+        reply_to="inbound-tail-seal-failure",
+        metadata={"notify": True, **tail_seal_failure_metadata},
+    )
+    assert tail_seal_failure_result.success
+    assert not tail_seal_failure.normal_sends
+    tail_seal_streams, _tail_seal_anchors = streaming_mod._stream_maps(
+        tail_seal_failure
+    )
+    assert not tail_seal_streams
+    assert_exact_final_ownership(tail_seal_failure, tail_seal_failure_text)
 
     # A stale/cancelled consumer can close the same visible stream through
     # Hermes' real three-argument abandon_open_draft contract.
@@ -847,7 +997,11 @@ async def main():
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_overflow_rollover=ok")
     print("qq_c2c_final_first_overflow_rollover=ok")
+    print("qq_c2c_independent_final_full_rollover=ok")
+    print("qq_c2c_independent_final_growth_rollover=ok")
+    print("qq_c2c_head_seal_failure_suffix_ownership=ok")
     print("qq_c2c_tail_open_failure_suffix_fallback=ok")
+    print("qq_c2c_tail_seal_failure_no_duplicate=ok")
 
 
 anyio.run(main)

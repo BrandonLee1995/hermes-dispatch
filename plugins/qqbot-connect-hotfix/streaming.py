@@ -414,11 +414,50 @@ def _active_content(
     return full
 
 
-def _final_extends_visible_stream(state: _QQC2CStream, content: str) -> bool:
-    """Whether final text is a cumulative extension of all visible chunks."""
+def _visible_stream_content(state: _QQC2CStream) -> str:
+    """Return text that QQ has acknowledged as client-visible exactly once."""
 
-    visible = str(state.committed_prefix or "") + str(state.last_content or "")
-    return bool(visible) and str(content or "").startswith(visible)
+    current = str(state.last_content or "") if state.stream_msg_id else ""
+    return str(state.committed_prefix or "") + current
+
+
+def _append_nonoverlapping(base: str, suffix_source: str) -> str:
+    """Append only the part of ``suffix_source`` not already ending ``base``."""
+
+    base = str(base or "")
+    suffix_source = str(suffix_source or "")
+    if not base:
+        return suffix_source
+    if not suffix_source or suffix_source == base or suffix_source in base:
+        return base
+    if suffix_source.startswith(base):
+        return suffix_source
+
+    overlap = 0
+    for size in range(min(len(base), len(suffix_source)), 0, -1):
+        if base.endswith(suffix_source[:size]):
+            overlap = size
+            break
+
+    suffix = suffix_source[overlap:]
+    if suffix and not overlap and not base.endswith(("\n", " ")):
+        suffix = "\n" + suffix
+    return base + suffix
+
+
+def _compose_final_content(state: _QQC2CStream, content: str) -> str:
+    """Build the lossless final text from visible drafts and Hermes' final."""
+
+    return _append_nonoverlapping(_visible_stream_content(state), str(content or ""))
+
+
+def _unseen_final_suffix(state: _QQC2CStream, target: str) -> Optional[str]:
+    """Return the target suffix not yet visible, or ``None`` on invariant loss."""
+
+    visible = _visible_stream_content(state)
+    if not str(target or "").startswith(visible):
+        return None
+    return str(target or "")[len(visible):]
 
 
 async def _post_seal_with_retries(
@@ -527,41 +566,21 @@ async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
     return current, data
 
 
-def _seal_content(adapter, state: _QQC2CStream, content: str) -> str:
-    """Compose a legal final replace body without removing QQ's prefix.
+def _seal_content(adapter, state: _QQC2CStream, content: str) -> tuple[str, str]:
+    """Compose one legal seal body and return any overflow separately.
 
     Hermes' draft contains commentary, tool progress, and often the final
     answer, while its turn-final ``send`` can contain only the short final
     answer. QQ rejects a replace request that removes an already-submitted
-    prefix. Reuse the cumulative draft when it already contains the final; if
-    it does not, append only the non-overlapping final suffix within the
-    platform length limit.
+    prefix. Never silently discard overflow: callers must roll it into another
+    native stream or assign it to an ordinary fallback before reporting
+    success.
     """
 
     previous = str(state.last_content or "")
-    final = str(content or "")
     max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 4000))
-
-    if not previous:
-        return final[:max_length]
-    if not final or final == previous:
-        return previous
-    if final.startswith(previous):
-        return final[:max_length]
-    if final in previous:
-        return previous
-
-    overlap = 0
-    for size in range(min(len(previous), len(final)), 0, -1):
-        if previous.endswith(final[:size]):
-            overlap = size
-            break
-
-    suffix = final[overlap:]
-    if suffix and not overlap and not previous.endswith(("\n", " ")):
-        suffix = "\n" + suffix
-    remaining = max(0, max_length - len(previous))
-    return previous + suffix[:remaining]
+    composed = _append_nonoverlapping(previous, str(content or ""))
+    return composed[:max_length], composed[max_length:]
 
 
 async def _seal_stream(adapter, state: _QQC2CStream, content: str):
@@ -576,7 +595,15 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
                 success=False,
                 error="QQ stream cannot be sealed before its first frame",
             )
-        seal_content = _seal_content(adapter, state, content)
+        seal_content, overflow = _seal_content(adapter, state, content)
+        if overflow:
+            return _send_result(
+                success=False,
+                error=(
+                    "QQ stream seal requires rollover before closing "
+                    f"({len(overflow)} unassigned characters)"
+                ),
+            )
         data, last_error = await _post_seal_with_retries(
             adapter,
             state,
@@ -771,8 +798,6 @@ def patch_qq_c2c_streaming(QQAdapter):
         # GatewayStreamConsumer marks its turn-final send with notify=True.
         # Only intercept that exact path: approvals, slash-command replies,
         # heartbeats, and steering acknowledgements must remain independent.
-        fallback_state = None
-        recovery_state = None
         if (
             isinstance(metadata, dict)
             and metadata.get("notify") is True
@@ -787,107 +812,145 @@ def patch_qq_c2c_streaming(QQAdapter):
             draft_id = anchors.get((str(chat_id), anchor))
             state = streams.get(draft_id) if draft_id is not None else None
             if state is not None:
-                # A successful overflow rollover stores sealed heads in
-                # committed_prefix. Keep the final seal scoped to the current
-                # stream's suffix so every replace request preserves its own
-                # accepted prefix.
-                if _final_extends_visible_stream(state, content):
-                    try:
-                        async with state.lock:
-                            state, _data = await _send_cumulative_draft(
+                if not state.stream_msg_id and not state.committed_prefix:
+                    # Preserve the established final-only degradation when no
+                    # native frame ever became visible. Retrying a first frame
+                    # only at turn completion would change a known single-send
+                    # fallback into a new native lifecycle.
+                    normal_result = await original_send(
+                        self,
+                        chat_id,
+                        content,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    if getattr(normal_result, "success", False):
+                        _remove_stream(self, state)
+                    return normal_result
+
+                # Hermes can finish with either the whole cumulative response
+                # or a short final-only answer. Compose both forms against the
+                # exact QQ-acknowledged prefix before applying one rollover
+                # path, so no final suffix is capped or silently discarded.
+                target = _compose_final_content(state, content)
+                rollover_error = None
+                try:
+                    async with state.lock:
+                        state, _data = await _send_cumulative_draft(
+                            self,
+                            state,
+                            target,
+                        )
+                except Exception as exc:
+                    rollover_error = exc
+                    logger.warning(
+                        "qqbot-connect-hotfix: final rollover stopped for "
+                        "chat=%s draft=%s: %s",
+                        chat_id,
+                        state.draft_id,
+                        exc,
+                    )
+                    # Rollover can seal heads and replace the map entry before
+                    # a later operation fails. Ownership must be calculated
+                    # from the latest acknowledged state, never the stale
+                    # object captured before rollover.
+                    latest_streams, _latest_anchors = _stream_maps(self)
+                    latest_state = latest_streams.get(draft_id)
+                    if latest_state is not None:
+                        state = latest_state
+
+                unseen = _unseen_final_suffix(state, target)
+                if unseen is None:
+                    logger.error(
+                        "qqbot-connect-hotfix: final ownership invariant lost "
+                        "for chat=%s draft=%s; refusing duplicate fallback",
+                        chat_id,
+                        state.draft_id,
+                    )
+                    return _send_result(
+                        success=False,
+                        error="QQ stream final no longer extends visible content",
+                    )
+
+                if unseen:
+                    # Only text that QQ has never acknowledged can enter the
+                    # ordinary fallback. This remains correct whether failure
+                    # happened before the head seal, after committed heads, or
+                    # while opening a new tail.
+                    normal_result = await original_send(
+                        self,
+                        chat_id,
+                        unseen,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    if getattr(normal_result, "success", False):
+                        if state.stream_msg_id:
+                            recovery = await _seal_stream(
                                 self,
                                 state,
-                                content,
+                                state.last_content,
                             )
-                    except Exception as exc:
-                        logger.warning(
-                            "qqbot-connect-hotfix: final overflow rollover "
-                            "failed for chat=%s draft=%s: %s",
-                            chat_id,
-                            state.draft_id,
-                            exc,
-                        )
-                        # Rollover may already have sealed one or more chunks
-                        # and replaced the map entry before a new tail open
-                        # failed. Continue with that latest active state, not
-                        # the now-sealed state captured before the call.
-                        latest_streams, _latest_anchors = _stream_maps(self)
-                        latest_state = latest_streams.get(draft_id)
-                        if latest_state is not None:
-                            state = latest_state
-                active_content = _active_content(
-                    state,
-                    content,
-                    require_committed_prefix=False,
-                )
-                if (
-                    not state.stream_msg_id
-                    and state.committed_prefix
-                    and not active_content
-                ):
+                            if not recovery.success:
+                                logger.warning(
+                                    "qqbot-connect-hotfix: suffix fallback sent "
+                                    "but visible stream close remains pending "
+                                    "for chat=%s draft=%s: %s",
+                                    chat_id,
+                                    state.draft_id,
+                                    recovery.error,
+                                )
+                        else:
+                            _remove_stream(self, state)
+                    return normal_result
+
+                if not state.stream_msg_id and state.committed_prefix == target:
                     completed_id = state.last_completed_stream_id
                     _remove_stream(self, state)
                     return _send_result(success=True, message_id=completed_id)
 
-                sealed = await _seal_stream(self, state, active_content)
+                if not state.stream_msg_id:
+                    # No visible active stream and no unseen suffix is only
+                    # possible for an empty final. Clear the placeholder.
+                    _remove_stream(self, state)
+                    return _send_result(
+                        success=True,
+                        message_id=state.last_completed_stream_id,
+                    )
+
+                sealed = await _seal_stream(self, state, state.last_content)
                 if sealed.success:
                     return sealed
+
+                # The whole target is already visible. Retry closing the same
+                # body, but never emit an ordinary duplicate. If both bounded
+                # close rounds fail, retain the state for abandon/retry and
+                # report delivery success because every final character still
+                # has exactly one visible owner.
+                recovery = await _seal_stream(self, state, state.last_content)
+                if recovery.success:
+                    return recovery
                 logger.warning(
-                    "qqbot-connect-hotfix: falling back to normal C2C final "
-                    "after stream seal failure for chat=%s: %s",
+                    "qqbot-connect-hotfix: final is visible but stream close "
+                    "remains pending for chat=%s draft=%s after rollover=%s: %s",
                     chat_id,
-                    sealed.error,
+                    state.draft_id,
+                    bool(rollover_error),
+                    recovery.error,
                 )
-                fallback_state = state
-                # The normal final is a safe visible fallback, but the opened
-                # stream stays addressable so abandon/retry can still seal it.
-                if state.stream_msg_id:
-                    recovery_state = state
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_stream_close_pending": True},
+                )
 
-        normal_content = content
-        if (
-            fallback_state is not None
-            and fallback_state.committed_prefix
-            and str(content or "").startswith(fallback_state.committed_prefix)
-        ):
-            normal_content = str(content or "")[
-                len(fallback_state.committed_prefix):
-            ]
-
-        normal_result = await original_send(
+        return await original_send(
             self,
             chat_id,
-            normal_content,
+            content,
             reply_to=reply_to,
             metadata=metadata,
         )
-        if (
-            fallback_state is not None
-            and not fallback_state.stream_msg_id
-            and getattr(normal_result, "success", False)
-        ):
-            # No client-visible active stream remains: sealed overflow heads
-            # plus the ordinary suffix now own the complete response.
-            _remove_stream(self, fallback_state)
-        if recovery_state is not None and getattr(normal_result, "success", False):
-            # Once the complete ordinary final is visible, best-effort close
-            # the older stream with its last acknowledged partial body. This
-            # avoids duplicating the final answer in two bubbles. If QQ is
-            # still unavailable, _seal_stream leaves the state retryable.
-            recovery = await _seal_stream(
-                self,
-                recovery_state,
-                recovery_state.last_content,
-            )
-            if not recovery.success:
-                logger.warning(
-                    "qqbot-connect-hotfix: QQ C2C fallback final sent but "
-                    "stream close remains pending for chat=%s draft=%s: %s",
-                    chat_id,
-                    recovery_state.draft_id,
-                    recovery.error,
-                )
-        return normal_result
 
     @functools.wraps(original_send_typing)
     async def send_typing(

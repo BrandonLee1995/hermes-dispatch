@@ -24,6 +24,26 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.6 makes final-message ownership explicit across sealed native
+chunks, the currently visible native stream, and an ordinary fallback. Hermes
+can supply either a cumulative final or a short independent answer; the plugin
+now composes both forms losslessly with the QQ-acknowledged draft before one
+unified rollover path. A full 4000-character draft therefore rolls an
+independent final into a new stream instead of truncating it. If rollover stops
+while sealing a head, only the suffix that QQ has never acknowledged is sent
+normally. If a tail is already visible but its close fails, the plugin retries
+that close without sending the same tail normally; after both bounded close
+rounds fail, the visible state remains addressable for a later abandon/retry.
+The seal composer also returns overflow explicitly instead of silently capping
+it. These guarantees compensate for Hermes' mixed cumulative/final-only turn
+payloads and QQ's immutable replace-prefix plus 4000-character stream limit.
+No new setting is required: keep the C2C streaming settings below enabled and
+run `test_streaming.py`. The regression suite checks exact single ownership for
+full-draft independent finals, partial-draft growth, exhausted head-seal
+retries, tail-open failure, and tail-close recovery. Roll back by restoring
+1.8.5 from outside the plugin discovery tree and restarting only the affected
+profile.
+
 Version 1.8.5 extends rollover ownership to the authoritative final payload.
 If the visible draft is still below QQ's limit but the final first crosses it,
 the active stream is sealed at the limit and a new stream carries the suffix;
@@ -167,7 +187,7 @@ does not seal the stream, and logs contain neither error `40034128` nor a
 second final send.  Roll back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.5 code change,
+typing budget is also removed. To roll back the complete 1.8.6 code change,
 restore the previous plugin directory from outside the plugin discovery tree
 and restart that profile.
 
