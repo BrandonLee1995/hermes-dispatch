@@ -24,6 +24,42 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.8 removes a second message-carrier race found by the real QQ C2C
+canary. Codex app-server can stream a commentary item's live deltas and then
+Hermes can emit the completed item again as an ordinary `_interim_send` without
+its original reply anchor. When the same anchored open native stream already
+owns that exact token-bounded terminal payload, the adapter now acknowledges
+the interim callback without posting a duplicate ordinary QQ bubble. If Hermes
+does not provide an anchor, the plugin recovers only a unique matching open
+stream in the same private chat; multiple concurrent matches remain ambiguous
+and keep the ordinary path. Earlier/nonterminal occurrences, word-internal
+suffixes, unopened streams, other anchors, groups, and non-interim messages are
+unchanged. `test_streaming.py` covers the real Gateway consumer sequence,
+unique and ambiguous unanchored recovery, rollover-boundary ownership, and all
+negative isolation cases. Roll back by restoring 1.8.7 from outside the plugin
+discovery tree and restarting only the affected profile.
+
+Version 1.8.7 closes the remaining final-ownership gaps found during review of
+1.8.6. When an unseen final suffix is successfully delivered by the immutable
+ordinary-message fallback but the native-prefix recovery seal remains pending,
+the retained stream now records that ordinary owner. A delayed
+`abandon_open_draft`, a repeated turn-final callback, or a late draft frame may
+close the native prefix but cannot absorb or resend the ordinary-owned suffix.
+This prevents a recovered stream from displaying the final twice.
+
+Final composition no longer treats an arbitrary substring or suffix/prefix
+overlap as ownership. A cumulative final must explicitly extend the complete
+QQ-visible body. An independent final is considered already visible only when
+the exact payload is at the terminal position with a token boundary; otherwise
+the complete payload is appended once. The composer also respects an existing
+leading whitespace boundary instead of inserting a second newline. These rules
+compensate for Hermes turns where commentary may mention the same words as the
+later independent final. `test_streaming.py` covers delayed close, final retry,
+late-frame races, non-terminal repeats, partial overlaps, word-internal suffixes,
+leading boundaries, cumulative replacement, and exact final ownership. Roll
+back by restoring 1.8.6 from outside the plugin discovery tree and restarting
+only the affected profile.
+
 Version 1.8.6 makes final-message ownership explicit across sealed native
 chunks, the currently visible native stream, and an ordinary fallback. Hermes
 can supply either a cumulative final or a short independent answer; the plugin
@@ -182,12 +218,13 @@ PYTHONPATH=/path/to/hermes-agent \
 ```
 
 In a real QQ private chat, start a tool-using task and verify that one message
-updates in place, the last frame is sealed rather than duplicated, `/steer`
-does not seal the stream, and logs contain neither error `40034128` nor a
-second final send.  Roll back by setting
+updates in place, a completed commentary is not repeated in an ordinary bubble,
+the last frame is sealed rather than duplicated, `/steer` does not seal the
+stream, and logs contain neither error `40034128` nor a second final send. Roll
+back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.6 code change,
+typing budget is also removed. To roll back the complete 1.8.8 code change,
 restore the previous plugin directory from outside the plugin discovery tree
 and restart that profile.
 

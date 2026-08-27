@@ -81,6 +81,10 @@ class _QQC2CStream:
     last_content: str = ""
     committed_prefix: str = ""
     last_completed_stream_id: Optional[str] = None
+    # Text successfully delivered by the immutable ordinary-message fallback.
+    # It is already user-visible but can never be absorbed into a later native
+    # replace/seal without displaying the same suffix twice.
+    ordinary_owned_suffix: str = ""
     sealed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -421,28 +425,64 @@ def _visible_stream_content(state: _QQC2CStream) -> str:
     return str(state.committed_prefix or "") + current
 
 
+def _terminal_payload_is_owned(base: str, payload: str) -> bool:
+    """Return whether *payload* has an explicit terminal owner in *base*.
+
+    This is deliberately stricter than substring/overlap matching.  It is used
+    both for final composition and for Hermes' ``_interim_send`` callback that
+    follows a completed Codex commentary item.  In the latter path the live
+    token deltas may already have placed the exact commentary at the end of the
+    QQ native stream; sending the callback again would create a second ordinary
+    message bubble.
+    """
+
+    base = str(base or "")
+    payload = str(payload or "")
+    if not base or not payload or not base.endswith(payload):
+        return False
+    boundary = len(base) - len(payload)
+    if boundary == 0:
+        return True
+    previous = base[boundary - 1]
+    return bool(
+        previous.isspace()
+        or previous in "：:；;。.!！?？、)]}）】」』"
+    )
+
+
 def _append_nonoverlapping(base: str, suffix_source: str) -> str:
-    """Append only the part of ``suffix_source`` not already ending ``base``."""
+    """Compose a cumulative or independent final without value guessing.
+
+    Hermes may provide either the complete cumulative response or a separate
+    authoritative final after streamed commentary. Only two observations are
+    safe ownership evidence:
+
+    * the final explicitly extends the complete visible body; or
+    * the exact final payload is already the terminal, token-bounded body.
+
+    An occurrence elsewhere in commentary, or a coincidental suffix/prefix
+    overlap, does not own an independent final and must not swallow it.
+    """
 
     base = str(base or "")
     suffix_source = str(suffix_source or "")
     if not base:
         return suffix_source
-    if not suffix_source or suffix_source == base or suffix_source in base:
+    if not suffix_source or suffix_source == base:
         return base
     if suffix_source.startswith(base):
         return suffix_source
 
-    overlap = 0
-    for size in range(min(len(base), len(suffix_source)), 0, -1):
-        if base.endswith(suffix_source[:size]):
-            overlap = size
-            break
+    if _terminal_payload_is_owned(base, suffix_source):
+        return base
 
-    suffix = suffix_source[overlap:]
-    if suffix and not overlap and not base.endswith(("\n", " ")):
-        suffix = "\n" + suffix
-    return base + suffix
+    separator = (
+        ""
+        if base.endswith(("\n", " ", "\t"))
+        or suffix_source.startswith(("\n", " ", "\t"))
+        else "\n"
+    )
+    return base + separator + suffix_source
 
 
 def _compose_final_content(state: _QQC2CStream, content: str) -> str:
@@ -731,6 +771,15 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=False,
                     error="QQ native stream is already sealed",
                 )
+            if state.ordinary_owned_suffix:
+                # The turn already completed through an immutable ordinary
+                # fallback. A late frame from the old consumer cannot safely
+                # move that suffix back into the native replace lifecycle.
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_ordinary_suffix_owned": True},
+                )
             try:
                 state, data = await _send_cumulative_draft(
                     self,
@@ -772,6 +821,17 @@ def patch_qq_c2c_streaming(QQAdapter):
         state = streams.get(draft_id) if draft_id is not None else None
         if state is None:
             return _send_result(success=True)
+        if state.ordinary_owned_suffix:
+            # A completed ordinary fallback already owns every character after
+            # the native stream's last acknowledged frame. Delayed cancellation
+            # cleanup must only close that native frame; the caller commonly
+            # passes the full final payload here, which would otherwise absorb
+            # and duplicate the immutable suffix.
+            return await _seal_stream(
+                self,
+                state,
+                state.last_content,
+            )
         active_content = _active_content(
             state,
             content or state.last_content,
@@ -795,6 +855,67 @@ def patch_qq_c2c_streaming(QQAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        # Hermes emits a completed Codex commentary item through an ordinary
+        # ``_interim_send`` callback even when its live deltas already rendered
+        # the same item in this turn's native QQ stream. Suppress only when the
+        # same inbound reply anchor still owns an open stream and the callback
+        # payload is exactly its token-bounded terminal text. Earlier/nonterminal
+        # occurrences, another anchor, unopened streams, and every other send
+        # continue through the ordinary QQ path.
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("_interim_send") is True
+            and _is_c2c(self, str(chat_id))
+        ):
+            anchor = str(
+                reply_to
+                or metadata.get("reply_to_message_id")
+                or ""
+            ).strip()
+            streams, anchors = _stream_maps(self)
+            draft_id = anchors.get((str(chat_id), anchor))
+            state = streams.get(draft_id) if draft_id is not None else None
+            if state is None and not anchor:
+                # GatewayStreamConsumer._send_commentary currently omits its
+                # initial_reply_to_id from metadata. Recover only when content
+                # ownership identifies exactly one open stream in this C2C
+                # chat. Multiple matching concurrent turns remain ambiguous
+                # and deliberately fall through to the ordinary send.
+                candidates = [
+                    candidate
+                    for candidate in streams.values()
+                    if (
+                        candidate.chat_id == str(chat_id)
+                        and candidate.stream_msg_id
+                        and not candidate.sealed
+                        and _terminal_payload_is_owned(
+                            _visible_stream_content(candidate),
+                            str(content or ""),
+                        )
+                    )
+                ]
+                if len(candidates) == 1:
+                    state = candidates[0]
+            if (
+                state is not None
+                and state.stream_msg_id
+                and not state.sealed
+                and _terminal_payload_is_owned(
+                    _visible_stream_content(state),
+                    str(content or ""),
+                )
+            ):
+                logger.debug(
+                    "qqbot-connect-hotfix: suppressed already-streamed QQ "
+                    "C2C interim carrier draft=%s",
+                    state.draft_id,
+                )
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_stream_owned_interim": True},
+                )
+
         # GatewayStreamConsumer marks its turn-final send with notify=True.
         # Only intercept that exact path: approvals, slash-command replies,
         # heartbeats, and steering acknowledgements must remain independent.
@@ -812,6 +933,23 @@ def patch_qq_c2c_streaming(QQAdapter):
             draft_id = anchors.get((str(chat_id), anchor))
             state = streams.get(draft_id) if draft_id is not None else None
             if state is not None:
+                if state.ordinary_owned_suffix:
+                    # A prior successful final fallback is authoritative and
+                    # immutable. Retried final callbacks may only close the
+                    # still-open native prefix; they must not re-compose or
+                    # re-send the suffix through either delivery channel.
+                    closed = await _seal_stream(
+                        self,
+                        state,
+                        state.last_content,
+                    )
+                    if closed.success:
+                        return closed
+                    return _send_result(
+                        success=True,
+                        message_id=state.stream_msg_id,
+                        raw_response={"qq_stream_close_pending": True},
+                    )
                 if not state.stream_msg_id and not state.committed_prefix:
                     # Preserve the established final-only degradation when no
                     # native frame ever became visible. Retrying a first frame
@@ -886,6 +1024,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                     )
                     if getattr(normal_result, "success", False):
                         if state.stream_msg_id:
+                            state.ordinary_owned_suffix = unseen
                             recovery = await _seal_stream(
                                 self,
                                 state,

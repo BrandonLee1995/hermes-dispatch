@@ -256,6 +256,142 @@ async def main():
     )
     assert not prefixed.normal_sends
 
+    # Hermes' completed commentary callback is an ordinary ``_interim_send``.
+    # When the exact item is already the token-bounded terminal payload of the
+    # same anchored native stream, that second carrier must be acknowledged
+    # without creating another QQ bubble.
+    interim_owned = DummyAdapter()
+    interim_owned_metadata = {
+        "reply_to_message_id": "inbound-interim-owned"
+    }
+    await interim_owned.send_draft(
+        "user-interim-owned",
+        1004,
+        "第一段\nSTATUS",
+        interim_owned_metadata,
+    )
+    owned_interim = await interim_owned.send(
+        "user-interim-owned",
+        "STATUS",
+        reply_to="inbound-interim-owned",
+        metadata={"_interim_send": True, **interim_owned_metadata},
+    )
+    assert owned_interim.success
+    assert owned_interim.raw_response["qq_stream_owned_interim"] is True
+    assert not interim_owned.normal_sends
+
+    # A nonterminal occurrence is not ownership evidence; neither are a
+    # word-internal suffix, a different inbound anchor, or a non-interim send.
+    interim_nonterminal = DummyAdapter()
+    await interim_nonterminal.send_draft(
+        "user-interim-nonterminal",
+        1005,
+        "STATUS\n继续处理",
+        {"reply_to_message_id": "inbound-interim-nonterminal"},
+    )
+    await interim_nonterminal.send(
+        "user-interim-nonterminal",
+        "STATUS",
+        reply_to="inbound-interim-nonterminal",
+        metadata={
+            "_interim_send": True,
+            "reply_to_message_id": "inbound-interim-nonterminal",
+        },
+    )
+    assert interim_nonterminal.normal_sends[-1][1] == "STATUS"
+
+    interim_word_suffix = DummyAdapter()
+    await interim_word_suffix.send_draft(
+        "user-interim-word-suffix",
+        1006,
+        "NOTSTATUS",
+        {"reply_to_message_id": "inbound-interim-word-suffix"},
+    )
+    await interim_word_suffix.send(
+        "user-interim-word-suffix",
+        "STATUS",
+        reply_to="inbound-interim-word-suffix",
+        metadata={
+            "_interim_send": True,
+            "reply_to_message_id": "inbound-interim-word-suffix",
+        },
+    )
+    assert interim_word_suffix.normal_sends[-1][1] == "STATUS"
+
+    await interim_owned.send(
+        "user-interim-owned",
+        "STATUS",
+        reply_to="different-anchor",
+        metadata={
+            "_interim_send": True,
+            "reply_to_message_id": "different-anchor",
+        },
+    )
+    await interim_owned.send(
+        "user-interim-owned",
+        "STATUS",
+        reply_to="inbound-interim-owned",
+        metadata={"non_conversational": True},
+    )
+    assert [item[1] for item in interim_owned.normal_sends] == [
+        "STATUS",
+        "STATUS",
+    ]
+
+    # The ownership check spans already-sealed rollover heads plus the open
+    # tail, so a completed commentary at the 4000-character boundary does not
+    # fall back to an oversized duplicate ordinary message.
+    interim_overflow = DummyAdapter()
+    interim_overflow_text = "X" * 4000 + "\nSTATUS"
+    await interim_overflow.send_draft(
+        "user-interim-overflow",
+        1007,
+        interim_overflow_text,
+        {"reply_to_message_id": "inbound-interim-overflow"},
+    )
+    overflow_interim = await interim_overflow.send(
+        "user-interim-overflow",
+        interim_overflow_text,
+        reply_to="inbound-interim-overflow",
+        metadata={
+            "_interim_send": True,
+            "reply_to_message_id": "inbound-interim-overflow",
+        },
+    )
+    assert overflow_interim.success
+    assert not interim_overflow.normal_sends
+
+    # Hermes currently omits the reply anchor from _send_commentary. A unique
+    # same-chat terminal owner is safe to recover; two matching concurrent
+    # streams are ambiguous and must not be guessed.
+    interim_ambiguous = DummyAdapter()
+    for draft_id, anchor in (
+        (1008, "inbound-interim-a"),
+        (1009, "inbound-interim-b"),
+    ):
+        await interim_ambiguous.send_draft(
+            "user-interim-ambiguous",
+            draft_id,
+            "SAME STATUS",
+            {"reply_to_message_id": anchor},
+        )
+    ambiguous_interim = await interim_ambiguous.send(
+        "user-interim-ambiguous",
+        "SAME STATUS",
+        metadata={"_interim_send": True},
+    )
+    assert ambiguous_interim.success
+    assert interim_ambiguous.normal_sends[-1][1] == "SAME STATUS"
+
+    interim_unowned = DummyAdapter()
+    unowned_interim = await interim_unowned.send(
+        "user-interim-unowned",
+        "NO STREAM",
+        metadata={"_interim_send": True},
+    )
+    assert unowned_interim.success
+    assert interim_unowned.normal_sends[-1][1] == "NO STREAM"
+
     # A non-final message must never seal or hijack the open stream.
     await adapter.send_draft(
         "user-2",
@@ -727,6 +863,44 @@ async def main():
     assert consumer.final_response_sent is True
     assert consumer.delivered_final_matches("阶段一，阶段二，完成") is True
 
+    # Codex app-server emits live deltas for a commentary item and then emits
+    # the completed phase=commentary item through Hermes' interim callback.
+    # Hermes marks that second carrier as ``_interim_send`` even though the
+    # exact text is already visible in the native QQ stream. The connector
+    # must keep the stream as the sole message owner instead of posting an
+    # identical ordinary QQ bubble beside it.
+    commentary_duplicate = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(
+        commentary_duplicate,
+        "user-commentary-duplicate",
+    )
+    commentary_consumer = GatewayStreamConsumer(
+        commentary_duplicate,
+        "user-commentary-duplicate",
+        cfg,
+        initial_reply_to_id="inbound-commentary-duplicate",
+    )
+    commentary_text = "处理即将完成\nPR187_TERMINAL_ONCE"
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(commentary_consumer.run)
+        commentary_consumer.on_delta(commentary_text)
+        await anyio.sleep(0.05)
+        commentary_consumer.on_commentary(commentary_text)
+        await anyio.sleep(0.05)
+        commentary_consumer.finish("PR187_TERMINAL_ONCE")
+
+    commentary_bodies = [call[2] for call in commentary_duplicate.api_calls]
+    assert [body["input_state"] for body in commentary_bodies].count(10) == 1
+    assert commentary_bodies[-1]["content_raw"] == commentary_text
+    assert not commentary_duplicate.normal_sends, (
+        commentary_bodies,
+        commentary_duplicate.normal_sends,
+    )
+    assert commentary_consumer.final_response_sent is True
+    assert commentary_consumer.delivered_final_matches(
+        "PR187_TERMINAL_ONCE"
+    ) is True
+
     # A response beyond one QQ message must roll over as complete native
     # stream chunks. Generic Hermes overflow would emit an ordinary head and
     # then reuse the draft id with a shorter tail, violating replace-prefix.
@@ -960,6 +1134,232 @@ async def main():
     assert not tail_seal_streams
     assert_exact_final_ownership(tail_seal_failure, tail_seal_failure_text)
 
+    # A successful ordinary suffix fallback remains an immutable owner even
+    # when every immediate recovery seal fails. A later abandon/close must
+    # seal only the native text that was already visible, not absorb the
+    # ordinary-owned suffix and display the final twice.
+    delayed_close = DummyAdapter()
+    delayed_close_metadata = {
+        "reply_to_message_id": "inbound-delayed-close"
+    }
+    delayed_close_target = "处理中\nFINAL"
+    await delayed_close.send_draft(
+        "user-delayed-close",
+        5107,
+        "处理中",
+        delayed_close_metadata,
+    )
+    delayed_close.fail_next_stream = True
+    delayed_close.fail_seal_attempts = len(
+        streaming_mod._SEAL_RETRY_DELAYS
+    )
+    delayed_close_result = await delayed_close.send(
+        "user-delayed-close",
+        "FINAL",
+        reply_to="inbound-delayed-close",
+        metadata={"notify": True, **delayed_close_metadata},
+    )
+    assert delayed_close_result.success
+    assert [item[1] for item in delayed_close.normal_sends] == ["\nFINAL"]
+    delayed_close_streams, _delayed_close_anchors = streaming_mod._stream_maps(
+        delayed_close
+    )
+    assert 5107 in delayed_close_streams
+    assert_exact_final_ownership(delayed_close, delayed_close_target)
+    delayed_closed = await delayed_close.abandon_open_draft(
+        "user-delayed-close",
+        delayed_close_target,
+        delayed_close_metadata,
+    )
+    assert delayed_closed.success
+    assert 5107 not in delayed_close_streams
+    assert_exact_final_ownership(delayed_close, delayed_close_target)
+
+    # Once an ordinary fallback owns the suffix, late draft frames from the
+    # completed consumer cannot put that immutable text back into the native
+    # message. They are stale lifecycle events and must be harmless.
+    late_frame = DummyAdapter()
+    late_frame_metadata = {
+        "reply_to_message_id": "inbound-late-frame"
+    }
+    late_frame_target = "处理中\nFINAL"
+    await late_frame.send_draft(
+        "user-late-frame",
+        5113,
+        "处理中",
+        late_frame_metadata,
+    )
+    late_frame.fail_next_stream = True
+    late_frame.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS)
+    late_frame_result = await late_frame.send(
+        "user-late-frame",
+        "FINAL",
+        reply_to="inbound-late-frame",
+        metadata={"notify": True, **late_frame_metadata},
+    )
+    assert late_frame_result.success
+    await late_frame.send_draft(
+        "user-late-frame",
+        5113,
+        late_frame_target,
+        late_frame_metadata,
+    )
+    assert_exact_final_ownership(late_frame, late_frame_target)
+    late_frame_closed = await late_frame.abandon_open_draft(
+        "user-late-frame",
+        late_frame_target,
+        late_frame_metadata,
+    )
+    assert late_frame_closed.success
+    assert_exact_final_ownership(late_frame, late_frame_target)
+
+    # A retried turn-final callback may close the retained native stream, but
+    # it must not deliver or absorb the ordinary-owned suffix a second time.
+    retried_final = DummyAdapter()
+    retried_final_metadata = {
+        "reply_to_message_id": "inbound-retried-final"
+    }
+    retried_final_target = "处理中\nFINAL"
+    await retried_final.send_draft(
+        "user-retried-final",
+        5114,
+        "处理中",
+        retried_final_metadata,
+    )
+    retried_final.fail_next_stream = True
+    retried_final.fail_seal_attempts = len(streaming_mod._SEAL_RETRY_DELAYS)
+    first_final = await retried_final.send(
+        "user-retried-final",
+        "FINAL",
+        reply_to="inbound-retried-final",
+        metadata={"notify": True, **retried_final_metadata},
+    )
+    assert first_final.success
+    second_final = await retried_final.send(
+        "user-retried-final",
+        "FINAL",
+        reply_to="inbound-retried-final",
+        metadata={"notify": True, **retried_final_metadata},
+    )
+    assert second_final.success
+    assert [item[1] for item in retried_final.normal_sends] == ["\nFINAL"]
+    assert_exact_final_ownership(retried_final, retried_final_target)
+
+    # Independent finals are payloads, not substring searches. An earlier,
+    # non-terminal occurrence of the same value does not own the final.
+    repeated_final = DummyAdapter()
+    repeated_final_metadata = {
+        "reply_to_message_id": "inbound-repeated-final"
+    }
+    repeated_final_draft = "progress FINAL details"
+    repeated_final_target = repeated_final_draft + "\nFINAL"
+    await repeated_final.send_draft(
+        "user-repeated-final",
+        5108,
+        repeated_final_draft,
+        repeated_final_metadata,
+    )
+    repeated_final_result = await repeated_final.send(
+        "user-repeated-final",
+        "FINAL",
+        reply_to="inbound-repeated-final",
+        metadata={"notify": True, **repeated_final_metadata},
+    )
+    assert repeated_final_result.success
+    assert_exact_final_ownership(repeated_final, repeated_final_target)
+
+    # A true terminal copy already has one visible owner and must not be
+    # appended again merely because the final callback repeats it.
+    terminal_final = DummyAdapter()
+    terminal_final_metadata = {
+        "reply_to_message_id": "inbound-terminal-final"
+    }
+    terminal_final_target = "progress\nFINAL"
+    await terminal_final.send_draft(
+        "user-terminal-final",
+        5109,
+        terminal_final_target,
+        terminal_final_metadata,
+    )
+    terminal_final_result = await terminal_final.send(
+        "user-terminal-final",
+        "FINAL",
+        reply_to="inbound-terminal-final",
+        metadata={"notify": True, **terminal_final_metadata},
+    )
+    assert terminal_final_result.success
+    assert_exact_final_ownership(terminal_final, terminal_final_target)
+
+    # Coincidental partial overlap and a matching substring inside a larger
+    # terminal word are not ownership. Preserve the complete independent
+    # final behind a message boundary in both cases.
+    for draft_id, draft_text, final_text in (
+        (5110, "status F", "FINAL"),
+        (5111, "status NOTFINAL", "FINAL"),
+    ):
+        overlap = DummyAdapter()
+        overlap_metadata = {
+            "reply_to_message_id": f"inbound-overlap-{draft_id}"
+        }
+        overlap_target = draft_text + "\n" + final_text
+        await overlap.send_draft(
+            f"user-overlap-{draft_id}",
+            draft_id,
+            draft_text,
+            overlap_metadata,
+        )
+        overlap_result = await overlap.send(
+            f"user-overlap-{draft_id}",
+            final_text,
+            reply_to=overlap_metadata["reply_to_message_id"],
+            metadata={"notify": True, **overlap_metadata},
+        )
+        assert overlap_result.success
+        assert_exact_final_ownership(overlap, overlap_target)
+
+    # A caller-supplied message boundary is authoritative; composition must
+    # not insert a second newline before an independent final that already
+    # starts with one.
+    leading_boundary = DummyAdapter()
+    leading_boundary_metadata = {
+        "reply_to_message_id": "inbound-leading-boundary"
+    }
+    await leading_boundary.send_draft(
+        "user-leading-boundary",
+        5115,
+        "progress",
+        leading_boundary_metadata,
+    )
+    leading_boundary_result = await leading_boundary.send(
+        "user-leading-boundary",
+        "\nFINAL",
+        reply_to="inbound-leading-boundary",
+        metadata={"notify": True, **leading_boundary_metadata},
+    )
+    assert leading_boundary_result.success
+    assert_exact_final_ownership(leading_boundary, "progress\nFINAL")
+
+    # A cumulative authoritative final remains a replace, not an independent
+    # append, when it explicitly extends the complete visible draft.
+    cumulative_final = DummyAdapter()
+    cumulative_final_metadata = {
+        "reply_to_message_id": "inbound-cumulative-final"
+    }
+    await cumulative_final.send_draft(
+        "user-cumulative-final",
+        5112,
+        "progress ",
+        cumulative_final_metadata,
+    )
+    cumulative_final_result = await cumulative_final.send(
+        "user-cumulative-final",
+        "progress complete",
+        reply_to="inbound-cumulative-final",
+        metadata={"notify": True, **cumulative_final_metadata},
+    )
+    assert cumulative_final_result.success
+    assert_exact_final_ownership(cumulative_final, "progress complete")
+
     # A stale/cancelled consumer can close the same visible stream through
     # Hermes' real three-argument abandon_open_draft contract.
     cancelled = GatewayDummyAdapter()
@@ -981,6 +1381,8 @@ async def main():
     print("qq_c2c_stream_seal_preserves_prefix=ok")
     print("qq_c2c_stream_parallel_dm_isolation=ok")
     print("qq_c2c_stream_nonfinal_send_isolation=ok")
+    print("qq_c2c_streamed_interim_carrier_dedup=ok")
+    print("qq_c2c_interim_ownership_boundaries=ok")
     print("qq_c2c_stream_abandon_close=ok")
     print("qq_c2c_stream_fallback=ok")
     print("qq_c2c_stream_seal_retry=ok")
@@ -993,6 +1395,7 @@ async def main():
     print("qq_c2c_typing_budget=ok")
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
+    print("qq_c2c_streamed_commentary_single_carrier=ok")
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_overflow_rollover=ok")
@@ -1002,6 +1405,14 @@ async def main():
     print("qq_c2c_head_seal_failure_suffix_ownership=ok")
     print("qq_c2c_tail_open_failure_suffix_fallback=ok")
     print("qq_c2c_tail_seal_failure_no_duplicate=ok")
+    print("qq_c2c_delayed_close_ordinary_ownership=ok")
+    print("qq_c2c_ordinary_owned_late_frame_ignored=ok")
+    print("qq_c2c_ordinary_owned_final_retry=ok")
+    print("qq_c2c_nonterminal_repeated_final=ok")
+    print("qq_c2c_terminal_final_single_owner=ok")
+    print("qq_c2c_partial_overlap_not_ownership=ok")
+    print("qq_c2c_leading_boundary_not_duplicated=ok")
+    print("qq_c2c_cumulative_final_replace=ok")
 
 
 anyio.run(main)

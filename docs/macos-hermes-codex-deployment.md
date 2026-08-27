@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.5 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.8 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,11 +194,18 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.5 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.8 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
   如果新尾 stream 无法打开，普通 fallback 只补发尚未提交的后缀，避免重复已封口头部。
+  ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
+  final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
+  final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由
+  stream 拥有，正文中较早出现的同值文本、任意部分重叠或词内后缀都不会吞掉最终回复。
+  Codex commentary 的实时 delta 已由同一私聊 stream 展示后，Hermes 随后的 `_interim_send`
+  不会再创建内容相同的普通 QQ 气泡：有入站锚点时精确匹配；Hermes 未携带锚点时只恢复同一
+  私聊中唯一且终端正文完全匹配的打开 stream，多候选并发保持普通发送，不猜测归属。
   只有 Gateway 已为该私聊选择 native lane
   或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
   streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
