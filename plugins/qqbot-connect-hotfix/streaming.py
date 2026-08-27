@@ -414,6 +414,13 @@ def _active_content(
     return full
 
 
+def _final_extends_visible_stream(state: _QQC2CStream, content: str) -> bool:
+    """Whether final text is a cumulative extension of all visible chunks."""
+
+    visible = str(state.committed_prefix or "") + str(state.last_content or "")
+    return bool(visible) and str(content or "").startswith(visible)
+
+
 async def _post_seal_with_retries(
     adapter,
     state: _QQC2CStream,
@@ -764,6 +771,7 @@ def patch_qq_c2c_streaming(QQAdapter):
         # GatewayStreamConsumer marks its turn-final send with notify=True.
         # Only intercept that exact path: approvals, slash-command replies,
         # heartbeats, and steering acknowledgements must remain independent.
+        fallback_state = None
         recovery_state = None
         if (
             isinstance(metadata, dict)
@@ -783,9 +791,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                 # committed_prefix. Keep the final seal scoped to the current
                 # stream's suffix so every replace request preserves its own
                 # accepted prefix.
-                if state.committed_prefix and str(content or "").startswith(
-                    state.committed_prefix
-                ):
+                if _final_extends_visible_stream(state, content):
                     try:
                         async with state.lock:
                             state, _data = await _send_cumulative_draft(
@@ -801,6 +807,14 @@ def patch_qq_c2c_streaming(QQAdapter):
                             state.draft_id,
                             exc,
                         )
+                        # Rollover may already have sealed one or more chunks
+                        # and replaced the map entry before a new tail open
+                        # failed. Continue with that latest active state, not
+                        # the now-sealed state captured before the call.
+                        latest_streams, _latest_anchors = _stream_maps(self)
+                        latest_state = latest_streams.get(draft_id)
+                        if latest_state is not None:
+                            state = latest_state
                 active_content = _active_content(
                     state,
                     content,
@@ -824,6 +838,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                     chat_id,
                     sealed.error,
                 )
+                fallback_state = state
                 # The normal final is a safe visible fallback, but the opened
                 # stream stays addressable so abandon/retry can still seal it.
                 if state.stream_msg_id:
@@ -831,12 +846,12 @@ def patch_qq_c2c_streaming(QQAdapter):
 
         normal_content = content
         if (
-            recovery_state is not None
-            and recovery_state.committed_prefix
-            and str(content or "").startswith(recovery_state.committed_prefix)
+            fallback_state is not None
+            and fallback_state.committed_prefix
+            and str(content or "").startswith(fallback_state.committed_prefix)
         ):
             normal_content = str(content or "")[
-                len(recovery_state.committed_prefix):
+                len(fallback_state.committed_prefix):
             ]
 
         normal_result = await original_send(
@@ -846,6 +861,14 @@ def patch_qq_c2c_streaming(QQAdapter):
             reply_to=reply_to,
             metadata=metadata,
         )
+        if (
+            fallback_state is not None
+            and not fallback_state.stream_msg_id
+            and getattr(normal_result, "success", False)
+        ):
+            # No client-visible active stream remains: sealed overflow heads
+            # plus the ordinary suffix now own the complete response.
+            _remove_stream(self, fallback_state)
         if recovery_state is not None and getattr(normal_result, "success", False):
             # Once the complete ordinary final is visible, best-effort close
             # the older stream with its last acknowledged partial body. This

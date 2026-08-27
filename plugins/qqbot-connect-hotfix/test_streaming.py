@@ -48,6 +48,7 @@ class DummyAdapter:
         self.stream_counter = 0
         self.fail_next_stream = False
         self.fail_seal_attempts = 0
+        self.fail_tail_open_attempts = 0
 
     def _guess_chat_type(self, chat_id):
         chat_id = str(chat_id)
@@ -65,6 +66,13 @@ class DummyAdapter:
         if self.fail_next_stream:
             self.fail_next_stream = False
             raise RuntimeError("stream unavailable")
+        if (
+            body["index"] == 0
+            and len(body["content_raw"]) == 100
+            and self.fail_tail_open_attempts
+        ):
+            self.fail_tail_open_attempts -= 1
+            raise RuntimeError("tail open unavailable")
         if body["input_state"] == 10 and self.fail_seal_attempts:
             self.fail_seal_attempts -= 1
             raise RuntimeError("seal unavailable")
@@ -742,6 +750,66 @@ async def main():
     assert overflow_consumer.final_response_sent is True
     assert overflow_consumer.delivered_final_matches(overflow_final) is True
 
+    # The authoritative final can be the first payload that crosses the QQ
+    # limit. It must roll over even when no committed overflow prefix exists
+    # yet, rather than truncating the seal at 4000 characters.
+    final_growth = DummyAdapter()
+    final_growth_metadata = {"reply_to_message_id": "inbound-final-growth"}
+    await final_growth.send_draft(
+        "user-final-growth",
+        5101,
+        "D" * 3900,
+        final_growth_metadata,
+    )
+    final_growth_text = "D" * 4100
+    final_growth_result = await final_growth.send(
+        "user-final-growth",
+        final_growth_text,
+        reply_to="inbound-final-growth",
+        metadata={"notify": True, **final_growth_metadata},
+    )
+    assert final_growth_result.success
+    assert not final_growth.normal_sends
+    final_growth_seals = [
+        call[2]["content_raw"]
+        for call in final_growth.api_calls
+        if call[2]["input_state"] == 10
+    ]
+    assert "".join(final_growth_seals) == final_growth_text
+
+    # If the head was sealed but the new tail stream cannot open, the ordinary
+    # fallback owns only the uncommitted suffix. Sending the complete final
+    # would duplicate the already-visible 4000-character head.
+    tail_failure = DummyAdapter()
+    tail_failure.fail_tail_open_attempts = 2
+    tail_failure_metadata = {"reply_to_message_id": "inbound-tail-failure"}
+    tail_failure_text = "E" * 2000 + "F" * 2100
+    await tail_failure.send_draft(
+        "user-tail-failure",
+        5102,
+        "E" * 2000,
+        tail_failure_metadata,
+    )
+    await tail_failure.send_draft(
+        "user-tail-failure",
+        5102,
+        tail_failure_text,
+        tail_failure_metadata,
+    )
+    tail_failure_result = await tail_failure.send(
+        "user-tail-failure",
+        tail_failure_text,
+        reply_to="inbound-tail-failure",
+        metadata={"notify": True, **tail_failure_metadata},
+    )
+    assert tail_failure_result.success
+    assert [len(item[1]) for item in tail_failure.normal_sends] == [100]
+    assert tail_failure.normal_sends[-1][1] == tail_failure_text[4000:]
+    tail_failure_streams, _tail_failure_anchors = streaming_mod._stream_maps(
+        tail_failure
+    )
+    assert not tail_failure_streams
+
     # A stale/cancelled consumer can close the same visible stream through
     # Hermes' real three-argument abandon_open_draft contract.
     cancelled = GatewayDummyAdapter()
@@ -778,6 +846,8 @@ async def main():
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_overflow_rollover=ok")
+    print("qq_c2c_final_first_overflow_rollover=ok")
+    print("qq_c2c_tail_open_failure_suffix_fallback=ok")
 
 
 anyio.run(main)

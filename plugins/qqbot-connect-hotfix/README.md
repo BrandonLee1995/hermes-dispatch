@@ -24,6 +24,17 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.5 extends rollover ownership to the authoritative final payload.
+If the visible draft is still below QQ's limit but the final first crosses it,
+the active stream is sealed at the limit and a new stream carries the suffix;
+the suffix is no longer truncated. If a prior overflow head is already sealed
+but QQ cannot open the new tail stream, the ordinary fallback sends only the
+uncommitted suffix instead of duplicating the sealed prefix. A successful
+suffix fallback also removes the unopened placeholder state. These two paths
+are regression-tested with 3900-to-4100 final growth and repeated tail-open
+failure. Roll back this release by restoring 1.8.4 from outside the plugin
+discovery tree and restarting the affected profile.
+
 Version 1.8.4 gives QQ native streams their own overflow lifecycle. When a
 cumulative C2C reply exceeds QQ's per-message limit, the plugin seals the full
 active stream chunk and opens a new stream for only the remaining suffix.
@@ -156,7 +167,7 @@ does not seal the stream, and logs contain neither error `40034128` nor a
 second final send.  Roll back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.4 code change,
+typing budget is also removed. To roll back the complete 1.8.5 code change,
 restore the previous plugin directory from outside the plugin discovery tree
 and restart that profile.
 
