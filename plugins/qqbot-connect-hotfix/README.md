@@ -24,6 +24,27 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.1 preserves QQ's already-submitted stream prefix when Hermes seals
+a tool-using private-chat turn. Hermes' cumulative draft can contain commentary
+and tool progress before the final answer, while its turn-final `send()` may
+contain only the short final answer. Sending that shorter text with
+`input_mode=replace` removes the visible prefix and QQ rejects the
+`input_state=10` frame as immutable content. The hotfix now seals with the
+cumulative draft when it already contains the final, or appends only the
+non-overlapping final suffix when needed. This keeps one visible message,
+allows the native stream to reach its completed state, and retains the existing
+single ordinary-final fallback if the stream itself fails. Verify with
+`test_streaming.py` and a tool-using C2C task whose commentary is visible before
+a short final. Roll back by restoring 1.8.0 and restarting only the affected
+profile Gateway.
+
+Keep rollback copies outside every configured plugin discovery root. Hermes can
+recursively discover a `plugin.yaml` below the profile `plugins` directory, so
+a path such as `plugins/.backups/qqbot-connect-hotfix-1.8.0` may register the
+old copy before the active plugin. A profile-level path such as
+`plugin-backups/qqbot-connect-hotfix-1.8.0-<timestamp>` keeps the backup
+available without loading it.
+
 Version 1.8.0 adds QQ's official C2C streaming-message protocol without
 modifying the installed Hermes package.  The plugin advertises native draft
 streaming only for private chats, maps Hermes cumulative draft frames to

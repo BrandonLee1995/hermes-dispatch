@@ -125,8 +125,46 @@ async def main():
     assert final.success
     assert final.message_id.startswith("stream-")
     assert adapter.api_calls[-1][2]["input_state"] == 10
-    assert adapter.api_calls[-1][2]["content_raw"] == "最终答案"
+    assert (
+        adapter.api_calls[-1][2]["content_raw"]
+        == "正在读取知识库\n最终答案"
+    )
     assert not adapter.normal_sends
+
+    # Hermes can stream user-visible commentary before it produces the short
+    # turn-final answer. QQ replace mode forbids removing an already-delivered
+    # prefix, so sealing must retain the cumulative draft instead of replacing
+    # it with the shorter final-only string.
+    prefixed = DummyAdapter()
+    prefixed_metadata = {"reply_to_message_id": "inbound-prefix"}
+    await prefixed.send_draft(
+        "user-prefix",
+        1003,
+        "开始只读检查。",
+        prefixed_metadata,
+    )
+    await prefixed.send_draft(
+        "user-prefix",
+        1003,
+        "开始只读检查。\n最终答案",
+        prefixed_metadata,
+    )
+    prefixed_final = await prefixed.send(
+        "user-prefix",
+        "最终答案",
+        reply_to="inbound-prefix",
+        metadata={
+            "notify": True,
+            "reply_to_message_id": "inbound-prefix",
+        },
+    )
+    assert prefixed_final.success
+    assert prefixed.api_calls[-1][2]["input_state"] == 10
+    assert (
+        prefixed.api_calls[-1][2]["content_raw"]
+        == "开始只读检查。\n最终答案"
+    )
+    assert not prefixed.normal_sends
 
     # A non-final message must never seal or hijack the open stream.
     await adapter.send_draft(
@@ -287,6 +325,7 @@ async def main():
     assert cancelled.api_calls[-1][2]["input_state"] == 10
 
     print("qq_c2c_stream_open_continue_seal=ok")
+    print("qq_c2c_stream_seal_preserves_prefix=ok")
     print("qq_c2c_stream_parallel_dm_isolation=ok")
     print("qq_c2c_stream_nonfinal_send_isolation=ok")
     print("qq_c2c_stream_abandon_close=ok")

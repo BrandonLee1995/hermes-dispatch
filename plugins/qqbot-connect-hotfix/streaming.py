@@ -222,8 +222,47 @@ async def _post_stream_frame(
             state.next_index,
         )
     state.next_index += 1
-    state.last_content = str(content or "")
+    # Track the exact body submitted to QQ, including the platform length cap.
+    # A later replace/seal request must preserve this already-submitted prefix.
+    state.last_content = str(body["content_raw"])
     return data
+
+
+def _seal_content(adapter, state: _QQC2CStream, content: str) -> str:
+    """Compose a legal final replace body without removing QQ's prefix.
+
+    Hermes' draft contains commentary, tool progress, and often the final
+    answer, while its turn-final ``send`` can contain only the short final
+    answer. QQ rejects a replace request that removes an already-submitted
+    prefix. Reuse the cumulative draft when it already contains the final; if
+    it does not, append only the non-overlapping final suffix within the
+    platform length limit.
+    """
+
+    previous = str(state.last_content or "")
+    final = str(content or "")
+    max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 4000))
+
+    if not previous:
+        return final[:max_length]
+    if not final or final == previous:
+        return previous
+    if final.startswith(previous):
+        return final[:max_length]
+    if final in previous:
+        return previous
+
+    overlap = 0
+    for size in range(min(len(previous), len(final)), 0, -1):
+        if previous.endswith(final[:size]):
+            overlap = size
+            break
+
+    suffix = final[overlap:]
+    if suffix and not overlap and not previous.endswith(("\n", " ")):
+        suffix = "\n" + suffix
+    remaining = max(0, max_length - len(previous))
+    return previous + suffix[:remaining]
 
 
 async def _seal_stream(adapter, state: _QQC2CStream, content: str):
@@ -240,10 +279,11 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
                 error="QQ stream cannot be sealed before its first frame",
             )
         try:
+            seal_content = _seal_content(adapter, state, content)
             data = await _post_stream_frame(
                 adapter,
                 state,
-                content or state.last_content,
+                seal_content,
                 input_state=10,
             )
         except Exception as exc:
