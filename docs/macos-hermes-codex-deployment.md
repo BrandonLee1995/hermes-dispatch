@@ -134,8 +134,8 @@ hermes config set compression.codex_app_server_auto native
 hermes config set display.interim_assistant_messages true
 hermes config set display.streaming true
 hermes config set display.platforms.qqbot.interim_assistant_messages true
-hermes config set display.platforms.qqbot.streaming false
-hermes config set display.platforms.qqbot.tool_progress false
+hermes config set display.platforms.qqbot.streaming true
+hermes config set display.platforms.qqbot.tool_progress new
 
 hermes config set group_sessions_per_user false
 hermes config set session_reset.mode none
@@ -155,7 +155,10 @@ hermes config check
 
 关键点：
 
-- QQ 开启 commentary，但关闭逐 token streaming，既能看到中间进度，又避免 final 重复发送。
+- `qqbot-connect-hotfix` 1.8.0 起，QQ 私聊通过官方
+  `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
+  不使用该 C2C 端点，仍走原有被动回复路径。插件会把同一入站消息的 `input_notify`
+  限制为一次，避免长任务在 final 前耗尽被动回复额度。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -330,6 +333,7 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_expired_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_media_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_streaming.py
 "$HERMES_PY" plugins/message-snapshot-store/test_store.py
 "$HERMES_PY" plugins/message-snapshot-store/test_capture.py
 "$HERMES_PY" plugins/message-snapshot-store/test_materialize.py

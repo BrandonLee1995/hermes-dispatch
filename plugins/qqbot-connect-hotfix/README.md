@@ -21,7 +21,56 @@ QQBot connect signature compatibility, QQ group configuration interaction ACKs,
 channel-directory chat routing,
 `GROUP_MESSAGE_CREATE` context buffering, deterministic group-context compaction,
 structured self-mention gating, emoji-only group mentions, reply `msg_id`
-handling, markdown fallback, and media caption compatibility.
+handling, native C2C streaming, bounded input notifications, markdown fallback,
+and media caption compatibility.
+
+Version 1.8.0 adds QQ's official C2C streaming-message protocol without
+modifying the installed Hermes package.  The plugin advertises native draft
+streaming only for private chats, maps Hermes cumulative draft frames to
+[`POST /v2/users/{openid}/stream_messages`](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html)
+with `input_mode=replace`, and seals
+the same visible message with `input_state=10` when the turn completes.  Each
+stream is keyed by chat, inbound `msg_id`, and Hermes draft id so concurrent
+private sessions cannot share indices or `stream_msg_id` values.  Approval,
+slash-command, heartbeat, and steering messages bypass the seal path and remain
+independent messages.
+
+QQ counts `input_notify` calls against the passive-reply budget associated with
+an inbound message.  Hermes normally refreshes that status every 50 seconds;
+long turns can therefore exhaust the budget before their final response.  The
+1.8.0 patch permits at most one typing notification per inbound `msg_id` and
+then uses the native stream for continuing status.  If the first stream frame
+fails, Hermes falls back to its normal final-message path.
+
+Enable the feature per profile:
+
+```yaml
+streaming:
+  enabled: true
+  transport: auto
+
+display:
+  platforms:
+    qqbot:
+      streaming: true
+      interim_assistant_messages: true
+      tool_progress: new
+```
+
+Verification:
+
+```bash
+PYTHONPATH=/path/to/hermes-agent \
+  /path/to/hermes-agent/venv/bin/python \
+  plugins/qqbot-connect-hotfix/test_streaming.py
+```
+
+In a real QQ private chat, start a tool-using task and verify that one message
+updates in place, the last frame is sealed rather than duplicated, `/steer`
+does not seal the stream, and logs contain neither error `40034128` nor a
+second final send.  Roll back by setting
+`display.platforms.qqbot.streaming: false`, restoring the previous plugin
+directory, and restarting only the affected profile's Gateway.
 
 Version 1.7.0 adds the narrow expired-reply fallback used by upstream Hermes
 PR [#85221](https://github.com/NousResearch/hermes-agent/pull/85221). QQ can
