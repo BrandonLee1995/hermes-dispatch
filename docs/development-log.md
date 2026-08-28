@@ -1,5 +1,41 @@
 # Development Log
 
+## 2026-08-28 — Serialize concurrent ordinary final ownership
+
+### Problem
+
+The cancellation-tombstone and final-only-pending paths read lifecycle state,
+awaited the ordinary QQ sender, and recorded successful delivery afterward.
+Two concurrent `notify=True` callbacks could therefore both observe the same
+undelivered record and emit the same final in separate QQ messages.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.13.
+- Added a reference-counted delivery claim keyed by QQ private chat and inbound
+  reply anchor. It is registered before any external send await and removed
+  after the last caller exits.
+- Rechecked completed, cancelled, and pending lifecycle state inside the claim.
+  A successful first sender leaves replay suppression for its waiter; a failed
+  sender leaves the source record unchanged so the waiter can retry.
+- Added public adapter regressions for concurrent cancellation and pending
+  finals with three callers, failure handoff, cancelled-waiter cleanup, claim
+  registry removal, cancelled-holder and raised-exception handoff,
+  independent-anchor parallel delivery, exactly one successful visible
+  delivery per turn, and replay suppression.
+
+### Verify and roll back
+
+Run the complete QQ streaming lifecycle test against Hermes 0.20.5, all five QQ
+compatibility tests against Hermes 0.20.0, the offline plugin/MCP matrix,
+`scripts/test_install_plugins.sh`, and the static checks. The concurrency cases
+must record one successful ordinary message; the failure-handoff case must
+record one failed attempt followed by one successful visible message. Confirm
+cancelled waiters and holders plus raised send exceptions leave no stale claim,
+and different anchors still reach the external send boundary concurrently.
+Restore only an exact installer-created external backup and restart only the
+affected profile after verification.
+
 ## 2026-08-28 — Separate cancellation ownership and preflight complete updates
 
 ### Problem

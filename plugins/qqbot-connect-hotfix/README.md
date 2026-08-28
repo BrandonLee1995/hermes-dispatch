@@ -24,6 +24,24 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.13 serializes ordinary final ownership for each QQ private chat and
+inbound reply anchor. The adapter registers a short-lived delivery claim before
+awaiting the external QQ send, so concurrent `notify=True` callbacks cannot
+both deliver the same cancellation or final-only-pending payload. A waiting
+callback rechecks the lifecycle state after acquiring the claim: it suppresses
+a replay after success, or retries the unchanged tombstone/pending record after
+failure. Claims are reference-counted and removed when their last caller exits,
+so unrelated chats and anchors remain independent and no adapter-lifetime lock
+registry accumulates. Public concurrent regressions cover successful
+three-caller cancellation and pending delivery, failure handoff, cancelled
+waiter cleanup, cancelled-holder and raised-exception handoff, independent
+anchors reaching the external boundary in parallel, an empty claim registry
+after exit, and replay suppression.
+Install with `scripts/install-plugins.sh`, run the complete Python command in
+the Verification section plus `scripts/test_install_plugins.sh`, then restart
+only the affected profile. Roll back only from the exact external backup
+printed by a successful earlier install.
+
 Version 1.8.12 separates cancellation evidence from successful final delivery.
 When a capacity-triggered final-only turn is abandoned, its cancellation
 tombstone still suppresses a stale `send_draft`, but it is not eligible to

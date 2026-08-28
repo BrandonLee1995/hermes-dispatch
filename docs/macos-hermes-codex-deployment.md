@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.12 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.13 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.12 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.13 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -218,6 +218,11 @@ hermes config check
   capacity-final-only 被成功 abandon 后会保留 cancellation tombstone：它只拦截 late
   draft，不会吞掉尚未投递的普通 final；普通 final 首次成功后才升级为 completed owner，
   后续重复 final 只确认、不再投递。
+- cancellation 与 final-only-pending 的普通 final 在 `(chat_id, reply anchor)` 范围内先取得
+  短生命周期 delivery claim，再调用 QQ 外部发送。并发 final callback 会在 claim 内重新
+  检查状态：首次成功后等待者只确认 replay；首次失败时保留原状态，由等待者安全重试。
+  claim 在最后一个调用者退出后删除，不会形成 adapter 生命周期的锁表，也不会串行化其他
+  私聊或其他入站锚点。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。

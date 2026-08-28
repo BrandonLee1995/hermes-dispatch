@@ -17,6 +17,7 @@ import functools
 import logging
 import re
 import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -108,6 +109,14 @@ class _QQC2CTurnTombstone:
     final_delivered: bool = True
 
 
+@dataclass
+class _QQC2CFinalDeliveryClaim:
+    """Serialize ordinary final ownership for one chat/reply anchor."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 def _stream_maps(adapter):
     streams = getattr(adapter, "_qq_native_c2c_streams", None)
     if streams is None:
@@ -124,6 +133,41 @@ def _stream_key(chat_id: str, draft_id: int) -> tuple[str, int]:
     """Return the adapter-contract identity for one active draft."""
 
     return str(chat_id), int(draft_id)
+
+
+def _final_delivery_claims(
+    adapter,
+) -> Dict[tuple[str, str], _QQC2CFinalDeliveryClaim]:
+    claims = getattr(adapter, "_qq_native_c2c_final_delivery_claims", None)
+    if claims is None:
+        claims = {}
+        adapter._qq_native_c2c_final_delivery_claims = claims
+    return claims
+
+
+@asynccontextmanager
+async def _claim_final_delivery(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+):
+    """Claim one turn before awaiting its external ordinary final send."""
+
+    claims = _final_delivery_claims(adapter)
+    key = (str(chat_id), str(reply_to))
+    claim = claims.get(key)
+    if claim is None:
+        claim = _QQC2CFinalDeliveryClaim()
+        claims[key] = claim
+    claim.users += 1
+    try:
+        async with claim.lock:
+            yield
+    finally:
+        claim.users -= 1
+        if claim.users == 0 and claims.get(key) is claim:
+            claims.pop(key, None)
 
 
 def _turn_tombstones(
@@ -1258,65 +1302,70 @@ def patch_qq_c2c_streaming(QQAdapter):
             state_key = anchors.get((str(chat_id), anchor))
             state = streams.get(state_key) if state_key is not None else None
             if state is None:
-                completed_owner = _completed_owner_for_final(
+                async with _claim_final_delivery(
                     self,
                     chat_id=str(chat_id),
                     reply_to=anchor,
-                    content=str(content or ""),
-                )
-                if completed_owner is not None:
-                    return _send_result(
-                        success=True,
-                        message_id=completed_owner.message_id,
-                        raw_response={"qq_completed_turn_owned": True},
-                    )
-                cancelled_owner = _cancelled_owner_for_anchor(
-                    self,
-                    chat_id=str(chat_id),
-                    reply_to=anchor,
-                )
-                if cancelled_owner is not None:
-                    normal_result = await original_send(
+                ):
+                    completed_owner = _completed_owner_for_final(
                         self,
-                        chat_id,
-                        content,
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        chat_id=str(chat_id),
+                        reply_to=anchor,
+                        content=str(content or ""),
                     )
-                    if getattr(normal_result, "success", False):
-                        _promote_cancelled_owner(
-                            self,
-                            cancelled_owner,
-                            final_content=str(content or ""),
-                            message_id=getattr(
-                                normal_result,
-                                "message_id",
-                                None,
-                            ),
+                    if completed_owner is not None:
+                        return _send_result(
+                            success=True,
+                            message_id=completed_owner.message_id,
+                            raw_response={"qq_completed_turn_owned": True},
                         )
-                    return normal_result
-                pending_state = _final_only_pending_for_anchor(
-                    self,
-                    chat_id=str(chat_id),
-                    reply_to=anchor,
-                )
-                if pending_state is not None:
-                    normal_result = await original_send(
+                    cancelled_owner = _cancelled_owner_for_anchor(
                         self,
-                        chat_id,
-                        content,
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        chat_id=str(chat_id),
+                        reply_to=anchor,
                     )
-                    if getattr(normal_result, "success", False):
-                        _remember_turn_tombstone(
+                    if cancelled_owner is not None:
+                        normal_result = await original_send(
                             self,
-                            pending_state,
-                            final_payload=str(content or ""),
-                            final_content=str(content or ""),
+                            chat_id,
+                            content,
+                            reply_to=reply_to,
+                            metadata=metadata,
                         )
-                        _remove_final_only_pending(self, pending_state)
-                    return normal_result
+                        if getattr(normal_result, "success", False):
+                            _promote_cancelled_owner(
+                                self,
+                                cancelled_owner,
+                                final_content=str(content or ""),
+                                message_id=getattr(
+                                    normal_result,
+                                    "message_id",
+                                    None,
+                                ),
+                            )
+                        return normal_result
+                    pending_state = _final_only_pending_for_anchor(
+                        self,
+                        chat_id=str(chat_id),
+                        reply_to=anchor,
+                    )
+                    if pending_state is not None:
+                        normal_result = await original_send(
+                            self,
+                            chat_id,
+                            content,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                        if getattr(normal_result, "success", False):
+                            _remember_turn_tombstone(
+                                self,
+                                pending_state,
+                                final_payload=str(content or ""),
+                                final_content=str(content or ""),
+                            )
+                            _remove_final_only_pending(self, pending_state)
+                        return normal_result
             if state is not None:
                 if state.ordinary_owned_suffix:
                     # A prior successful final fallback is authoritative and

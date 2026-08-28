@@ -45,6 +45,15 @@ class DummyAdapter:
         self.api_calls = []
         self.successful_api_calls = []
         self.normal_sends = []
+        self.normal_send_attempts = []
+        self.normal_send_entered = None
+        self.normal_send_concurrent_entered = None
+        self.normal_send_second_attempt_entered = None
+        self.normal_send_release = None
+        self.fail_normal_attempts = 0
+        self.raise_normal_attempts = 0
+        self.normal_send_inflight = 0
+        self.normal_send_peak = 0
         self.typing_calls = []
         self.stream_counter = 0
         self.fail_next_stream = False
@@ -87,12 +96,46 @@ class DummyAdapter:
         return data
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        self.normal_sends.append((chat_id, content, reply_to, metadata))
-        return SimpleNamespace(
-            success=True,
-            message_id="normal-message",
-            error=None,
+        attempt = (chat_id, content, reply_to, metadata)
+        self.normal_send_attempts.append(attempt)
+        self.normal_send_inflight += 1
+        self.normal_send_peak = max(
+            self.normal_send_peak,
+            self.normal_send_inflight,
         )
+        try:
+            if self.normal_send_entered is not None:
+                self.normal_send_entered.set()
+            if (
+                len(self.normal_send_attempts) >= 2
+                and self.normal_send_second_attempt_entered is not None
+            ):
+                self.normal_send_second_attempt_entered.set()
+            if (
+                self.normal_send_inflight >= 2
+                and self.normal_send_concurrent_entered is not None
+            ):
+                self.normal_send_concurrent_entered.set()
+            if self.normal_send_release is not None:
+                await self.normal_send_release.wait()
+            if self.raise_normal_attempts:
+                self.raise_normal_attempts -= 1
+                raise RuntimeError("normal send raised")
+            if self.fail_normal_attempts:
+                self.fail_normal_attempts -= 1
+                return SimpleNamespace(
+                    success=False,
+                    message_id=None,
+                    error="normal send unavailable",
+                )
+            self.normal_sends.append(attempt)
+            return SimpleNamespace(
+                success=True,
+                message_id="normal-message",
+                error=None,
+            )
+        finally:
+            self.normal_send_inflight -= 1
 
     async def send_typing(self, chat_id, metadata=None):
         self.typing_calls.append((chat_id, metadata))
@@ -122,6 +165,27 @@ def assert_exact_final_ownership(adapter, target):
     ]
     ordinary = [item[1] for item in adapter.normal_sends]
     assert "".join(sealed + visible_open + ordinary) == target
+
+
+async def wait_for_final_claim_users(
+    adapter,
+    chat_id,
+    reply_to,
+    expected_users,
+):
+    """Wait until every intended concurrent caller has registered its claim."""
+
+    key = (str(chat_id), str(reply_to))
+    with anyio.fail_after(1):
+        while True:
+            claim = getattr(
+                adapter,
+                "_qq_native_c2c_final_delivery_claims",
+                {},
+            ).get(key)
+            if claim is not None and claim.users == expected_users:
+                return
+            await anyio.sleep(0)
 
 
 async def main():
@@ -775,6 +839,458 @@ async def main():
         assert [item[1] for item in abandoned_pending.normal_sends] == [
             "pending"
         ]
+    finally:
+        streaming_mod._MAX_OPEN_STREAMS = previous_capacity
+
+    # Concurrent turn-final callbacks share one delivery claim. A cancelled
+    # capacity turn and a still-pending capacity turn must each expose exactly
+    # one successful ordinary QQ message, while both callers complete.
+    previous_capacity = streaming_mod._MAX_OPEN_STREAMS
+    streaming_mod._MAX_OPEN_STREAMS = 1
+    try:
+        for abandoned, suffix in ((True, "cancelled"), (False, "pending")):
+            concurrent_final = DummyAdapter()
+            blocker_chat = f"user-concurrent-blocker-{suffix}"
+            blocker_anchor = f"msg-concurrent-blocker-{suffix}"
+            final_chat = f"user-concurrent-{suffix}"
+            final_anchor = f"msg-concurrent-{suffix}"
+            await concurrent_final.send_draft(
+                blocker_chat,
+                3250,
+                "blocker",
+                {"reply_to_message_id": blocker_anchor},
+            )
+            await concurrent_final.send_draft(
+                final_chat,
+                3251,
+                "final",
+                {"reply_to_message_id": final_anchor},
+            )
+            if abandoned:
+                await concurrent_final.abandon_open_draft(
+                    final_chat,
+                    "final",
+                    {"reply_to_message_id": final_anchor},
+                )
+            concurrent_final.normal_send_entered = anyio.Event()
+            concurrent_final.normal_send_release = anyio.Event()
+            results = {}
+
+            async def send_concurrent_final(call_id):
+                results[call_id] = await concurrent_final.send(
+                    final_chat,
+                    "final",
+                    reply_to=final_anchor,
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": final_anchor,
+                    },
+                )
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(send_concurrent_final, "first")
+                task_group.start_soon(send_concurrent_final, "second")
+                task_group.start_soon(send_concurrent_final, "third")
+                await concurrent_final.normal_send_entered.wait()
+                await wait_for_final_claim_users(
+                    concurrent_final,
+                    final_chat,
+                    final_anchor,
+                    3,
+                )
+                concurrent_final.normal_send_release.set()
+
+            assert results["first"].success
+            assert results["second"].success
+            assert results["third"].success
+            assert concurrent_final.normal_send_peak == 1
+            assert not concurrent_final._qq_native_c2c_final_delivery_claims
+            assert [item[1] for item in concurrent_final.normal_sends] == [
+                "final"
+            ]
+            repeated_concurrent_final = await concurrent_final.send(
+                final_chat,
+                "final",
+                reply_to=final_anchor,
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": final_anchor,
+                },
+            )
+            assert repeated_concurrent_final.success
+            assert [item[1] for item in concurrent_final.normal_sends] == [
+                "final"
+            ]
+            await concurrent_final.abandon_open_draft(
+                blocker_chat,
+                "blocker",
+                {"reply_to_message_id": blocker_anchor},
+            )
+
+        failed_claim = DummyAdapter()
+        await failed_claim.send_draft(
+            "user-failed-claim-blocker",
+            3252,
+            "blocker",
+            {"reply_to_message_id": "msg-failed-claim-blocker"},
+        )
+        await failed_claim.send_draft(
+            "user-failed-claim",
+            3253,
+            "final",
+            {"reply_to_message_id": "msg-failed-claim"},
+        )
+        await failed_claim.abandon_open_draft(
+            "user-failed-claim",
+            "final",
+            {"reply_to_message_id": "msg-failed-claim"},
+        )
+        failed_claim.fail_normal_attempts = 1
+        failed_claim.normal_send_entered = anyio.Event()
+        failed_claim.normal_send_release = anyio.Event()
+        failed_results = {}
+
+        async def send_failed_claim(call_id):
+            failed_results[call_id] = await failed_claim.send(
+                "user-failed-claim",
+                "final",
+                reply_to="msg-failed-claim",
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": "msg-failed-claim",
+                },
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_failed_claim, "first")
+            task_group.start_soon(send_failed_claim, "second")
+            await failed_claim.normal_send_entered.wait()
+            await wait_for_final_claim_users(
+                failed_claim,
+                "user-failed-claim",
+                "msg-failed-claim",
+                2,
+            )
+            failed_claim.normal_send_release.set()
+
+        assert sorted(result.success for result in failed_results.values()) == [
+            False,
+            True,
+        ]
+        assert failed_claim.normal_send_peak == 1
+        assert not failed_claim._qq_native_c2c_final_delivery_claims
+        assert [item[1] for item in failed_claim.normal_sends] == ["final"]
+        replay_after_retry = await failed_claim.send(
+            "user-failed-claim",
+            "final",
+            reply_to="msg-failed-claim",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-failed-claim",
+            },
+        )
+        assert replay_after_retry.success
+        assert [item[1] for item in failed_claim.normal_sends] == ["final"]
+
+        independent_claims = DummyAdapter()
+        await independent_claims.send_draft(
+            "user-independent-claim-blocker",
+            3260,
+            "blocker",
+            {"reply_to_message_id": "msg-independent-claim-blocker"},
+        )
+        for draft_id, anchor in (
+            (3261, "msg-independent-claim-a"),
+            (3262, "msg-independent-claim-b"),
+        ):
+            await independent_claims.send_draft(
+                "user-independent-claim",
+                draft_id,
+                f"final-{draft_id}",
+                {"reply_to_message_id": anchor},
+            )
+        independent_claims.normal_send_concurrent_entered = anyio.Event()
+        independent_claims.normal_send_release = anyio.Event()
+        independent_results = {}
+
+        async def send_independent_claim(call_id, anchor):
+            independent_results[call_id] = await independent_claims.send(
+                "user-independent-claim",
+                call_id,
+                reply_to=anchor,
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": anchor,
+                },
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                send_independent_claim,
+                "final-3261",
+                "msg-independent-claim-a",
+            )
+            task_group.start_soon(
+                send_independent_claim,
+                "final-3262",
+                "msg-independent-claim-b",
+            )
+            await independent_claims.normal_send_concurrent_entered.wait()
+            independent_claims.normal_send_release.set()
+
+        assert all(result.success for result in independent_results.values())
+        assert independent_claims.normal_send_peak == 2
+        assert not independent_claims._qq_native_c2c_final_delivery_claims
+        assert sorted(item[1] for item in independent_claims.normal_sends) == [
+            "final-3261",
+            "final-3262",
+        ]
+        await independent_claims.abandon_open_draft(
+            "user-independent-claim-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-independent-claim-blocker"},
+        )
+
+        cancelled_waiter = DummyAdapter()
+        await cancelled_waiter.send_draft(
+            "user-cancelled-waiter-blocker",
+            3270,
+            "blocker",
+            {"reply_to_message_id": "msg-cancelled-waiter-blocker"},
+        )
+        await cancelled_waiter.send_draft(
+            "user-cancelled-waiter",
+            3271,
+            "final",
+            {"reply_to_message_id": "msg-cancelled-waiter"},
+        )
+        await cancelled_waiter.abandon_open_draft(
+            "user-cancelled-waiter",
+            "final",
+            {"reply_to_message_id": "msg-cancelled-waiter"},
+        )
+        cancelled_waiter.normal_send_entered = anyio.Event()
+        cancelled_waiter.normal_send_release = anyio.Event()
+        waiter_scope_ready = anyio.Event()
+        waiter_cancelled = anyio.Event()
+        waiter_scope_holder = {}
+        leader_results = []
+
+        async def send_claim_leader():
+            leader_results.append(
+                await cancelled_waiter.send(
+                    "user-cancelled-waiter",
+                    "final",
+                    reply_to="msg-cancelled-waiter",
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": "msg-cancelled-waiter",
+                    },
+                )
+            )
+
+        async def send_then_cancel_waiter():
+            with anyio.CancelScope() as cancel_scope:
+                waiter_scope_holder["scope"] = cancel_scope
+                waiter_scope_ready.set()
+                await cancelled_waiter.send(
+                    "user-cancelled-waiter",
+                    "final",
+                    reply_to="msg-cancelled-waiter",
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": "msg-cancelled-waiter",
+                    },
+                )
+            waiter_cancelled.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_claim_leader)
+            await cancelled_waiter.normal_send_entered.wait()
+            task_group.start_soon(send_then_cancel_waiter)
+            await waiter_scope_ready.wait()
+            await wait_for_final_claim_users(
+                cancelled_waiter,
+                "user-cancelled-waiter",
+                "msg-cancelled-waiter",
+                2,
+            )
+            waiter_scope_holder["scope"].cancel()
+            await waiter_cancelled.wait()
+            cancelled_waiter.normal_send_release.set()
+
+        assert leader_results[0].success
+        assert [item[1] for item in cancelled_waiter.normal_sends] == ["final"]
+        assert not cancelled_waiter._qq_native_c2c_final_delivery_claims
+        replay_after_waiter_cancel = await cancelled_waiter.send(
+            "user-cancelled-waiter",
+            "final",
+            reply_to="msg-cancelled-waiter",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-cancelled-waiter",
+            },
+        )
+        assert replay_after_waiter_cancel.success
+        assert [item[1] for item in cancelled_waiter.normal_sends] == ["final"]
+        await cancelled_waiter.abandon_open_draft(
+            "user-cancelled-waiter-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-cancelled-waiter-blocker"},
+        )
+
+        cancelled_holder = DummyAdapter()
+        await cancelled_holder.send_draft(
+            "user-cancelled-holder-blocker",
+            3272,
+            "blocker",
+            {"reply_to_message_id": "msg-cancelled-holder-blocker"},
+        )
+        await cancelled_holder.send_draft(
+            "user-cancelled-holder",
+            3273,
+            "final",
+            {"reply_to_message_id": "msg-cancelled-holder"},
+        )
+        await cancelled_holder.abandon_open_draft(
+            "user-cancelled-holder",
+            "final",
+            {"reply_to_message_id": "msg-cancelled-holder"},
+        )
+        cancelled_holder.normal_send_entered = anyio.Event()
+        cancelled_holder.normal_send_second_attempt_entered = anyio.Event()
+        cancelled_holder.normal_send_release = anyio.Event()
+        holder_scope_ready = anyio.Event()
+        holder_cancelled = anyio.Event()
+        holder_scope_holder = {}
+        holder_waiter_results = []
+
+        async def send_then_cancel_holder():
+            with anyio.CancelScope() as cancel_scope:
+                holder_scope_holder["scope"] = cancel_scope
+                holder_scope_ready.set()
+                await cancelled_holder.send(
+                    "user-cancelled-holder",
+                    "final",
+                    reply_to="msg-cancelled-holder",
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": "msg-cancelled-holder",
+                    },
+                )
+            holder_cancelled.set()
+
+        async def send_after_holder_cancel():
+            holder_waiter_results.append(
+                await cancelled_holder.send(
+                    "user-cancelled-holder",
+                    "final",
+                    reply_to="msg-cancelled-holder",
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": "msg-cancelled-holder",
+                    },
+                )
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_then_cancel_holder)
+            await holder_scope_ready.wait()
+            await cancelled_holder.normal_send_entered.wait()
+            task_group.start_soon(send_after_holder_cancel)
+            await wait_for_final_claim_users(
+                cancelled_holder,
+                "user-cancelled-holder",
+                "msg-cancelled-holder",
+                2,
+            )
+            holder_scope_holder["scope"].cancel()
+            await holder_cancelled.wait()
+            await cancelled_holder.normal_send_second_attempt_entered.wait()
+            cancelled_holder.normal_send_release.set()
+
+        assert holder_waiter_results[0].success
+        assert cancelled_holder.normal_send_peak == 1
+        assert [item[1] for item in cancelled_holder.normal_sends] == ["final"]
+        assert not cancelled_holder._qq_native_c2c_final_delivery_claims
+        await cancelled_holder.abandon_open_draft(
+            "user-cancelled-holder-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-cancelled-holder-blocker"},
+        )
+
+        raised_claim = DummyAdapter()
+        await raised_claim.send_draft(
+            "user-raised-claim-blocker",
+            3274,
+            "blocker",
+            {"reply_to_message_id": "msg-raised-claim-blocker"},
+        )
+        await raised_claim.send_draft(
+            "user-raised-claim",
+            3275,
+            "final",
+            {"reply_to_message_id": "msg-raised-claim"},
+        )
+        await raised_claim.abandon_open_draft(
+            "user-raised-claim",
+            "final",
+            {"reply_to_message_id": "msg-raised-claim"},
+        )
+        raised_claim.raise_normal_attempts = 1
+        raised_claim.normal_send_entered = anyio.Event()
+        raised_claim.normal_send_release = anyio.Event()
+        raised_results = {}
+
+        async def send_raised_claim(call_id):
+            try:
+                raised_results[call_id] = await raised_claim.send(
+                    "user-raised-claim",
+                    "final",
+                    reply_to="msg-raised-claim",
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": "msg-raised-claim",
+                    },
+                )
+            except RuntimeError as exc:
+                raised_results[call_id] = str(exc)
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_raised_claim, "first")
+            task_group.start_soon(send_raised_claim, "second")
+            await raised_claim.normal_send_entered.wait()
+            await wait_for_final_claim_users(
+                raised_claim,
+                "user-raised-claim",
+                "msg-raised-claim",
+                2,
+            )
+            raised_claim.normal_send_release.set()
+
+        assert sorted(
+            "success" if getattr(result, "success", False) else result
+            for result in raised_results.values()
+        ) == ["normal send raised", "success"]
+        assert raised_claim.normal_send_peak == 1
+        assert [item[1] for item in raised_claim.normal_sends] == ["final"]
+        assert not raised_claim._qq_native_c2c_final_delivery_claims
+        replay_after_raise = await raised_claim.send(
+            "user-raised-claim",
+            "final",
+            reply_to="msg-raised-claim",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-raised-claim",
+            },
+        )
+        assert replay_after_raise.success
+        assert [item[1] for item in raised_claim.normal_sends] == ["final"]
+        await raised_claim.abandon_open_draft(
+            "user-raised-claim-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-raised-claim-blocker"},
+        )
     finally:
         streaming_mod._MAX_OPEN_STREAMS = previous_capacity
 
@@ -2078,6 +2594,12 @@ async def main():
     print("qq_c2c_stream_seal_state_retained=ok")
     print("qq_c2c_stream_capacity_preserves_opened=ok")
     print("qq_c2c_capacity_pending_abandon_replay_dedup=ok")
+    print("qq_c2c_concurrent_final_single_delivery=ok")
+    print("qq_c2c_failed_final_claim_retry=ok")
+    print("qq_c2c_independent_final_claims_parallel=ok")
+    print("qq_c2c_cancelled_final_waiter_cleanup=ok")
+    print("qq_c2c_cancelled_final_holder_handoff=ok")
+    print("qq_c2c_raised_final_claim_handoff=ok")
     print("qq_c2c_final_only_pending_chat_registry_bounded=ok")
     print("qq_c2c_disabled_typing_unchanged=ok")
     print("qq_c2c_interim_only_runner_stays_disabled=ok")
