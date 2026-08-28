@@ -1,5 +1,48 @@
 # Development Log
 
+## 2026-08-28 — Preserve QQ final ownership after recovery close
+
+### Problem
+
+After a native QQ C2C update failed, the ordinary-message fallback could
+successfully deliver the unseen final suffix and the immediate native-prefix
+recovery seal could then succeed. The seal removed the active stream state, so
+a repeated Hermes final callback sent the final again and a late draft frame
+could open a new stream for the already-completed turn. The terminal ownership
+check also used a handwritten boundary list that omitted common Unicode
+punctuation such as Chinese and ASCII commas and em dashes. Finally, the plugin
+README named 1.8.7 as a rollback target although Git contains no recoverable
+1.8.7 artifact and the installer replaced active directories without making an
+external plugin backup.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.9.
+- Added a 256-entry completed-turn ownership map keyed by QQ private chat,
+  inbound reply anchor, and Hermes draft id. It survives successful active-map
+  removal, suppresses stale final/draft replays, and keeps another inbound
+  anchor isolated as a new turn.
+- Replaced the punctuation whitelist with Unicode punctuation-category
+  detection while retaining whitespace boundaries and word-internal negative
+  cases.
+- Made `scripts/install-plugins.sh` copy an existing plugin, including hidden
+  files, into the profile-level `plugin-backups` directory before replacement.
+  Added a guarded `--restore` mode that verifies the manifest, rejects backups
+  under plugin discovery, and preserves the active copy before rollback.
+- Added public adapter lifecycle regressions for successful close, repeated
+  final, late frame, anchor isolation, bounded eviction, and punctuation, plus
+  an isolated shell regression for install/restore safety.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh` and the complete plugin regression matrix
+documented in the deployment guide before touching a running profile. During an
+update, record the installer's printed `plugin-backups` path. To roll back, run
+`scripts/install-plugins.sh --restore <profile-home> qqbot-connect-hotfix
+<exact-backup-path>`, verify `hermes plugins list`, restart only that profile's
+Gateway, and confirm QQ reaches `Ready`. The restore source must remain outside
+the `plugins` directory.
+
 ## 2026-08-25 — Release idle Codex thread writers on Agent cache eviction
 
 ### Problem

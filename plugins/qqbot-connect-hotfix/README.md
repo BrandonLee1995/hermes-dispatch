@@ -24,6 +24,27 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.9 keeps final ownership after a successful native recovery close.
+When an ordinary fallback has already delivered the unseen final suffix, the
+adapter records a completed-turn tombstone keyed by private chat, inbound reply
+anchor, and Hermes draft id before the active stream is removed. The map is
+bounded to 256 recent turns. A repeated turn-final callback or late draft frame
+for that exact completed turn is acknowledged without creating another QQ
+message, while a different inbound anchor remains a distinct new turn even if
+the draft id is reused. This compensates for Hermes consumer cleanup callbacks
+that can arrive after QQ has accepted the recovery seal.
+
+The terminal ownership boundary now uses Unicode punctuation categories plus
+whitespace rather than a handwritten punctuation list. ASCII/CJK commas, em
+dashes, and other Unicode punctuation therefore suppress an already-streamed
+completed commentary carrier consistently, while word-internal suffixes remain
+unowned. `test_streaming.py` covers successful recovery removal, repeated
+finals, late frames, anchor isolation, bounded eviction, Unicode interim
+carriers, and Unicode turn-final composition. Install with
+`scripts/install-plugins.sh`; it now creates a timestamped external backup under
+`$HERMES_HOME/plugin-backups` before replacement. Restore that exact backup
+with the documented `--restore` command and restart only the affected profile.
+
 Version 1.8.8 removes a second message-carrier race found by the real QQ C2C
 canary. Codex app-server can stream a commentary item's live deltas and then
 Hermes can emit the completed item again as an ordinary `_interim_send` without
@@ -36,8 +57,8 @@ and keep the ordinary path. Earlier/nonterminal occurrences, word-internal
 suffixes, unopened streams, other anchors, groups, and non-interim messages are
 unchanged. `test_streaming.py` covers the real Gateway consumer sequence,
 unique and ambiguous unanchored recovery, rollover-boundary ownership, and all
-negative isolation cases. Roll back by restoring 1.8.7 from outside the plugin
-discovery tree and restarting only the affected profile.
+negative isolation cases. Roll back a deployed copy by restoring its external
+pre-install backup; do not assume a version-named artifact exists in Git.
 
 Version 1.8.7 closes the remaining final-ownership gaps found during review of
 1.8.6. When an unseen final suffix is successfully delivered by the immutable
@@ -224,9 +245,9 @@ stream, and logs contain neither error `40034128` nor a second final send. Roll
 back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane
-typing budget is also removed. To roll back the complete 1.8.8 code change,
+typing budget is also removed. To roll back the complete current code change,
 restore the previous plugin directory from outside the plugin discovery tree
-and restart that profile.
+with `scripts/install-plugins.sh --restore`, then restart that profile.
 
 Version 1.7.0 adds the narrow expired-reply fallback used by upstream Hermes
 PR [#85221](https://github.com/NousResearch/hermes-agent/pull/85221). QQ can

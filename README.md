@@ -61,6 +61,17 @@ Copy plugins into the target Hermes data directory:
 scripts/install-plugins.sh "$HOME/.hermes"
 ```
 
+An update automatically preserves each existing plugin below the profile-level
+`plugin-backups` directory before replacement. Restore an exact copy with:
+
+```bash
+scripts/install-plugins.sh --restore \
+  "$HOME/.hermes" <plugin> "$HOME/.hermes/plugin-backups/<backup-directory>"
+```
+
+Backups stay outside the recursive `plugins` discovery tree. See
+[`docs/operations.md`](docs/operations.md) for verification and rollback.
+
 Then enable the required plugins from inside the Hermes container or host
 runtime:
 
@@ -107,6 +118,7 @@ python plugins/message-snapshot-store/test_whatsapp_capture.py
 python plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
 python mcp/http-gateway/test_hermes_mcp_http_auth.py
 python mcp/http-gateway/test_hermes_mcp_qqbot_target_patch.py
+scripts/test_install_plugins.sh
 ```
 
 For live MCP validation, start the HTTP MCP wrapper and run:

@@ -11,6 +11,28 @@ scripts/install-plugins.sh "$HOME/.hermes"
 Inside a containerized deployment the target path is the host directory mounted
 as `/opt/data`.
 
+When an active plugin directory already exists, the installer copies it first
+to a timestamped path below `$HERMES_HOME/plugin-backups`. This location is
+outside the recursive `plugins` discovery root, so the preserved `plugin.yaml`
+cannot register as a second plugin. The copy includes hidden files and is
+completed before the active directory is replaced. A first installation does
+not create an empty backup.
+
+To restore an exact installer-created copy:
+
+```bash
+scripts/install-plugins.sh --restore \
+  "$HOME/.hermes" \
+  qqbot-connect-hotfix \
+  "$HOME/.hermes/plugin-backups/qqbot-connect-hotfix-<version>-<timestamp>"
+```
+
+Restore mode rejects a source below `$HERMES_HOME/plugins`, verifies that its
+manifest names the requested plugin, and backs up the currently active copy
+before replacing it. Run `hermes plugins list`, restart only the target
+profile's Gateway, and verify its channel connection after either install or
+restore. Do not delete the backup until that verification passes.
+
 Enable plugins:
 
 ```bash
@@ -21,6 +43,12 @@ hermes plugins enable whatsapp-bridge-policy-hotfix
 ```
 
 Restart Hermes gateway after enabling or updating plugins.
+
+Exercise both installation and rollback safety without touching a real profile:
+
+```bash
+scripts/test_install_plugins.sh
+```
 
 ## Permanent Message Snapshots
 

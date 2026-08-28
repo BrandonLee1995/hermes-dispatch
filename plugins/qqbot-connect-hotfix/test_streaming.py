@@ -300,23 +300,49 @@ async def main():
     )
     assert interim_nonterminal.normal_sends[-1][1] == "STATUS"
 
-    interim_word_suffix = DummyAdapter()
-    await interim_word_suffix.send_draft(
-        "user-interim-word-suffix",
-        1006,
-        "NOTSTATUS",
-        {"reply_to_message_id": "inbound-interim-word-suffix"},
-    )
-    await interim_word_suffix.send(
-        "user-interim-word-suffix",
-        "STATUS",
-        reply_to="inbound-interim-word-suffix",
-        metadata={
-            "_interim_send": True,
-            "reply_to_message_id": "inbound-interim-word-suffix",
-        },
-    )
-    assert interim_word_suffix.normal_sends[-1][1] == "STATUS"
+    for word_draft_id, word_prefix in ((1006, "NOT"), (1007, "NOT_")):
+        interim_word_suffix = DummyAdapter()
+        word_anchor = f"inbound-interim-word-suffix-{word_draft_id}"
+        await interim_word_suffix.send_draft(
+            "user-interim-word-suffix",
+            word_draft_id,
+            f"{word_prefix}STATUS",
+            {"reply_to_message_id": word_anchor},
+        )
+        await interim_word_suffix.send(
+            "user-interim-word-suffix",
+            "STATUS",
+            reply_to=word_anchor,
+            metadata={
+                "_interim_send": True,
+                "reply_to_message_id": word_anchor,
+            },
+        )
+        assert interim_word_suffix.normal_sends[-1][1] == "STATUS"
+
+    # Unicode punctuation is a real message boundary. Completed commentary
+    # following either Western or CJK punctuation is already owned by the
+    # native stream and must not create an ordinary duplicate bubble.
+    for draft_id, punctuation in enumerate((",", "，", "—"), start=1020):
+        interim_punctuation = DummyAdapter()
+        punctuation_anchor = f"inbound-interim-punctuation-{draft_id}"
+        await interim_punctuation.send_draft(
+            f"user-interim-punctuation-{draft_id}",
+            draft_id,
+            f"阶段一{punctuation}STATUS",
+            {"reply_to_message_id": punctuation_anchor},
+        )
+        punctuation_result = await interim_punctuation.send(
+            f"user-interim-punctuation-{draft_id}",
+            "STATUS",
+            reply_to=punctuation_anchor,
+            metadata={
+                "_interim_send": True,
+                "reply_to_message_id": punctuation_anchor,
+            },
+        )
+        assert punctuation_result.success
+        assert not interim_punctuation.normal_sends
 
     await interim_owned.send(
         "user-interim-owned",
@@ -1245,6 +1271,118 @@ async def main():
     assert [item[1] for item in retried_final.normal_sends] == ["\nFINAL"]
     assert_exact_final_ownership(retried_final, retried_final_target)
 
+    # A recovery close can succeed immediately after the ordinary fallback.
+    # Removing the active stream must leave bounded completed-turn ownership:
+    # repeated final callbacks and late frames for the same full turn identity
+    # are stale, while a new inbound anchor may safely reuse the draft id.
+    completed_owner = DummyAdapter()
+    completed_owner_metadata = {
+        "reply_to_message_id": "inbound-completed-owner"
+    }
+    completed_owner_target = "处理中\nFINAL"
+    await completed_owner.send_draft(
+        "user-completed-owner",
+        5116,
+        "处理中",
+        completed_owner_metadata,
+    )
+    completed_owner.fail_next_stream = True
+    completed_owner_result = await completed_owner.send(
+        "user-completed-owner",
+        "FINAL",
+        reply_to="inbound-completed-owner",
+        metadata={"notify": True, **completed_owner_metadata},
+    )
+    assert completed_owner_result.success
+    completed_owner_streams, _completed_owner_anchors = (
+        streaming_mod._stream_maps(completed_owner)
+    )
+    assert not completed_owner_streams, completed_owner_streams
+    assert [item[1] for item in completed_owner.normal_sends] == ["\nFINAL"]
+
+    repeated_completed_final = await completed_owner.send(
+        "user-completed-owner",
+        "FINAL",
+        reply_to="inbound-completed-owner",
+        metadata={"notify": True, **completed_owner_metadata},
+    )
+    assert repeated_completed_final.success
+    await completed_owner.send_draft(
+        "user-completed-owner",
+        5116,
+        completed_owner_target,
+        completed_owner_metadata,
+    )
+    assert not completed_owner_streams
+    assert [item[1] for item in completed_owner.normal_sends] == ["\nFINAL"]
+    assert_exact_final_ownership(completed_owner, completed_owner_target)
+
+    reused_anchor = "inbound-completed-owner-new-turn"
+    reused_draft = await completed_owner.send_draft(
+        "user-completed-owner",
+        5116,
+        "新任务",
+        {"reply_to_message_id": reused_anchor},
+    )
+    assert reused_draft.success
+    assert 5116 in completed_owner_streams
+    assert completed_owner_streams[5116].reply_to == reused_anchor
+
+    # Completed ownership is deliberately bounded. Once the oldest identity
+    # is evicted, a replay can open normally; the newest retained identity
+    # must still reject its stale late frame.
+    bounded_owners = DummyAdapter()
+    first_bounded_draft = 5200
+    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS
+    streaming_mod._MAX_COMPLETED_OWNERS = 2
+    try:
+        for offset in range(streaming_mod._MAX_COMPLETED_OWNERS + 1):
+            bounded_draft_id = first_bounded_draft + offset
+            bounded_anchor = f"inbound-bounded-owner-{offset}"
+            bounded_metadata = {"reply_to_message_id": bounded_anchor}
+            await bounded_owners.send_draft(
+                "user-bounded-owner",
+                bounded_draft_id,
+                "处理中",
+                bounded_metadata,
+            )
+            bounded_owners.fail_next_stream = True
+            bounded_result = await bounded_owners.send(
+                "user-bounded-owner",
+                "FINAL",
+                reply_to=bounded_anchor,
+                metadata={"notify": True, **bounded_metadata},
+            )
+            assert bounded_result.success
+
+        await bounded_owners.send_draft(
+            "user-bounded-owner",
+            first_bounded_draft,
+            "处理中\nFINAL",
+            {"reply_to_message_id": "inbound-bounded-owner-0"},
+        )
+        newest_bounded_draft = (
+            first_bounded_draft + streaming_mod._MAX_COMPLETED_OWNERS
+        )
+        await bounded_owners.send_draft(
+            "user-bounded-owner",
+            newest_bounded_draft,
+            "处理中\nFINAL",
+            {
+                "reply_to_message_id": (
+                    "inbound-bounded-owner-"
+                    f"{streaming_mod._MAX_COMPLETED_OWNERS}"
+                )
+            },
+        )
+        bounded_streams, _bounded_anchors = streaming_mod._stream_maps(
+            bounded_owners
+        )
+        assert first_bounded_draft in bounded_streams
+        assert newest_bounded_draft not in bounded_streams
+    finally:
+        streaming_mod._MAX_COMPLETED_OWNERS = completed_owner_limit
+
     # Independent finals are payloads, not substring searches. An earlier,
     # non-terminal occurrence of the same value does not own the final.
     repeated_final = DummyAdapter()
@@ -1289,6 +1427,28 @@ async def main():
     )
     assert terminal_final_result.success
     assert_exact_final_ownership(terminal_final, terminal_final_target)
+
+    # The same Unicode punctuation boundary applies to the turn-final path:
+    # the already-visible terminal payload remains the sole owner.
+    punctuation_final = DummyAdapter()
+    punctuation_final_metadata = {
+        "reply_to_message_id": "inbound-punctuation-final"
+    }
+    punctuation_final_target = "阶段一，FINAL"
+    await punctuation_final.send_draft(
+        "user-punctuation-final",
+        5117,
+        punctuation_final_target,
+        punctuation_final_metadata,
+    )
+    punctuation_final_result = await punctuation_final.send(
+        "user-punctuation-final",
+        "FINAL",
+        reply_to="inbound-punctuation-final",
+        metadata={"notify": True, **punctuation_final_metadata},
+    )
+    assert punctuation_final_result.success
+    assert_exact_final_ownership(punctuation_final, punctuation_final_target)
 
     # Coincidental partial overlap and a matching substring inside a larger
     # terminal word are not ownership. Preserve the complete independent
@@ -1383,6 +1543,7 @@ async def main():
     print("qq_c2c_stream_nonfinal_send_isolation=ok")
     print("qq_c2c_streamed_interim_carrier_dedup=ok")
     print("qq_c2c_interim_ownership_boundaries=ok")
+    print("qq_c2c_unicode_punctuation_ownership=ok")
     print("qq_c2c_stream_abandon_close=ok")
     print("qq_c2c_stream_fallback=ok")
     print("qq_c2c_stream_seal_retry=ok")
@@ -1408,6 +1569,9 @@ async def main():
     print("qq_c2c_delayed_close_ordinary_ownership=ok")
     print("qq_c2c_ordinary_owned_late_frame_ignored=ok")
     print("qq_c2c_ordinary_owned_final_retry=ok")
+    print("qq_c2c_completed_owner_replay_dedup=ok")
+    print("qq_c2c_completed_owner_anchor_isolation=ok")
+    print("qq_c2c_completed_owner_bounded=ok")
     print("qq_c2c_nonterminal_repeated_final=ok")
     print("qq_c2c_terminal_final_single_owner=ok")
     print("qq_c2c_partial_overlap_not_ownership=ok")

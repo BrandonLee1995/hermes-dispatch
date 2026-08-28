@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -26,6 +27,7 @@ _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
 _OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
+_MAX_COMPLETED_OWNERS = 256
 _MAX_TYPING_ANCHORS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
@@ -89,6 +91,18 @@ class _QQC2CStream:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass(frozen=True)
+class _QQC2CCompletedOwner:
+    """Bounded ownership evidence for a turn removed from the active maps."""
+
+    chat_id: str
+    draft_id: int
+    reply_to: str
+    final_payload: str
+    final_content: str
+    message_id: Optional[str] = None
+
+
 def _stream_maps(adapter):
     streams = getattr(adapter, "_qq_native_c2c_streams", None)
     if streams is None:
@@ -99,6 +113,66 @@ def _stream_maps(adapter):
         anchors = {}
         adapter._qq_native_c2c_streams_by_anchor = anchors
     return streams, anchors
+
+
+def _completed_owners(adapter) -> Dict[tuple[str, str, int], _QQC2CCompletedOwner]:
+    owners = getattr(adapter, "_qq_native_c2c_completed_owners", None)
+    if owners is None:
+        owners = {}
+        adapter._qq_native_c2c_completed_owners = owners
+    return owners
+
+
+def _remember_completed_owner(
+    adapter,
+    state: _QQC2CStream,
+    *,
+    final_payload: str,
+    final_content: str,
+) -> None:
+    """Retain exact completed-turn ownership without growing indefinitely."""
+
+    owners = _completed_owners(adapter)
+    key = (state.chat_id, state.reply_to, state.draft_id)
+    owners.pop(key, None)
+    owners[key] = _QQC2CCompletedOwner(
+        chat_id=state.chat_id,
+        draft_id=state.draft_id,
+        reply_to=state.reply_to,
+        final_payload=str(final_payload or ""),
+        final_content=str(final_content or ""),
+        message_id=state.stream_msg_id or state.last_completed_stream_id,
+    )
+    while len(owners) > _MAX_COMPLETED_OWNERS:
+        owners.pop(next(iter(owners)))
+
+
+def _completed_owner_for_draft(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+    draft_id: int,
+) -> Optional[_QQC2CCompletedOwner]:
+    return _completed_owners(adapter).get((str(chat_id), str(reply_to), int(draft_id)))
+
+
+def _completed_owner_for_final(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+    content: str,
+) -> Optional[_QQC2CCompletedOwner]:
+    payload = str(content or "")
+    for owner in reversed(tuple(_completed_owners(adapter).values())):
+        if (
+            owner.chat_id == str(chat_id)
+            and owner.reply_to == str(reply_to)
+            and payload in (owner.final_payload, owner.final_content)
+        ):
+            return owner
+    return None
 
 
 def _remove_stream(adapter, state: _QQC2CStream) -> None:
@@ -444,9 +518,10 @@ def _terminal_payload_is_owned(base: str, payload: str) -> bool:
     if boundary == 0:
         return True
     previous = base[boundary - 1]
+    category = unicodedata.category(previous)
     return bool(
         previous.isspace()
-        or previous in "：:；;。.!！?？、)]}）】」』"
+        or (category.startswith("P") and category != "Pc")
     )
 
 
@@ -737,6 +812,18 @@ def patch_qq_c2c_streaming(QQAdapter):
         streams, anchors = _stream_maps(self)
         state = streams.get(int(draft_id))
         if state is None:
+            completed_owner = _completed_owner_for_draft(
+                self,
+                chat_id=chat_id,
+                reply_to=reply_to,
+                draft_id=int(draft_id),
+            )
+            if completed_owner is not None:
+                return _send_result(
+                    success=True,
+                    message_id=completed_owner.message_id,
+                    raw_response={"qq_completed_turn_owned": True},
+                )
             _evict_unopened_streams(self, limit=_MAX_OPEN_STREAMS - 1)
             if len(streams) >= _MAX_OPEN_STREAMS:
                 logger.warning(
@@ -932,6 +1019,19 @@ def patch_qq_c2c_streaming(QQAdapter):
             streams, anchors = _stream_maps(self)
             draft_id = anchors.get((str(chat_id), anchor))
             state = streams.get(draft_id) if draft_id is not None else None
+            if state is None:
+                completed_owner = _completed_owner_for_final(
+                    self,
+                    chat_id=str(chat_id),
+                    reply_to=anchor,
+                    content=str(content or ""),
+                )
+                if completed_owner is not None:
+                    return _send_result(
+                        success=True,
+                        message_id=completed_owner.message_id,
+                        raw_response={"qq_completed_turn_owned": True},
+                    )
             if state is not None:
                 if state.ordinary_owned_suffix:
                     # A prior successful final fallback is authoritative and
@@ -1023,6 +1123,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                         metadata=metadata,
                     )
                     if getattr(normal_result, "success", False):
+                        _remember_completed_owner(
+                            self,
+                            state,
+                            final_payload=str(content or ""),
+                            final_content=target,
+                        )
                         if state.stream_msg_id:
                             state.ordinary_owned_suffix = unseen
                             recovery = await _seal_stream(
