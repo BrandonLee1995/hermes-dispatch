@@ -1220,6 +1220,28 @@ async def main():
 
         abandon_first._api_request = gated_seal_request
         abandon_first_results = {}
+        completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+        remember_tombstone = streaming_mod._remember_turn_tombstone
+
+        def remember_abandon_then_evict(adapter, state, **kwargs):
+            owner = remember_tombstone(adapter, state, **kwargs)
+            if (
+                adapter is abandon_first
+                and state.reply_to == abandon_first_anchor
+                and kwargs.get("final_delivered", True)
+            ):
+                remember_tombstone(
+                    adapter,
+                    streaming_mod._QQC2CStream(
+                        chat_id=state.chat_id,
+                        draft_id=9998,
+                        reply_to="independent-abandon-eviction",
+                        msg_seq=98,
+                    ),
+                    final_payload="independent",
+                    final_content="independent",
+                )
+            return owner
 
         async def abandon_before_final():
             abandon_first_results["abandon"] = (
@@ -1241,23 +1263,106 @@ async def main():
                 },
             )
 
-        async with anyio.create_task_group() as task_group:
-            task_group.start_soon(abandon_before_final)
-            await seal_entered.wait()
-            task_group.start_soon(send_after_abandon_started)
-            await wait_for_final_claim_users(
-                abandon_first,
+        async def send_late_after_abandon_started():
+            abandon_first_results["late"] = await abandon_first.send_draft(
                 abandon_first_chat,
-                abandon_first_anchor,
-                2,
+                3259,
+                "LATE",
+                {"reply_to_message_id": abandon_first_anchor},
             )
-            assert abandon_first.normal_send_attempts == []
-            seal_release.set()
+
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 1
+        streaming_mod._remember_turn_tombstone = remember_abandon_then_evict
+        try:
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(abandon_before_final)
+                await seal_entered.wait()
+                task_group.start_soon(send_late_after_abandon_started)
+                task_group.start_soon(send_after_abandon_started)
+                await wait_for_final_claim_users(
+                    abandon_first,
+                    abandon_first_chat,
+                    abandon_first_anchor,
+                    3,
+                )
+                assert abandon_first.normal_send_attempts == []
+                seal_release.set()
+        finally:
+            streaming_mod._remember_turn_tombstone = remember_tombstone
+            streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
 
         assert abandon_first_results["abandon"].success
+        assert abandon_first_results["late"].success
         assert abandon_first_results["final"].success
         assert abandon_first.normal_sends == []
         assert_exact_final_ownership(abandon_first, abandon_first_target)
+        assert (
+            abandon_first._qq_native_c2c_final_delivery_broker.stats().active
+            == 0
+        )
+        assert (
+            abandon_first._qq_native_c2c_final_delivery_broker
+            .transient_completion_for(
+                (abandon_first_chat, abandon_first_anchor)
+            )
+            is None
+        )
+
+        async def assert_abandon_leading_boundary(
+            *,
+            label,
+            payload,
+            expected_owned,
+        ):
+            adapter = DummyAdapter()
+            chat_id = f"user-abandon-leading-{label}"
+            anchor = f"msg-abandon-leading-{label}"
+            target = f"progress{payload}"
+            await adapter.send_draft(
+                chat_id,
+                3258,
+                "progress",
+                {"reply_to_message_id": anchor},
+            )
+            closed = await adapter.abandon_open_draft(
+                chat_id,
+                target,
+                {"reply_to_message_id": anchor},
+            )
+            final = await adapter.send(
+                chat_id,
+                payload,
+                reply_to=anchor,
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": anchor,
+                },
+            )
+            assert closed.success
+            assert final.success
+            if expected_owned:
+                assert adapter.normal_sends == []
+                assert_exact_final_ownership(adapter, target)
+            else:
+                assert [item[1] for item in adapter.normal_sends] == [
+                    payload
+                ]
+
+        for label, payload in (
+            ("newline", "\nFINAL"),
+            ("ascii-comma", ",FINAL"),
+            ("chinese-comma", "，FINAL"),
+        ):
+            await assert_abandon_leading_boundary(
+                label=label,
+                payload=payload,
+                expected_owned=True,
+            )
+        await assert_abandon_leading_boundary(
+            label="connector",
+            payload="_FINAL",
+            expected_owned=False,
+        )
 
         abandon_word_overlap = DummyAdapter()
         await abandon_word_overlap.send_draft(
@@ -1266,22 +1371,53 @@ async def main():
             "progressNOTFINAL",
             {"reply_to_message_id": "msg-abandon-word-overlap"},
         )
-        word_overlap_closed = await abandon_word_overlap.abandon_open_draft(
-            "user-abandon-word-overlap",
-            "progressNOTFINAL",
-            {"reply_to_message_id": "msg-abandon-word-overlap"},
-        )
-        word_overlap_final = await abandon_word_overlap.send(
-            "user-abandon-word-overlap",
-            "FINAL",
-            reply_to="msg-abandon-word-overlap",
-            metadata={
-                "notify": True,
-                "reply_to_message_id": "msg-abandon-word-overlap",
-            },
-        )
-        assert word_overlap_closed.success
-        assert word_overlap_final.success
+        word_seal_entered = anyio.Event()
+        word_seal_release = anyio.Event()
+        word_base_api_request = abandon_word_overlap._api_request
+
+        async def gated_word_seal_request(method, path, body):
+            if body["input_state"] == 10:
+                word_seal_entered.set()
+                await word_seal_release.wait()
+            return await word_base_api_request(method, path, body)
+
+        abandon_word_overlap._api_request = gated_word_seal_request
+        word_overlap_results = {}
+
+        async def abandon_word_internal():
+            word_overlap_results["abandon"] = (
+                await abandon_word_overlap.abandon_open_draft(
+                    "user-abandon-word-overlap",
+                    "progressNOTFINAL",
+                    {"reply_to_message_id": "msg-abandon-word-overlap"},
+                )
+            )
+
+        async def send_word_internal_final():
+            word_overlap_results["final"] = await abandon_word_overlap.send(
+                "user-abandon-word-overlap",
+                "FINAL",
+                reply_to="msg-abandon-word-overlap",
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": "msg-abandon-word-overlap",
+                },
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(abandon_word_internal)
+            await word_seal_entered.wait()
+            task_group.start_soon(send_word_internal_final)
+            await wait_for_final_claim_users(
+                abandon_word_overlap,
+                "user-abandon-word-overlap",
+                "msg-abandon-word-overlap",
+                2,
+            )
+            word_seal_release.set()
+
+        assert word_overlap_results["abandon"].success
+        assert word_overlap_results["final"].success
         assert [item[1] for item in abandon_word_overlap.normal_sends] == [
             "FINAL"
         ]
@@ -3199,6 +3335,8 @@ async def main():
     print("qq_c2c_active_fallback_tombstone_eviction_safe=ok")
     print("qq_c2c_abandon_final_flight_coordination=ok")
     print("qq_c2c_abandon_first_terminal_owner=ok")
+    print("qq_c2c_abandon_first_claim_context_eviction_safe=ok")
+    print("qq_c2c_abandon_leading_boundary_owned=ok")
     print("qq_c2c_active_final_late_frame_coordination=ok")
     print("qq_c2c_completed_anchor_changed_draft_guard=ok")
     print("qq_c2c_unanchored_finals_independent=ok")

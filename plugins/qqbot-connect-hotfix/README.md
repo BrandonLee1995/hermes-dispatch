@@ -24,6 +24,29 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.16 retains successful abandon-first completion context on the
+existing bounded per-anchor claim until every caller already registered on that
+claim exits. A final or late draft queued behind the abandonment therefore does
+not depend on the independently evictable per-chat tombstone. The contextual
+owner is never copied to the long-lived replay LRU by abandonment alone and is
+dropped with the claim; an arbitrary partial abandonment can suppress stale
+draft frames but cannot swallow a different later final. If a registered final
+matches the exact or strict terminal owner, that real final callback may then
+publish normal completed replay evidence.
+
+Terminal matching also accepts a suffix whose first character is whitespace or
+Unicode punctuation other than connector punctuation, such as `\nFINAL`,
+`,FINAL`, or `，FINAL`. The payload carries its own token boundary, so checking
+only the character before the whole suffix would send a duplicate ordinary
+final. `_FINAL`, partial overlaps, and word-internal cases remain unowned.
+Dedicated public-adapter regressions force same-chat tombstone eviction while
+abandonment, a final waiter, and a late draft share one claim, and separately
+cover the leading whitespace/punctuation table. Enablement is unchanged: use
+the streaming settings below and install through `scripts/install-plugins.sh`. Verify with
+`test_final_delivery.py`, `test_streaming.py`, the full plugin matrix and static
+checks. Roll back only from the exact external installer backup, then restart
+and verify the affected profile.
+
 Version 1.8.15 closes the completion-boundary gaps left by the initial
 single-flight implementation. Hermes can cancel `GatewayStreamConsumer.run()`
 while the broker-owned ordinary final request is still in flight; patched

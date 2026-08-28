@@ -1,5 +1,48 @@
 # Development Log
 
+## 2026-08-28 — Retain abandon-first ownership through claim drain
+
+### Problem
+
+Version 1.8.15 coordinated abandonment and final delivery on one anchor, but a
+successful abandon recorded completion only in the independently bounded
+per-chat tombstone. Another anchor could evict that record before an already
+registered same-key final waiter acquired the claim, causing the waiter to send
+the terminal suffix again. Terminal matching also inspected only the character
+before the suffix, so a payload that carried its own leading whitespace or
+punctuation, such as `\nFINAL`, `,FINAL`, or `，FINAL`, was misclassified as
+unowned.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.16.
+- Added claim-scoped transient completion context. Successful abandon-first
+  native completion is retained until every same-key user already registered
+  on the bounded claim drains; queued final and draft callbacks recheck it even
+  if the per-chat tombstone was evicted.
+- Kept that context out of the long-lived replay LRU. A partial abandonment
+  does not become anchor-wide replay: final suppression still requires exact or
+  strict terminal ownership, while a different final follows normal delivery.
+- Applied the existing boundary predicate to the payload's first character as
+  well as the character before it: whitespace and Unicode punctuation other
+  than connector punctuation are valid. `_FINAL`, partial overlap and
+  word-internal suffixes remain negative.
+- Extended the public adapter regression with forced same-chat tombstone
+  eviction, a registered final waiter, a registered changed-draft callback,
+  claim-drain cleanup, and a leading-boundary table for newline, ASCII/Chinese
+  comma, connector punctuation, and word-internal negatives.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` and `test_streaming.py`, then the complete
+plugin/MCP, Hermes 0.20.0 fail-closed, installer and static matrices. The
+abandon-first case must show one native sealed owner, zero ordinary finals, no
+late carrier, and zero active/transient claim state after all callers exit. The
+leading-boundary finals must add no ordinary message, while connector and
+word-internal negatives must still deliver normally. Restore only an exact
+external backup created by `scripts/install-plugins.sh`, restart only the affected profile, and
+verify QQ Ready before live use.
+
 ## 2026-08-28 — Coordinate final cleanup and stable anchor completion
 
 ### Problem

@@ -467,6 +467,40 @@ async def test_cleanup_coordination_waits_for_active_delivery():
     assert broker.stats().active == 0
 
 
+async def test_transient_completion_lives_until_registered_users_drain():
+    broker = streaming._QQC2CFinalDeliveryBroker(limit=1)
+    key = ("chat", "anchor")
+    owner_entered = anyio.Event()
+    owner_release = anyio.Event()
+    waiter_observed = anyio.Event()
+    completion = object()
+
+    async def retain_completion():
+        broker.remember_transient_completion(key, completion)
+        owner_entered.set()
+        await owner_release.wait()
+        return result(True, "abandoned")
+
+    async def observe_completion():
+        assert broker.transient_completion_for(key) is completion
+        waiter_observed.set()
+        return result(True, "observed")
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(broker.coordinate, key, retain_completion)
+        await owner_entered.wait()
+        group.start_soon(broker.coordinate, key, observe_completion)
+        with anyio.fail_after(1):
+            while broker.stats().registered != 2:
+                await anyio.sleep(0)
+        owner_release.set()
+
+    assert waiter_observed.is_set()
+    assert broker.stats().active == 0
+    assert broker.stats().completed == 0
+    assert broker.transient_completion_for(key) is None
+
+
 async def _immediate_success(marker):
     return result(True, marker)
 
@@ -510,6 +544,7 @@ async def main():
     await test_completed_replay_registry_is_bounded()
     await test_external_completion_uses_same_bounded_replay_registry()
     await test_cleanup_coordination_waits_for_active_delivery()
+    await test_transient_completion_lives_until_registered_users_drain()
     await test_stress_never_exceeds_hard_limit()
     print("qq_c2c_final_broker_same_key_single_flight=ok")
     print("qq_c2c_final_broker_retains_success=ok")
@@ -524,6 +559,7 @@ async def main():
     print("qq_c2c_final_broker_completed_registry_bounded=ok")
     print("qq_c2c_final_broker_external_completion_bounded=ok")
     print("qq_c2c_final_broker_cleanup_coordination=ok")
+    print("qq_c2c_final_broker_transient_completion_drain=ok")
     print("qq_c2c_final_broker_stress_bound=ok")
 
 

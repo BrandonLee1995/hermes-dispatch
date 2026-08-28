@@ -123,6 +123,7 @@ class _QQC2CFinalDeliveryClaim:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
     successful_result: Any = None
+    transient_completion: Any = None
     cache_completed: bool = True
     attempt_task: Optional[asyncio.Task] = None
 
@@ -197,6 +198,21 @@ class _QQC2CFinalDeliveryBroker:
         if claim is not None and claim.successful_result is not None:
             return claim.successful_result
         return self._completed_result(normalized_key)
+
+    def transient_completion_for(self, key):
+        """Return same-flight lifecycle evidence without extending its life."""
+
+        normalized_key = (str(key[0]), str(key[1]))
+        claim = self._claims.get(normalized_key)
+        return None if claim is None else claim.transient_completion
+
+    def remember_transient_completion(self, key, completion: Any) -> None:
+        """Retain contextual completion only until registered users drain."""
+
+        normalized_key = (str(key[0]), str(key[1]))
+        claim = self._claims.get(normalized_key)
+        if claim is not None:
+            claim.transient_completion = completion
 
     async def _register(
         self,
@@ -438,7 +454,7 @@ def _remember_turn_tombstone(
     final_payload: str,
     final_content: str,
     final_delivered: bool = True,
-) -> None:
+) -> _QQC2CTurnTombstone:
     """Retain exact turn lifecycle evidence without growing indefinitely."""
 
     owners = _turn_tombstones(adapter)
@@ -448,7 +464,7 @@ def _remember_turn_tombstone(
     owners[state.chat_id] = bucket
     key = (state.reply_to, state.draft_id)
     bucket.pop(key, None)
-    bucket[key] = _QQC2CTurnTombstone(
+    owner = _QQC2CTurnTombstone(
         chat_id=state.chat_id,
         draft_id=state.draft_id,
         reply_to=state.reply_to,
@@ -457,10 +473,24 @@ def _remember_turn_tombstone(
         message_id=state.stream_msg_id or state.last_completed_stream_id,
         final_delivered=final_delivered,
     )
+    bucket[key] = owner
     while len(bucket) > _MAX_COMPLETED_OWNERS_PER_CHAT:
         bucket.pop(next(iter(bucket)))
     while len(owners) > _MAX_COMPLETED_OWNER_CHATS:
         owners.pop(next(iter(owners)))
+    return owner
+
+
+def _remember_transient_turn_completion(
+    adapter,
+    owner: _QQC2CTurnTombstone,
+) -> None:
+    """Keep abandon-first ownership until same-anchor waiters drain."""
+
+    _final_delivery_broker(adapter).remember_transient_completion(
+        (owner.chat_id, owner.reply_to),
+        owner,
+    )
 
 
 def _ordinary_owned_final_content(state: _QQC2CStream) -> str:
@@ -522,19 +552,36 @@ def _completed_owner_for_final(
     chat_key = str(chat_id)
     bucket = owners.get(chat_key, {})
     for owner in reversed(tuple(bucket.values())):
-        if (
-            owner.final_delivered
-            and owner.chat_id == str(chat_id)
-            and owner.reply_to == str(reply_to)
-            and (
-                payload in (owner.final_payload, owner.final_content)
-                or _terminal_payload_is_owned(owner.final_content, payload)
-            )
+        if _turn_tombstone_owns_final(
+            owner,
+            chat_id=str(chat_id),
+            reply_to=str(reply_to),
+            payload=payload,
         ):
             owners.pop(chat_key, None)
             owners[chat_key] = bucket
             return owner
     return None
+
+
+def _turn_tombstone_owns_final(
+    owner: _QQC2CTurnTombstone,
+    *,
+    chat_id: str,
+    reply_to: str,
+    payload: str,
+) -> bool:
+    """Match one delivered owner without broadening partial cancellation."""
+
+    return bool(
+        owner.final_delivered
+        and owner.chat_id == str(chat_id)
+        and owner.reply_to == str(reply_to)
+        and (
+            payload in (owner.final_payload, owner.final_content)
+            or _terminal_payload_is_owned(owner.final_content, payload)
+        )
+    )
 
 
 def _cancelled_owner_for_anchor(
@@ -1013,6 +1060,16 @@ def _visible_stream_content(state: _QQC2CStream) -> str:
     return str(state.committed_prefix or "") + current
 
 
+def _is_terminal_boundary(character: str) -> bool:
+    """Return whether one character separates an independent terminal token."""
+
+    category = unicodedata.category(character)
+    return bool(
+        character.isspace()
+        or (category.startswith("P") and category != "Pc")
+    )
+
+
 def _terminal_payload_is_owned(base: str, payload: str) -> bool:
     """Return whether *payload* has an explicit terminal owner in *base*.
 
@@ -1031,12 +1088,12 @@ def _terminal_payload_is_owned(base: str, payload: str) -> bool:
     boundary = len(base) - len(payload)
     if boundary == 0:
         return True
-    previous = base[boundary - 1]
-    category = unicodedata.category(previous)
-    return bool(
-        previous.isspace()
-        or (category.startswith("P") and category != "Pc")
-    )
+    if _is_terminal_boundary(payload[0]):
+        # The payload already carries its own token boundary. Looking only at
+        # the character before the whole suffix would misclassify
+        # `progress\nFINAL` + `\nFINAL` as unowned and duplicate the final.
+        return True
+    return _is_terminal_boundary(base[boundary - 1])
 
 
 def _append_nonoverlapping(base: str, suffix_source: str) -> str:
@@ -1286,6 +1343,20 @@ async def _complete_turn_final(
             reply_to=anchor,
             content=str(content or ""),
         )
+        if completed_owner is None:
+            transient_owner = _final_delivery_broker(
+                adapter
+            ).transient_completion_for((str(chat_id), anchor))
+            if (
+                transient_owner is not None
+                and _turn_tombstone_owns_final(
+                    transient_owner,
+                    chat_id=str(chat_id),
+                    reply_to=anchor,
+                    payload=str(content or ""),
+                )
+            ):
+                completed_owner = transient_owner
         if completed_owner is not None:
             return _send_result(
                 success=True,
@@ -1622,6 +1693,15 @@ def patch_qq_c2c_streaming(QQAdapter):
                     message_id=anchored_state.stream_msg_id,
                     raw_response={"qq_visible_final_owned": True},
                 )
+            transient_owner = _final_delivery_broker(
+                self
+            ).transient_completion_for((chat_id, reply_to))
+            if transient_owner is not None:
+                return _send_result(
+                    success=True,
+                    message_id=transient_owner.message_id,
+                    raw_response={"qq_transient_anchor_owned": True},
+                )
             completed_delivery = _final_delivery_broker(self).completed_for(
                 (chat_id, reply_to)
             )
@@ -1854,12 +1934,13 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=True,
                     message_id=completed_id,
                 )
-                _remember_turn_tombstone(
+                owner = _remember_turn_tombstone(
                     self,
                     state,
                     final_payload=str(content or ""),
                     final_content=state.committed_prefix,
                 )
+                _remember_transient_turn_completion(self, owner)
                 _remove_stream(self, state)
                 return completed
             sealed = await _seal_stream(
@@ -1879,12 +1960,13 @@ def patch_qq_c2c_streaming(QQAdapter):
                         final_content=state.close_pending_final_content,
                     )
                 else:
-                    _remember_turn_tombstone(
+                    owner = _remember_turn_tombstone(
                         self,
                         state,
                         final_payload=str(content or ""),
                         final_content=_visible_stream_content(state),
                     )
+                    _remember_transient_turn_completion(self, owner)
             return sealed
 
         if not anchor:
