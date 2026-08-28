@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.16 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.17 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,11 +194,16 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.16 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.17 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
   如果新尾 stream 无法打开，普通 fallback 只补发尚未提交的后缀，避免重复已封口头部。
+  因 QQ 未公开 carrier 寿命而实测约十分钟后会过期，插件还会在单个 carrier 打开 480 秒时
+  主动按相同规则封口并换新。若 QQ 已接收最后一帧却返回
+  `同一流式消息发送超过时间限制`，该 carrier 会被永久退休；后续 draft、final seal 和取消
+  清理都不再重试旧 index，只由普通 fallback 补发尚未显示的最终后缀。其他 API 或网络错误
+  仍使用原有可重试/回退语义。
   ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
   final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
   final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由
@@ -210,7 +215,7 @@ hermes config check
   或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
   streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
   native lane；同一 Gateway 进程的下一轮配置解析还会撤销旧 lane，并保留 Hermes 原始
-  typing 和 final-only 行为。已打开的 stream 仍保留到封口或取消。
+  typing 和 final-only 行为。已打开的 stream 仍保留到封口、取消或平台寿命终止。
 - 活动 stream 以 `(chat_id, draft_id)` 为身份，两个私聊可安全复用相同 draft id。
   completed-owner 与 final-only-pending 各保留每 chat 256 条，并按最近使用顺序限制为
   1024 个 chat；native-lane membership 也按最近使用顺序限制为 1024 个 chat，打开的

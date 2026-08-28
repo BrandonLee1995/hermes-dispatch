@@ -59,6 +59,10 @@ class DummyAdapter:
         self.fail_next_stream = False
         self.fail_seal_attempts = 0
         self.fail_tail_open_attempts = 0
+        self.accept_then_expire_stream = False
+        self.accepted_terminal_calls = []
+        self.native_stream_now = 0.0
+        self._qq_native_stream_clock = lambda: self.native_stream_now
 
     def _guess_chat_type(self, chat_id):
         chat_id = str(chat_id)
@@ -74,6 +78,11 @@ class DummyAdapter:
     async def _api_request(self, method, path, body):
         call = (method, path, dict(body))
         self.api_calls.append(call)
+        if self.accept_then_expire_stream and body["index"] > 0:
+            if not self.accepted_terminal_calls:
+                self.accepted_terminal_calls.append(call)
+                raise RuntimeError("同一流式消息发送超过时间限制")
+            raise RuntimeError("请求参数index需要递增")
         if self.fail_next_stream:
             self.fail_next_stream = False
             raise RuntimeError("stream unavailable")
@@ -284,6 +293,197 @@ async def main():
         == "正在读取知识库\n最终答案"
     )
     assert not adapter.normal_sends
+
+    # QQ expires one C2C native carrier after roughly ten minutes even when
+    # its content stays below MAX_MESSAGE_LENGTH.  Rollover must therefore be
+    # driven by stream age as well as size: keep the first carrier before the
+    # safety boundary, then seal it and open index 0 on a new carrier once the
+    # fake monotonic clock crosses the boundary.
+    age_rollover = DummyAdapter()
+    age_rollover._qq_native_stream_max_age_seconds = 480.0
+    age_metadata = {"reply_to_message_id": "inbound-age-rollover"}
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one",
+        age_metadata,
+    )
+    age_rollover.native_stream_now = 479.0
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one plus",
+        age_metadata,
+    )
+    assert [call[2]["input_state"] for call in age_rollover.api_calls] == [1, 1]
+    age_rollover.native_stream_now = 481.0
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one plus tail",
+        age_metadata,
+    )
+    age_bodies = [call[2] for call in age_rollover.api_calls]
+    assert [body["input_state"] for body in age_bodies] == [1, 1, 10, 1]
+    assert [body["index"] for body in age_bodies] == [0, 1, 2, 0]
+    assert age_bodies[2]["content_raw"] == "phase one plus"
+    assert age_bodies[3]["content_raw"] == " tail"
+    assert "stream_msg_id" not in age_bodies[3]
+
+    # QQ can consume and display a continuation frame while returning the
+    # terminal stream-lifetime error.  The next request would then receive
+    # "index needs to increment".  Treat that carrier as deliberately retired:
+    # no later draft or seal may touch it, and final delivery owns only the
+    # suffix beyond the accepted terminal frame.
+    lifetime_terminal = DummyAdapter()
+    lifetime_metadata = {"reply_to_message_id": "inbound-lifetime-terminal"}
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        "progress",
+        lifetime_metadata,
+    )
+    lifetime_terminal.accept_then_expire_stream = True
+    accepted_terminal_text = "progress accepted before expiry"
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        accepted_terminal_text,
+        lifetime_metadata,
+    )
+    calls_after_terminal = len(lifetime_terminal.api_calls)
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        accepted_terminal_text + " ignored late draft",
+        lifetime_metadata,
+    )
+    assert len(lifetime_terminal.api_calls) == calls_after_terminal
+    lifetime_final_text = accepted_terminal_text + "\nFINAL"
+    lifetime_final = await lifetime_terminal.send(
+        "user-lifetime-terminal",
+        lifetime_final_text,
+        reply_to="inbound-lifetime-terminal",
+        metadata={"notify": True, **lifetime_metadata},
+    )
+    assert lifetime_final.success
+    assert len(lifetime_terminal.api_calls) == calls_after_terminal
+    assert [item[1] for item in lifetime_terminal.normal_sends] == ["\nFINAL"]
+    assert accepted_terminal_text + lifetime_terminal.normal_sends[0][1] == lifetime_final_text
+    lifetime_repeat = await lifetime_terminal.send(
+        "user-lifetime-terminal",
+        lifetime_final_text,
+        reply_to="inbound-lifetime-terminal",
+        metadata={"notify": True, **lifetime_metadata},
+    )
+    assert lifetime_repeat.success
+    assert len(lifetime_terminal.normal_sends) == 1
+
+    # The terminal lifetime response can also arrive on the final cumulative
+    # replace itself.  That accepted frame already owns the whole final, so the
+    # completion path must tombstone it without a seal or ordinary duplicate.
+    lifetime_during_final = DummyAdapter()
+    lifetime_final_metadata = {
+        "reply_to_message_id": "inbound-lifetime-during-final"
+    }
+    await lifetime_during_final.send_draft(
+        "user-lifetime-during-final",
+        1005,
+        "progress",
+        lifetime_final_metadata,
+    )
+    lifetime_during_final.accept_then_expire_stream = True
+    accepted_whole_final = "progress\nFINAL"
+    lifetime_during_final_result = await lifetime_during_final.send(
+        "user-lifetime-during-final",
+        accepted_whole_final,
+        reply_to="inbound-lifetime-during-final",
+        metadata={"notify": True, **lifetime_final_metadata},
+    )
+    assert lifetime_during_final_result.success
+    assert len(lifetime_during_final.api_calls) == 2
+    assert not lifetime_during_final.normal_sends
+    lifetime_during_final_repeat = await lifetime_during_final.send(
+        "user-lifetime-during-final",
+        accepted_whole_final,
+        reply_to="inbound-lifetime-during-final",
+        metadata={"notify": True, **lifetime_final_metadata},
+    )
+    assert lifetime_during_final_repeat.success
+    assert len(lifetime_during_final.api_calls) == 2
+
+    # The same terminal response may arrive while proactive age rollover seals
+    # the old carrier.  One seal attempt retires it; no stale seal/index retry
+    # is allowed, and the eventual final owns only the unseen suffix.
+    lifetime_during_rollover = DummyAdapter()
+    lifetime_during_rollover._qq_native_stream_max_age_seconds = 480.0
+    lifetime_rollover_metadata = {
+        "reply_to_message_id": "inbound-lifetime-during-rollover"
+    }
+    await lifetime_during_rollover.send_draft(
+        "user-lifetime-during-rollover",
+        1006,
+        "phase one",
+        lifetime_rollover_metadata,
+    )
+    lifetime_during_rollover.accept_then_expire_stream = True
+    lifetime_during_rollover.native_stream_now = 481.0
+    await lifetime_during_rollover.send_draft(
+        "user-lifetime-during-rollover",
+        1006,
+        "phase one late draft",
+        lifetime_rollover_metadata,
+    )
+    assert len(lifetime_during_rollover.api_calls) == 2
+    assert lifetime_during_rollover.api_calls[-1][2]["input_state"] == 10
+    lifetime_rollover_final = await lifetime_during_rollover.send(
+        "user-lifetime-during-rollover",
+        "phase one\nFINAL",
+        reply_to="inbound-lifetime-during-rollover",
+        metadata={"notify": True, **lifetime_rollover_metadata},
+    )
+    assert lifetime_rollover_final.success
+    assert len(lifetime_during_rollover.api_calls) == 2
+    assert [item[1] for item in lifetime_during_rollover.normal_sends] == [
+        "\nFINAL"
+    ]
+
+    # Cancellation also terminalizes retired state locally without touching the
+    # expired carrier.  A later real final remains eligible for one full normal
+    # delivery because cancellation did not claim it as delivered.
+    lifetime_cancelled = DummyAdapter()
+    lifetime_cancelled_metadata = {
+        "reply_to_message_id": "inbound-lifetime-cancelled"
+    }
+    await lifetime_cancelled.send_draft(
+        "user-lifetime-cancelled",
+        1007,
+        "progress",
+        lifetime_cancelled_metadata,
+    )
+    lifetime_cancelled.accept_then_expire_stream = True
+    await lifetime_cancelled.send_draft(
+        "user-lifetime-cancelled",
+        1007,
+        "progress accepted",
+        lifetime_cancelled_metadata,
+    )
+    lifetime_cancelled_call_count = len(lifetime_cancelled.api_calls)
+    lifetime_cancelled_close = await lifetime_cancelled.abandon_open_draft(
+        "user-lifetime-cancelled",
+        "progress accepted",
+        lifetime_cancelled_metadata,
+    )
+    assert lifetime_cancelled_close.success
+    assert len(lifetime_cancelled.api_calls) == lifetime_cancelled_call_count
+    lifetime_cancelled_final = await lifetime_cancelled.send(
+        "user-lifetime-cancelled",
+        "FULL FINAL",
+        reply_to="inbound-lifetime-cancelled",
+        metadata={"notify": True, **lifetime_cancelled_metadata},
+    )
+    assert lifetime_cancelled_final.success
+    assert [item[1] for item in lifetime_cancelled.normal_sends] == ["FULL FINAL"]
 
     # Hermes can stream user-visible commentary before it produces the short
     # turn-final answer. QQ replace mode forbids removing an already-delivered
@@ -3316,6 +3516,8 @@ async def main():
     assert ("user-cancel", 5001) not in cancelled_streams
 
     print("qq_c2c_stream_open_continue_seal=ok")
+    print("qq_c2c_stream_age_rollover=ok")
+    print("qq_c2c_stream_lifetime_terminal_retirement=ok")
     print("qq_c2c_stream_seal_preserves_prefix=ok")
     print("qq_c2c_stream_parallel_dm_isolation=ok")
     print("qq_c2c_same_draft_id_cross_chat_isolation=ok")

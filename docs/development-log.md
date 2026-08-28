@@ -1,5 +1,41 @@
 # Development Log
 
+## 2026-08-28 — Retire expired QQ C2C carriers
+
+### Problem
+
+QQ's C2C streaming contract requires one stable `stream_msg_id` and increasing
+indices, but does not publish the native carrier lifetime. A production turn
+crossed the platform lifetime after roughly ten minutes. QQ consumed the last
+frame while returning `同一流式消息发送超过时间限制`; the plugin kept that index
+retryable, so later drafts and final cleanup retried a stale index and seal,
+received `请求参数index需要递增`, and could fall back with already-visible text.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.17.
+- Added a 480-second monotonic safety rollover independent of message length.
+  The acknowledged old body is sealed before a fresh carrier opens at index 0.
+- Classified only the observed terminal lifetime response as carrier-terminal.
+  Its submitted frame becomes visible ownership and the carrier is retired;
+  unrelated transport and API failures keep their prior retry semantics.
+- Made draft, final, seal-retry, fallback-recovery and abandonment paths respect
+  retired state. They never touch the expired carrier again, deliver only an
+  unseen final suffix, and publish the existing bounded per-turn tombstone on
+  every successful completion.
+- Added public-adapter regressions for age rollover and terminal responses
+  during draft continuation, cumulative final, rollover seal and cancellation,
+  including late-frame and repeated-final suppression.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` and `test_streaming.py`, then the complete QQ,
+plugin, installer and static matrices. The lifetime cases must issue exactly one
+terminal request, zero stale index/seal retries, one unseen-suffix fallback at
+most, and no repeated final. Restore only an exact external backup created by
+`scripts/install-plugins.sh`, restart only the affected profile, and verify QQ
+Ready. Disabling QQ streaming restores the upstream ordinary-message path.
+
 ## 2026-08-28 — Retain abandon-first ownership through claim drain
 
 ### Problem

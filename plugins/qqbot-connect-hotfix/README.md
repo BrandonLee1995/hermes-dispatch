@@ -24,6 +24,33 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.17 prevents expired QQ C2C native carriers from entering a stale
+index/seal retry loop. QQ documents monotonically increasing `index` values and
+one stable `stream_msg_id`, but does not publish a carrier lifetime. Production
+evidence showed a carrier expiring after roughly ten minutes and, critically,
+QQ consuming the last frame while returning `同一流式消息发送超过时间限制`;
+retrying that index then returned `请求参数index需要递增`.
+
+The plugin now rolls an open carrier at an internal 480-second monotonic safety
+boundary, sealing its acknowledged body and opening index 0 on a new carrier
+before the observed expiry. If the exact terminal lifetime response still
+occurs, the submitted frame becomes the carrier's final visible owner and that
+carrier is deliberately retired: later drafts, final cleanup, and abandonment
+never send another index or seal to it. A real final uses the existing
+per-anchor single-flight and tombstone machinery to send only the suffix not
+owned by the terminal frame; a terminal frame that already contains the whole
+final sends no ordinary duplicate. Other API/network errors retain the existing
+retry and final-fallback behavior.
+
+No new configuration key is required. Enable the existing QQ streaming
+settings, install with `scripts/install-plugins.sh`, and verify with
+`test_streaming.py` plus the complete plugin and installer matrices. The
+regressions cover age rollover, terminal responses during draft/final/seal,
+late frames, cancellation, suffix-only fallback, and repeated-final
+suppression. Roll back from the exact external installer backup, restart only
+the affected profile, and verify QQ Ready; disabling QQ streaming restores the
+upstream non-streaming private-message path.
+
 Version 1.8.16 retains successful abandon-first completion context on the
 existing bounded per-anchor claim until every caller already registered on that
 claim exits. A final or late draft queued behind the abandonment therefore does
