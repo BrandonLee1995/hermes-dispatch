@@ -61,6 +61,22 @@ Copy plugins into the target Hermes data directory:
 scripts/install-plugins.sh "$HOME/.hermes"
 ```
 
+An update automatically preserves each existing plugin below the profile-level
+`plugin-backups` directory before replacement. Restore an exact copy with:
+
+```bash
+scripts/install-plugins.sh --restore \
+  "$HOME/.hermes" <plugin> "$HOME/.hermes/plugin-backups/<backup-directory>"
+```
+
+Backups stay outside the recursive `plugins` discovery tree. See
+[`docs/operations.md`](docs/operations.md) for verification and rollback.
+The installer rejects symbolic-link backup roots/active plugin targets,
+non-direct canonical targets, and dot path components before it changes active
+data. For a multi-plugin invocation it preflights every requested active target
+before it creates, backs up, clears, or copies any plugin. Backup-root rejection
+on a fresh install also occurs before the active plugin directory is created.
+
 Then enable the required plugins from inside the Hermes container or host
 runtime:
 
@@ -94,8 +110,11 @@ The plugin tests are self-contained:
 
 ```bash
 python plugins/qqbot-connect-hotfix/test_hotfix.py
+python plugins/qqbot-connect-hotfix/test_expired_reply.py
 python plugins/qqbot-connect-hotfix/test_media_reply.py
 python plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+python plugins/qqbot-connect-hotfix/test_final_delivery.py
+python plugins/qqbot-connect-hotfix/test_streaming.py
 python plugins/codex-app-server-phase-hotfix/test_hotfix.py
 python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py
@@ -105,6 +124,7 @@ python plugins/message-snapshot-store/test_whatsapp_capture.py
 python plugins/whatsapp-bridge-policy-hotfix/test_hotfix.py
 python mcp/http-gateway/test_hermes_mcp_http_auth.py
 python mcp/http-gateway/test_hermes_mcp_qqbot_target_patch.py
+scripts/test_install_plugins.sh
 ```
 
 For live MCP validation, start the HTTP MCP wrapper and run:

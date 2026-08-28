@@ -11,6 +11,40 @@ scripts/install-plugins.sh "$HOME/.hermes"
 Inside a containerized deployment the target path is the host directory mounted
 as `/opt/data`.
 
+When an active plugin directory already exists, the installer copies it first
+to a timestamped path below `$HERMES_HOME/plugin-backups`. This location is
+outside the recursive `plugins` discovery root, so the preserved `plugin.yaml`
+cannot register as a second plugin. The copy includes hidden files and is
+completed before the active directory is replaced. A first installation does
+not create an empty backup.
+
+The backup root and active plugin directory must be real directories, not
+symbolic links. The installer resolves canonical paths and requires the active
+target to be exactly one direct child below the canonical `plugins` root; it
+also rejects `.` and `..` as plugin names. These checks run before backup,
+clear, or copy operations. When several plugins are requested, the installer
+preflights and retains every canonical active target before mutating the first;
+if a later target is invalid, all earlier active plugin directories remain
+byte-for-byte unchanged and no backup is created. Backup-root validation also
+runs before an absent active plugin directory is created, so a rejected fresh
+install leaves no empty plugin artifact. Fix a rejected profile layout instead
+of bypassing the guard.
+
+To restore an exact installer-created copy:
+
+```bash
+scripts/install-plugins.sh --restore \
+  "$HOME/.hermes" \
+  qqbot-connect-hotfix \
+  "$HOME/.hermes/plugin-backups/qqbot-connect-hotfix-<version>-<timestamp>"
+```
+
+Restore mode rejects a source below `$HERMES_HOME/plugins`, verifies that its
+manifest names the requested plugin, and backs up the currently active copy
+before replacing it. Run `hermes plugins list`, restart only the target
+profile's Gateway, and verify its channel connection after either install or
+restore. Do not delete the backup until that verification passes.
+
 Enable plugins:
 
 ```bash
@@ -21,6 +55,12 @@ hermes plugins enable whatsapp-bridge-policy-hotfix
 ```
 
 Restart Hermes gateway after enabling or updating plugins.
+
+Exercise both installation and rollback safety without touching a real profile:
+
+```bash
+scripts/test_install_plugins.sh
+```
 
 ## Permanent Message Snapshots
 
@@ -301,6 +341,8 @@ python plugins/qqbot-connect-hotfix/test_hotfix.py
 python plugins/qqbot-connect-hotfix/test_expired_reply.py
 python plugins/qqbot-connect-hotfix/test_media_reply.py
 python plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+python plugins/qqbot-connect-hotfix/test_final_delivery.py
+python plugins/qqbot-connect-hotfix/test_streaming.py
 python plugins/codex-app-server-phase-hotfix/test_hotfix.py
 python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py

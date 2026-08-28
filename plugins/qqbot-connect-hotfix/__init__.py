@@ -41,6 +41,9 @@ from .approval_owner import (
 from .approval_choices import (
     patch_codex_approval_choices as _patch_codex_approval_choices,
 )
+from .streaming import (
+    patch_qq_c2c_streaming as _patch_qq_c2c_streaming,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,8 @@ def register(ctx):
     _patch_plain_text_retry(QQAdapter)
     _patch_expired_reply_fallback(QQAdapter)
     _patch_media_caption_retry(QQAdapter)
+    streaming_status = _patch_qq_c2c_streaming(QQAdapter)
+    logger.info("qqbot-connect-hotfix: %s", streaming_status)
     choices_status = _patch_codex_approval_choices(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", choices_status)
     approval_status = _patch_shared_group_approval_owners(QQAdapter)

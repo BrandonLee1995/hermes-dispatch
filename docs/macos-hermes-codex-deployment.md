@@ -117,6 +117,45 @@ hermes gateway stop
 先运行向导，让当前 Hermes 生成完整配置结构，再用命令调整。不要直接复制旧版本的
 整份 `config.yaml`。
 
+QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。0.20.0 的
+`GatewayStreamConsumer.finish()` 和 draft capability probe 契约不完整，不能启用本文的
+QQ streaming 设置。先检查实际运行源码版本：
+
+```bash
+hermes --version
+HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+"$HERMES_PY" - <<'PY'
+import re
+from hermes_cli import __version__
+
+match = re.fullmatch(r"\s*(\d+)\.(\d+)\.(\d+)\s*", __version__)
+if match is None:
+    raise SystemExit(
+        f"Hermes {__version__} is not a stable x.y.z release; native QQ "
+        "streaming must fail closed"
+    )
+version = tuple(int(part) for part in match.groups())
+if version < (0, 20, 5):
+    raise SystemExit(f"Hermes {__version__} is too old; require >= 0.20.5")
+print(f"Hermes {__version__}: QQ native streaming compatible")
+PY
+```
+
+旧环境先查看更新范围和所有 profile 的重启计划，再执行带备份的官方更新：
+
+```bash
+hermes update --check
+if hermes update --help | rg -q -- '--plan'; then
+  hermes update --plan
+fi
+hermes update --backup
+hermes --version
+```
+
+版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
+Gateway。`qqbot-connect-hotfix` 1.8.16 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+不会替换 `send`、`send_typing` 或 Gateway streaming gate。
+
 ## 5. 用命令配置 `config.yaml`
 
 以下命令均写入当前部门账号的 `~/.hermes/config.yaml`：
@@ -134,8 +173,8 @@ hermes config set compression.codex_app_server_auto native
 hermes config set display.interim_assistant_messages true
 hermes config set display.streaming true
 hermes config set display.platforms.qqbot.interim_assistant_messages true
-hermes config set display.platforms.qqbot.streaming false
-hermes config set display.platforms.qqbot.tool_progress false
+hermes config set display.platforms.qqbot.streaming true
+hermes config set display.platforms.qqbot.tool_progress new
 
 hermes config set group_sessions_per_user false
 hermes config set session_reset.mode none
@@ -155,7 +194,61 @@ hermes config check
 
 关键点：
 
-- QQ 开启 commentary，但关闭逐 token streaming，既能看到中间进度，又避免 final 重复发送。
+- `qqbot-connect-hotfix` 1.8.16 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+  `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
+  和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
+  当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
+  如果新尾 stream 无法打开，普通 fallback 只补发尚未提交的后缀，避免重复已封口头部。
+  ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
+  final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
+  final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由
+  stream 拥有，正文中较早出现的同值文本、任意部分重叠或词内后缀都不会吞掉最终回复。
+  Codex commentary 的实时 delta 已由同一私聊 stream 展示后，Hermes 随后的 `_interim_send`
+  不会再创建内容相同的普通 QQ 气泡：有入站锚点时精确匹配；Hermes 未携带锚点时只恢复同一
+  私聊中唯一且终端正文完全匹配的打开 stream，多候选并发保持普通发送，不猜测归属。
+  只有 Gateway 已为该私聊选择 native lane
+  或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
+  streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
+  native lane；同一 Gateway 进程的下一轮配置解析还会撤销旧 lane，并保留 Hermes 原始
+  typing 和 final-only 行为。已打开的 stream 仍保留到封口或取消。
+- 活动 stream 以 `(chat_id, draft_id)` 为身份，两个私聊可安全复用相同 draft id。
+  completed-owner 与 final-only-pending 各保留每 chat 256 条，并按最近使用顺序限制为
+  1024 个 chat；native-lane membership 也按最近使用顺序限制为 1024 个 chat，打开的
+  stream 在封口或取消前不会被淘汰，动态关闭 streaming 仍立即撤销 lane。
+  capacity-final-only 被成功 abandon 后会保留 cancellation tombstone：它只拦截 late
+  draft，不会吞掉尚未投递的普通 final；普通 final 首次成功后才升级为 completed owner，
+  后续重复 final 只确认、不再投递。
+- 所有 C2C `notify=True` final（active native fallback、未打开 stream、final-only-pending、
+  cancellation 和 completed replay）都进入 `(chat_id, reply anchor)` 的有界 single-flight。
+  同 key 首次成功后，结果保留到所有已注册调用者退出，不依赖可能被淘汰的 completed-owner；
+  明确失败才允许等待者接棒。外部发送由 flight 持有，单个 caller 取消不会取消已发出的 QQ
+  请求。最多同时保留 128 个不同 final key；容量满时同 key 仍可加入，新 key 等待空位，
+  因而 registry 有硬上限且不同私聊/锚点仍可并行。flight 在最后调用者和在途请求都结束后
+  删除并释放准入容量；已完成封口或完整投递的成功结果另进入不占 active slot 的 1024-key
+  LRU，以覆盖唯一 caller 取消后 shielded QQ 请求才成功的迟到 replay。仍处于
+  `qq_stream_close_pending` 的可见成功只在当前 flight 内共享，不进入 replay LRU；后续 final
+  会继续重试幂等封口，且不会重复发送已由普通消息持有的 suffix；已记录完整 final 后的迟到
+  draft 在同一 inbound reply anchor 下只确认、不再扩展或新建第二条 native stream，即使
+  Hermes draft id 已改变；不同 anchor 仍保持独立。若后续由
+  `abandon_open_draft()` 对已记录完整 turn-final 身份的 stream 完成封口，插件会刷新
+  per-chat completed owner，并把成功 close 写入同一个有界 replay LRU；即使独立 anchor
+  淘汰 tombstone，同 anchor final 仍不会重发。普通 partial draft 的取消没有完整 final
+  身份，因此不会升级为 anchor-wide replay。
+  Hermes 的 `/new`、`/stop`、interrupt 或 timeout cleanup 可能在 shielded final 请求仍在途时
+  调用 `abandon_open_draft()`；插件会让 stable-anchor abandon 加入相同 single-flight，等待
+  final attempt 结束后再读取/封口，避免 native 完整 final 与 ordinary unseen suffix 双写。
+  同一 stable anchor 的所有 draft callback 也加入该 transaction：无论原 draft id 还是变更后的
+  stale draft id，都必须等待外部 final 投递及 ownership 发布完成后再重新判定，不会在这个窗口
+  替换或新开 carrier；不同 anchor 不受阻塞。反向顺序中，若 abandon 已封口完整累计正文，后到
+  的短 final 只有在构成带 token 边界的严格终端后缀时才视为已投递，任意部分或词内重叠不吞消息。
+  abandon-first 成功完成还会在当前有界 claim 内保留短生命周期 ownership，直到所有已注册的
+  final/draft waiter 退出；即使另一个 anchor 淘汰 per-chat tombstone，也不会重复 final 或重开
+  carrier。该上下文随 claim 清除，不把任意 partial abandon 升级为长期 anchor replay。若 final
+  payload 自带前导空白或非 connector Unicode 标点（例如 `\nFINAL`、`,FINAL`、`，FINAL`），
+  该字符本身作为 token boundary，完整终端 suffix 不会再走 ordinary fallback；`_FINAL`、
+  词内和任意部分重叠仍保持未认领。
+  fully sealed anchor 的 1024-key 有界 broker completion 也用于拦截 changed-draft late frame；
+  无稳定 inbound reply anchor 的 final 不使用空字符串 replay key，而是分别走真实投递。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -298,6 +391,26 @@ scripts/install-plugins.sh "$HOME/.hermes" \
   message-snapshot-store
 ```
 
+更新已有插件时，安装器会先将当前目录完整备份到对应 profile 的
+`plugin-backups/<插件>-<版本>-<时间戳>`；该目录位于 `plugins` 发现路径之外，
+不会重复加载旧 `plugin.yaml`。记下输出的精确备份路径。若需回滚，例如：
+
+```bash
+scripts/install-plugins.sh --restore \
+  "$HOME/.hermes" \
+  qqbot-connect-hotfix \
+  "$HOME/.hermes/plugin-backups/qqbot-connect-hotfix-<版本>-<时间戳>"
+```
+
+恢复命令会先备份当前活动版本，并拒绝使用位于 `plugins` 发现路径内的备份；
+恢复后只重启目标 profile，并重新检查插件版本和 QQ `Ready`。
+安装和恢复都会拒绝符号链接形式的 `plugin-backups` 或活动插件目录，并要求活动插件的
+canonical 路径是 canonical `plugins` 根的直接子目录；`.` 和 `..` 不是合法插件名。
+一次安装多个插件时，安装器会先完成全部活动目标的 canonical 预检，再开始创建、备份或
+替换；后续任一目标不合法时，前面的插件保持原样且不会产生备份。
+备份根验证先于缺失活动目录的创建，因此 fresh install 被拒绝时不会留下空插件目录。
+出现任一拒绝时，不得手工绕过检查，应先修复 profile 的目录布局。
+
 启用插件和消息检索工具集：
 
 ```bash
@@ -330,10 +443,13 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_expired_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_media_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_final_delivery.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_streaming.py
 "$HERMES_PY" plugins/message-snapshot-store/test_store.py
 "$HERMES_PY" plugins/message-snapshot-store/test_capture.py
 "$HERMES_PY" plugins/message-snapshot-store/test_materialize.py
 "$HERMES_PY" plugins/message-snapshot-store/test_quoted_attachment.py
+scripts/test_install_plugins.sh
 ```
 
 任一测试失败都先停止部署，不启动生产 Gateway。
@@ -515,7 +631,12 @@ rg -n '^(WHATSAPP_ENABLED|HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS|HERMES_CO
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
-hermes update --yes
+hermes update --check
+if hermes update --help | rg -q -- '--plan'; then
+  hermes update --plan
+fi
+hermes update --backup
+hermes --version  # QQ native streaming 要求 >= 0.20.5
 git -C "$HOME/src/hermes-dispatch" pull --ff-only origin main
 cd "$HOME/src/hermes-dispatch"
 scripts/install-plugins.sh "$HOME/.hermes"

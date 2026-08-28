@@ -1,5 +1,347 @@
 # Development Log
 
+## 2026-08-28 — Retain abandon-first ownership through claim drain
+
+### Problem
+
+Version 1.8.15 coordinated abandonment and final delivery on one anchor, but a
+successful abandon recorded completion only in the independently bounded
+per-chat tombstone. Another anchor could evict that record before an already
+registered same-key final waiter acquired the claim, causing the waiter to send
+the terminal suffix again. Terminal matching also inspected only the character
+before the suffix, so a payload that carried its own leading whitespace or
+punctuation, such as `\nFINAL`, `,FINAL`, or `，FINAL`, was misclassified as
+unowned.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.16.
+- Added claim-scoped transient completion context. Successful abandon-first
+  native completion is retained until every same-key user already registered
+  on the bounded claim drains; queued final and draft callbacks recheck it even
+  if the per-chat tombstone was evicted.
+- Kept that context out of the long-lived replay LRU. A partial abandonment
+  does not become anchor-wide replay: final suppression still requires exact or
+  strict terminal ownership, while a different final follows normal delivery.
+- Applied the existing boundary predicate to the payload's first character as
+  well as the character before it: whitespace and Unicode punctuation other
+  than connector punctuation are valid. `_FINAL`, partial overlap and
+  word-internal suffixes remain negative.
+- Extended the public adapter regression with forced same-chat tombstone
+  eviction, a registered final waiter, a registered changed-draft callback,
+  claim-drain cleanup, and a leading-boundary table for newline, ASCII/Chinese
+  comma, connector punctuation, and word-internal negatives.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` and `test_streaming.py`, then the complete
+plugin/MCP, Hermes 0.20.0 fail-closed, installer and static matrices. The
+abandon-first case must show one native sealed owner, zero ordinary finals, no
+late carrier, and zero active/transient claim state after all callers exit. The
+leading-boundary finals must add no ordinary message, while connector and
+word-internal negatives must still deliver normally. Restore only an exact
+external backup created by `scripts/install-plugins.sh`, restart only the affected profile, and
+verify QQ Ready before live use.
+
+## 2026-08-28 — Coordinate final cleanup and stable anchor completion
+
+### Problem
+
+The 1.8.14 broker serialized concurrent final callbacks, but Hermes cancellation
+cleanup still ran outside the per-anchor flight. An abandon could seal the full
+native final while a shielded ordinary unseen-suffix request was pending, then
+that request could succeed and duplicate the suffix. Completed late-draft
+suppression also required the old draft id, and missing reply identity collapsed
+unrelated finals into the shared `(chat_id, "")` replay key. A late frame could
+also enter while the ordinary final request was active but before completion
+evidence was published; in the reverse order, abandonment could seal the full
+cumulative final before the later short final callback sent that suffix again.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.15.
+- Added broker cleanup coordination. Stable-anchor abandonment waits for the
+  active final attempt to settle, then resolves and closes the resulting state
+  while holding the same keyed transaction.
+- Coordinated every stable-anchor draft callback on that transaction as well.
+  Same- and changed-draft late frames wait through external final delivery and
+  then re-resolve completion; different anchors remain independent. A fallback
+  anchor derived from `_last_msg_id` is frozen before the wait to prevent a
+  newer inbound message from redirecting the queued operation to another turn.
+- Recognized a later short final as already owned by an abandoned cumulative
+  seal only when it is an exact token-bounded terminal suffix. Partial overlap
+  and word-internal matches remain ordinary final deliveries.
+- Reused the bounded completed-result LRU as anchor-scoped late-draft evidence,
+  so a fully sealed anchor cannot reopen under a changed Hermes draft id.
+- Bypassed single-flight and completed replay for finals without a stable
+  inbound reply anchor; sequential and parallel unanchored finals stay
+  independent rather than sharing an empty key.
+- Added public adapter regressions for both gated final/abandon orderings,
+  same- and changed-draft callbacks during an active final flight,
+  changed-draft late frames after full native completion, and unanchored final
+  independence. Broker contract coverage now includes cleanup waiting for an
+  active delivery and the anchor-scoped completed-result lookup.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` and `test_streaming.py` before the full plugin/MCP,
+Hermes 0.20.0 fail-closed, installer and static matrices. The abandon race must
+show no native seal while the ordinary suffix is blocked and exactly one final
+owner after release; an abandon-first full cumulative seal must own a later
+token-bounded short final; same- and changed-draft frames must add no QQ API
+call while final delivery is active; a changed-draft post-completion frame must
+also add no QQ API call; two different unanchored finals must both reach the
+ordinary sender. Roll back only
+from the exact external backup created by `scripts/install-plugins.sh`, then
+restart and verify only the affected profile.
+
+## 2026-08-28 — Bound and unify concurrent final ownership
+
+### Problem
+
+The 1.8.13 claim covered cancellation and final-only-pending sends but left an
+active stream's ordinary unseen-suffix fallback outside that transaction.
+Concurrent final callbacks could therefore emit the same suffix twice. Waiting
+callers also recovered success from the independently evictable completed-owner
+tombstone instead of the claim itself, and distinct blocked anchors could grow
+the claim registry without a numerical bound.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.14.
+- Replaced path-specific claims with a 128-key bounded single-flight broker.
+  All C2C `notify=True` final paths now run lifecycle lookup, external delivery,
+  ownership promotion and cleanup in one per-anchor transaction.
+- Retained the first successful result on the flight until every caller already
+  registered on it exits. Tombstone eviction cannot make those waiters resend.
+- Made the external attempt flight-owned and shielded it from one caller's
+  cancellation. Same-key callers join the in-flight result; a definite failed
+  result or exception can hand off to one fresh attempt.
+- Added a separate 1024-key LRU for successfully closed or fully delivered
+  post-flight replay. It does not consume active admission and prevents a later
+  duplicate if a sole cancelled caller's shielded QQ request completes after
+  that caller exits. A visible-but-unsealed `qq_stream_close_pending` outcome is
+  shared with current waiters but excluded from this LRU, so a later callback
+  retries the seal without repeating an ordinary-owned suffix. Late draft
+  frames on the same inbound reply anchor cannot extend a recorded complete
+  final or open a second stream while its close is pending, including when the
+  stale Hermes draft id changed; different anchors remain independent. When
+  `abandon_open_draft()` subsequently closes a retained stream with a recorded
+  complete turn-final identity, it refreshes the per-chat completed owner and
+  publishes the successful close to the bounded replay LRU, preserving
+  deduplication across tombstone eviction. Ordinary partial-draft cancellation
+  is not promoted into this anchor-wide cache.
+- Added a focused broker contract suite plus active-stream adapter regression.
+  It covers same-key fan-in, independent-key parallelism, tombstone-independent
+  result sharing, failure/exception/cancellation handoff, queued admission
+  cancellation, same-key joining after a full-capacity wakeup, sole-holder
+  replay, close-pending retry, completed-cache eviction, capacity backpressure
+  and a 200-key stress bound.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` before `test_streaming.py`, then run all QQ,
+plugin/MCP, installer, Hermes 0.20.0 fail-closed and static checks. The broker
+suite must report an active-flight peak no higher than 128 (or the test's lower
+configured bound), return to zero, and expose one external send for same-key
+success. The active-stream regression must deliver exactly one ordinary unseen
+suffix to three concurrent final callers after a real independent-anchor
+tombstone eviction. Restore only an exact
+installer-created external backup and restart only the affected profile.
+
+## 2026-08-28 — Serialize concurrent ordinary final ownership
+
+### Problem
+
+The cancellation-tombstone and final-only-pending paths read lifecycle state,
+awaited the ordinary QQ sender, and recorded successful delivery afterward.
+Two concurrent `notify=True` callbacks could therefore both observe the same
+undelivered record and emit the same final in separate QQ messages.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.13.
+- Added a reference-counted delivery claim keyed by QQ private chat and inbound
+  reply anchor. It is registered before any external send await and removed
+  after the last caller exits.
+- Rechecked completed, cancelled, and pending lifecycle state inside the claim.
+  A successful first sender leaves replay suppression for its waiter; a failed
+  sender leaves the source record unchanged so the waiter can retry.
+- Added public adapter regressions for concurrent cancellation and pending
+  finals with three callers, failure handoff, cancelled-waiter cleanup, claim
+  registry removal, cancelled-holder and raised-exception handoff,
+  independent-anchor parallel delivery, exactly one successful visible
+  delivery per turn, and replay suppression.
+
+### Verify and roll back
+
+Run the complete QQ streaming lifecycle test against Hermes 0.20.5, all five QQ
+compatibility tests against Hermes 0.20.0, the offline plugin/MCP matrix,
+`scripts/test_install_plugins.sh`, and the static checks. The concurrency cases
+must record one successful ordinary message; the failure-handoff case must
+record one failed attempt followed by one successful visible message. Confirm
+cancelled waiters and holders plus raised send exceptions leave no stale claim,
+and different anchors still reach the external send boundary concurrently.
+Restore only an exact installer-created external backup and restart only the
+affected profile after verification.
+
+## 2026-08-28 — Separate cancellation ownership and preflight complete updates
+
+### Problem
+
+The capacity-abandon path recorded invisible content as completed delivery, so
+a later ordinary turn-final with the same anchor and content could be
+suppressed even though QQ had never received it. Multi-plugin installation
+validated and replaced one target at a time, allowing an invalid later target
+to leave an earlier plugin already updated. Native-lane membership also used an
+adapter-lifetime set with no chat-count bound.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.12.
+- Split cancelled and delivered completed-owner semantics. Cancellation still
+  blocks a late draft; a successful later ordinary final promotes the record
+  to delivered ownership and only then suppresses final replays.
+- Changed native-lane membership to a 1024-chat LRU that evicts inactive chats,
+  protects open streams, converges after close, and preserves live config
+  disable behavior.
+- Split plugin installation into a complete target-preflight pass and a later
+  mutation pass. A two-plugin regression compares the first active directory
+  recursively and verifies that no backup exists when the second target fails.
+
+### Verify and roll back
+
+Run `plugins/qqbot-connect-hotfix/test_streaming.py` and
+`scripts/test_install_plugins.sh`, then run the complete offline plugin/MCP and
+Hermes 0.20.0/0.20.5 QQ matrices. Verify capacity abandonment produces one
+ordinary final and suppresses only its replay, lane membership stays bounded
+without evicting an open stream, and an invalid second install target leaves
+the first untouched. Restore only an exact installer-created external backup
+and restart only the affected profile after verification.
+
+## 2026-08-28 — Scope active streams and bound chat registries
+
+### Problem
+
+Version 1.8.10 keyed active native streams by draft id alone even though the
+public adapter contract only requires draft ids to be unique within one chat.
+Two private chats using the same id therefore collided. A capacity-final-only
+turn also lost its identity when abandonment removed pending state, allowing a
+late callback to re-arm the cancelled turn. Finally, per-chat inner quotas did
+not bound the number of retained chat buckets, and a rejected fresh install
+could create an empty active plugin directory before detecting an invalid
+backup-root symlink.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.11.
+- Keyed every active stream and anchor reference by `(chat_id, draft_id)` and
+  added a same-id/two-chat public adapter regression.
+- Recorded a completed owner before removing a successfully abandoned
+  capacity-final-only pending identity.
+- Added 1024-chat least-recently-used bounds to the completed-owner and
+  final-only-pending registries while preserving each chat's 256-entry quota.
+- Moved canonical backup-root validation ahead of active-target creation and
+  made the rejected-fresh-install regression explicitly fail on any artifact.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh`, the complete QQ streaming lifecycle test,
+the five QQ regressions against Hermes 0.20.0 and 0.20.5, and the offline
+plugin/MCP matrix. Verify same-id private chats produce two independent native
+frames, abandoned pending turns produce no late frame, recent chat buckets
+retain ownership across LRU eviction, and rejected fresh installs leave no
+active directory. Restore only an exact installer-created external backup and
+restart only the affected profile after verification.
+
+## 2026-08-28 — Isolate completed owners and harden plugin paths
+
+### Problem
+
+The 1.8.9 completed-owner FIFO was adapter-global. Enough completions in one QQ
+private chat could evict another chat's tombstone and allow its repeated final
+or late frame to create a second carrier. Tombstones were also written only
+after an ordinary suffix fallback, leaving successful native seals,
+first-frame/final-only degradation, committed-only rollover completion, and
+abandon cleanup without replay protection.
+
+The new pre-install backup mechanism also trusted filesystem names without
+fully enforcing canonical boundaries. A symlinked `plugin-backups` root could
+place an old manifest below recursive plugin discovery; a symlinked active
+plugin could write through to an external directory and retain stale files; and
+restore accepted `.` as a manifest/plugin name, allowing `plugins/.` to become
+the destructive target.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.10.
+- Replaced the global completed-owner FIFO with an independent 256-entry quota
+  for each QQ private chat. More-than-capacity traffic in chat B no longer
+  consumes chat A's quota; each chat still evicts its own oldest identities.
+- Added completed owners before every successful managed completion leaves its
+  active/pending state. Capacity-triggered final-only turns retain a bounded
+  per-chat pending draft identity until the ordinary final succeeds.
+- Added public lifecycle regressions for ordinary fallback, all-native and
+  rollover seals, first-frame/final-only and capacity-final-only paths,
+  committed-only rollover heads, abandon completion, late frames, repeated
+  finals, same-chat eviction, and cross-chat isolation.
+- Hardened install and restore with explicit `.`/`..` rejection, symlink checks
+  for backup roots and active targets, canonical backup containment, and an
+  exact canonical direct-child requirement for active plugin directories.
+- Expanded the shell regression to prove normal install/restore remains
+  recoverable while every unsafe path is rejected before active data changes.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh`, the five QQ regressions against Hermes
+0.20.0 and 0.20.5, and the complete offline plugin/MCP matrix. An unsafe path
+must exit non-zero without changing the active plugin. Roll back only from the
+exact external backup path printed by the installer; never move that backup
+under `plugins` or replace a rejected directory with a symlink workaround.
+
+## 2026-08-28 — Preserve QQ final ownership after recovery close
+
+### Problem
+
+After a native QQ C2C update failed, the ordinary-message fallback could
+successfully deliver the unseen final suffix and the immediate native-prefix
+recovery seal could then succeed. The seal removed the active stream state, so
+a repeated Hermes final callback sent the final again and a late draft frame
+could open a new stream for the already-completed turn. The terminal ownership
+check also used a handwritten boundary list that omitted common Unicode
+punctuation such as Chinese and ASCII commas and em dashes. Finally, the plugin
+README named 1.8.7 as a rollback target although Git contains no recoverable
+1.8.7 artifact and the installer replaced active directories without making an
+external plugin backup.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.9.
+- Added a 256-entry completed-turn ownership map keyed by QQ private chat,
+  inbound reply anchor, and Hermes draft id. It survives successful active-map
+  removal, suppresses stale final/draft replays, and keeps another inbound
+  anchor isolated as a new turn.
+- Replaced the punctuation whitelist with Unicode punctuation-category
+  detection while retaining whitespace boundaries and word-internal negative
+  cases.
+- Made `scripts/install-plugins.sh` copy an existing plugin, including hidden
+  files, into the profile-level `plugin-backups` directory before replacement.
+  Added a guarded `--restore` mode that verifies the manifest, rejects backups
+  under plugin discovery, and preserves the active copy before rollback.
+- Added public adapter lifecycle regressions for successful close, repeated
+  final, late frame, anchor isolation, bounded eviction, and punctuation, plus
+  an isolated shell regression for install/restore safety.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh` and the complete plugin regression matrix
+documented in the deployment guide before touching a running profile. During an
+update, record the installer's printed `plugin-backups` path. To roll back, run
+`scripts/install-plugins.sh --restore <profile-home> qqbot-connect-hotfix
+<exact-backup-path>`, verify `hermes plugins list`, restart only that profile's
+Gateway, and confirm QQ reaches `Ready`. The restore source must remain outside
+the `plugins` directory.
+
 ## 2026-08-25 — Release idle Codex thread writers on Agent cache eviction
 
 ### Problem
