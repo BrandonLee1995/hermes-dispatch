@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.18 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.19 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,16 +194,31 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.18 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.19 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
   如果新尾 stream 无法打开，普通 fallback 只补发尚未提交的后缀，避免重复已封口头部。
-  因 QQ 未公开 carrier 寿命而实测约十分钟后会过期，插件还会在单个 carrier 打开 480 秒时
-  主动按相同规则封口并换新。若 QQ 已接收最后一帧却返回
+  因 QQ 未公开 carrier 寿命而实测约十分钟后会过期，插件会在单个 carrier 打开时建立独立、
+  可取消的 480 秒 deadline；即使期间没有新 draft，也会主动封口并让同一 turn 准备从新
+  carrier 的 index 0 继续。若 deadline 封口失败，旧 carrier 会被明确退休。若 QQ 已接收
+  最后一帧却返回
   `同一流式消息发送超过时间限制`，该 carrier 会被永久退休；后续 draft、final seal 和取消
-  清理都不再重试旧 index，只由普通 fallback 补发尚未显示的最终后缀。其他 API 或网络错误
-  仍使用原有可重试/回退语义。
+  清理都不再重试旧 index，只由普通 fallback 补发尚未显示的最终后缀。传输超时、断连或
+  丢响应只允许对原 index 做一次协调：`index 需要递增` 会确认原帧已被接收；仍不确定时会
+  退休 carrier，并把最新未确认累计正文留给 final fallback，避免丢失内容。其他非终止帧
+  错误按每 carrier 的 0.2/0.8/2.0/5.0 秒有界 cooldown 重试；cooldown 内只保留最新累计
+  正文且不请求 QQ，避免 delta 驱动的请求风暴。QQ 返回 `40034128` 或
+  `回复消息失败，被动回复时间或者次数超过限制` 时，表示入站消息的被动回复窗口或次数已经
+  终止；插件立即退休当前 replacement carrier，后续 draft 和直接 final fallback 都不再向
+  同一锚点请求。被拒绝的正文不会被误记为已显示，final 明确返回失败并保留 Gateway 恢复
+  语义；该终止态无法靠同锚点普通 fallback 恢复，因此真实验收应在平台的被动回复窗口内
+  完成。
+  Codex 可能把 final 先作为实时 delta 紧接在 commentary 后发送，再由 Hermes 以同一
+  `final_response` 完成 turn；两阶段之间不保证有空白。插件只在真实
+  `GatewayStreamConsumer` turn-final 调用的 task-local adapter/chat/anchor 身份完全匹配时，
+  允许把已显示的精确 final 后缀原地封口，避免再次追加整段 final。普通或直接 send 仍沿用
+  token-boundary 规则，不能凭词内同后缀猜测所有权。
   ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
   final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
   final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由
