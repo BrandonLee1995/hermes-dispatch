@@ -21,18 +21,40 @@ backup_existing_plugin() {
   local data_root="$1"
   local plugin="$2"
   local active_dir="$3"
-  local existing_version backup_root timestamp backup_dir suffix
+  local existing_version backup_root plugin_root timestamp backup_dir suffix
+
+  backup_root="${data_root}/plugin-backups"
+  if [[ -L "$backup_root" ]]; then
+    echo "plugin backup root must not be a symlink: ${backup_root}" >&2
+    exit 2
+  fi
+  plugin_root="$(cd -- "${data_root}/plugins" && pwd -P)"
+  if [[ -d "$backup_root" ]]; then
+    backup_root="$(cd -- "$backup_root" && pwd -P)"
+    case "${backup_root}/" in
+      "${plugin_root}/"*)
+        echo "plugin backup root must be outside discovery root: ${plugin_root}" >&2
+        exit 2
+        ;;
+    esac
+  fi
 
   if [[ ! -d "$active_dir" ]] || [[ -z "$(find "$active_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     return
   fi
 
   existing_version="$(plugin_version "$active_dir")"
-  backup_root="${data_root}/plugin-backups"
+  mkdir -p "$backup_root"
+  backup_root="$(cd -- "$backup_root" && pwd -P)"
+  case "${backup_root}/" in
+    "${plugin_root}/"*)
+      echo "plugin backup root must be outside discovery root: ${plugin_root}" >&2
+      exit 2
+      ;;
+  esac
   timestamp="$(date -u +%Y%m%d-%H%M%S)"
   backup_dir="${backup_root}/${plugin}-${existing_version}-${timestamp}"
   suffix=1
-  mkdir -p "$backup_root"
   while [[ -e "$backup_dir" ]]; do
     backup_dir="${backup_root}/${plugin}-${existing_version}-${timestamp}-${suffix}"
     suffix=$((suffix + 1))
@@ -44,10 +66,33 @@ backup_existing_plugin() {
 
 validate_plugin_name() {
   local plugin="$1"
-  if [[ ! "$plugin" =~ ^[0-9A-Za-z._-]+$ ]]; then
+  if [[ "$plugin" == "." || "$plugin" == ".." || ! "$plugin" =~ ^[0-9A-Za-z._-]+$ ]]; then
     echo "invalid plugin name: ${plugin}" >&2
     exit 2
   fi
+}
+
+canonical_active_plugin_dir() {
+  local plugin_root="$1"
+  local plugin="$2"
+  local target_dir="${plugin_root}/${plugin}"
+  local resolved_target
+
+  if [[ -L "$target_dir" ]]; then
+    echo "active plugin target must not be a symlink: ${target_dir}" >&2
+    return 2
+  fi
+  if [[ -e "$target_dir" && ! -d "$target_dir" ]]; then
+    echo "active plugin target must be a directory: ${target_dir}" >&2
+    return 2
+  fi
+  mkdir -p "$target_dir"
+  resolved_target="$(cd -- "$target_dir" && pwd -P)"
+  if [[ "$resolved_target" != "${plugin_root}/${plugin}" ]]; then
+    echo "active plugin target must be a direct child of ${plugin_root}" >&2
+    return 2
+  fi
+  printf '%s\n' "$resolved_target"
 }
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -83,9 +128,8 @@ if [[ "${1:-}" == "--restore" ]]; then
     exit 2
   fi
 
-  target_dir="${target_plugins}/${plugin}"
+  target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"
   backup_existing_plugin "$target_root" "$plugin" "$target_dir"
-  mkdir -p "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   cp -R "${backup_dir}/." "$target_dir/"
   echo "restored ${plugin} from ${backup_dir}"
@@ -119,9 +163,8 @@ done
 
 for plugin in "${plugins[@]}"; do
   source_dir="${repo_root}/plugins/${plugin}"
-  target_dir="${target_plugins}/${plugin}"
+  target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"
   backup_existing_plugin "$target_root" "$plugin" "$target_dir"
-  mkdir -p "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   cp -R "${source_dir}/." "$target_dir/"
 done

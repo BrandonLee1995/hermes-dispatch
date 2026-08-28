@@ -27,7 +27,8 @@ _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
 _OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
-_MAX_COMPLETED_OWNERS = 256
+_MAX_COMPLETED_OWNERS_PER_CHAT = 256
+_MAX_FINAL_ONLY_PENDING = 256
 _MAX_TYPING_ANCHORS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
@@ -115,7 +116,9 @@ def _stream_maps(adapter):
     return streams, anchors
 
 
-def _completed_owners(adapter) -> Dict[tuple[str, str, int], _QQC2CCompletedOwner]:
+def _completed_owners(
+    adapter,
+) -> Dict[str, Dict[tuple[str, int], _QQC2CCompletedOwner]]:
     owners = getattr(adapter, "_qq_native_c2c_completed_owners", None)
     if owners is None:
         owners = {}
@@ -133,9 +136,10 @@ def _remember_completed_owner(
     """Retain exact completed-turn ownership without growing indefinitely."""
 
     owners = _completed_owners(adapter)
-    key = (state.chat_id, state.reply_to, state.draft_id)
-    owners.pop(key, None)
-    owners[key] = _QQC2CCompletedOwner(
+    bucket = owners.setdefault(state.chat_id, {})
+    key = (state.reply_to, state.draft_id)
+    bucket.pop(key, None)
+    bucket[key] = _QQC2CCompletedOwner(
         chat_id=state.chat_id,
         draft_id=state.draft_id,
         reply_to=state.reply_to,
@@ -143,8 +147,8 @@ def _remember_completed_owner(
         final_content=str(final_content or ""),
         message_id=state.stream_msg_id or state.last_completed_stream_id,
     )
-    while len(owners) > _MAX_COMPLETED_OWNERS:
-        owners.pop(next(iter(owners)))
+    while len(bucket) > _MAX_COMPLETED_OWNERS_PER_CHAT:
+        bucket.pop(next(iter(bucket)))
 
 
 def _completed_owner_for_draft(
@@ -154,7 +158,8 @@ def _completed_owner_for_draft(
     reply_to: str,
     draft_id: int,
 ) -> Optional[_QQC2CCompletedOwner]:
-    return _completed_owners(adapter).get((str(chat_id), str(reply_to), int(draft_id)))
+    bucket = _completed_owners(adapter).get(str(chat_id), {})
+    return bucket.get((str(reply_to), int(draft_id)))
 
 
 def _completed_owner_for_final(
@@ -165,7 +170,8 @@ def _completed_owner_for_final(
     content: str,
 ) -> Optional[_QQC2CCompletedOwner]:
     payload = str(content or "")
-    for owner in reversed(tuple(_completed_owners(adapter).values())):
+    bucket = _completed_owners(adapter).get(str(chat_id), {})
+    for owner in reversed(tuple(bucket.values())):
         if (
             owner.chat_id == str(chat_id)
             and owner.reply_to == str(reply_to)
@@ -173,6 +179,58 @@ def _completed_owner_for_final(
         ):
             return owner
     return None
+
+
+def _final_only_pending(adapter) -> Dict[str, Dict[tuple[str, int], _QQC2CStream]]:
+    pending = getattr(adapter, "_qq_native_c2c_final_only_pending", None)
+    if pending is None:
+        pending = {}
+        adapter._qq_native_c2c_final_only_pending = pending
+    return pending
+
+
+def _remember_final_only_pending(adapter, state: _QQC2CStream) -> None:
+    pending = _final_only_pending(adapter)
+    bucket = pending.setdefault(state.chat_id, {})
+    key = (state.reply_to, state.draft_id)
+    bucket.pop(key, None)
+    bucket[key] = state
+    while len(bucket) > _MAX_FINAL_ONLY_PENDING:
+        bucket.pop(next(iter(bucket)))
+
+
+def _final_only_pending_for_draft(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+    draft_id: int,
+) -> Optional[_QQC2CStream]:
+    bucket = _final_only_pending(adapter).get(str(chat_id), {})
+    return bucket.get((str(reply_to), int(draft_id)))
+
+
+def _final_only_pending_for_anchor(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+) -> Optional[_QQC2CStream]:
+    bucket = _final_only_pending(adapter).get(str(chat_id), {})
+    for (owner_reply_to, _draft_id), state in reversed(tuple(bucket.items())):
+        if owner_reply_to == str(reply_to):
+            return state
+    return None
+
+
+def _remove_final_only_pending(adapter, state: _QQC2CStream) -> None:
+    pending = _final_only_pending(adapter)
+    bucket = pending.get(state.chat_id)
+    if bucket is None:
+        return
+    bucket.pop((state.reply_to, state.draft_id), None)
+    if not bucket:
+        pending.pop(state.chat_id, None)
 
 
 def _remove_stream(adapter, state: _QQC2CStream) -> None:
@@ -824,6 +882,17 @@ def patch_qq_c2c_streaming(QQAdapter):
                     message_id=completed_owner.message_id,
                     raw_response={"qq_completed_turn_owned": True},
                 )
+            pending_state = _final_only_pending_for_draft(
+                self,
+                chat_id=chat_id,
+                reply_to=reply_to,
+                draft_id=int(draft_id),
+            )
+            if pending_state is not None:
+                return _send_result(
+                    success=True,
+                    raw_response={"qq_final_only_pending": True},
+                )
             _evict_unopened_streams(self, limit=_MAX_OPEN_STREAMS - 1)
             if len(streams) >= _MAX_OPEN_STREAMS:
                 logger.warning(
@@ -835,7 +904,18 @@ def patch_qq_c2c_streaming(QQAdapter):
                 )
                 # Reporting success keeps GatewayStreamConsumer on the native
                 # lane without emitting an uneditable partial. Since no anchor
-                # is registered, the turn-final wrapper sends one normal final.
+                # is registered, retain a separate bounded identity so the
+                # turn-final wrapper can own one normal final and reject stale
+                # retries/late draft frames after completion.
+                _remember_final_only_pending(
+                    self,
+                    _QQC2CStream(
+                        chat_id=chat_id,
+                        draft_id=int(draft_id),
+                        reply_to=reply_to,
+                        msg_seq=int(self._next_msg_seq(reply_to)),
+                    ),
+                )
                 return _send_result(success=True)
             state = _QQC2CStream(
                 chat_id=chat_id,
@@ -907,6 +987,13 @@ def patch_qq_c2c_streaming(QQAdapter):
         draft_id = anchors.get((str(chat_id), anchor))
         state = streams.get(draft_id) if draft_id is not None else None
         if state is None:
+            pending_state = _final_only_pending_for_anchor(
+                self,
+                chat_id=str(chat_id),
+                reply_to=anchor,
+            )
+            if pending_state is not None:
+                _remove_final_only_pending(self, pending_state)
             return _send_result(success=True)
         if state.ordinary_owned_suffix:
             # A completed ordinary fallback already owns every character after
@@ -926,13 +1013,27 @@ def patch_qq_c2c_streaming(QQAdapter):
         )
         if not state.stream_msg_id and state.committed_prefix and not active_content:
             completed_id = state.last_completed_stream_id
+            _remember_completed_owner(
+                self,
+                state,
+                final_payload=str(content or ""),
+                final_content=state.committed_prefix,
+            )
             _remove_stream(self, state)
             return _send_result(success=True, message_id=completed_id)
-        return await _seal_stream(
+        sealed = await _seal_stream(
             self,
             state,
             active_content or state.last_content,
         )
+        if sealed.success:
+            _remember_completed_owner(
+                self,
+                state,
+                final_payload=str(content or ""),
+                final_content=_visible_stream_content(state),
+            )
+        return sealed
 
     @functools.wraps(original_send)
     async def send(
@@ -1032,6 +1133,28 @@ def patch_qq_c2c_streaming(QQAdapter):
                         message_id=completed_owner.message_id,
                         raw_response={"qq_completed_turn_owned": True},
                     )
+                pending_state = _final_only_pending_for_anchor(
+                    self,
+                    chat_id=str(chat_id),
+                    reply_to=anchor,
+                )
+                if pending_state is not None:
+                    normal_result = await original_send(
+                        self,
+                        chat_id,
+                        content,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    if getattr(normal_result, "success", False):
+                        _remember_completed_owner(
+                            self,
+                            pending_state,
+                            final_payload=str(content or ""),
+                            final_content=str(content or ""),
+                        )
+                        _remove_final_only_pending(self, pending_state)
+                    return normal_result
             if state is not None:
                 if state.ordinary_owned_suffix:
                     # A prior successful final fallback is authoritative and
@@ -1063,6 +1186,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                         metadata=metadata,
                     )
                     if getattr(normal_result, "success", False):
+                        _remember_completed_owner(
+                            self,
+                            state,
+                            final_payload=str(content or ""),
+                            final_content=str(content or ""),
+                        )
                         _remove_stream(self, state)
                     return normal_result
 
@@ -1151,12 +1280,24 @@ def patch_qq_c2c_streaming(QQAdapter):
 
                 if not state.stream_msg_id and state.committed_prefix == target:
                     completed_id = state.last_completed_stream_id
+                    _remember_completed_owner(
+                        self,
+                        state,
+                        final_payload=str(content or ""),
+                        final_content=target,
+                    )
                     _remove_stream(self, state)
                     return _send_result(success=True, message_id=completed_id)
 
                 if not state.stream_msg_id:
                     # No visible active stream and no unseen suffix is only
                     # possible for an empty final. Clear the placeholder.
+                    _remember_completed_owner(
+                        self,
+                        state,
+                        final_payload=str(content or ""),
+                        final_content=target,
+                    )
                     _remove_stream(self, state)
                     return _send_result(
                         success=True,
@@ -1165,6 +1306,12 @@ def patch_qq_c2c_streaming(QQAdapter):
 
                 sealed = await _seal_stream(self, state, state.last_content)
                 if sealed.success:
+                    _remember_completed_owner(
+                        self,
+                        state,
+                        final_payload=str(content or ""),
+                        final_content=target,
+                    )
                     return sealed
 
                 # The whole target is already visible. Retry closing the same
@@ -1174,6 +1321,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                 # has exactly one visible owner.
                 recovery = await _seal_stream(self, state, state.last_content)
                 if recovery.success:
+                    _remember_completed_owner(
+                        self,
+                        state,
+                        final_payload=str(content or ""),
+                        final_content=target,
+                    )
                     return recovery
                 logger.warning(
                     "qqbot-connect-hotfix: final is visible but stream close "

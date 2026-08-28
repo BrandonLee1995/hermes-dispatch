@@ -1,5 +1,50 @@
 # Development Log
 
+## 2026-08-28 — Isolate completed owners and harden plugin paths
+
+### Problem
+
+The 1.8.9 completed-owner FIFO was adapter-global. Enough completions in one QQ
+private chat could evict another chat's tombstone and allow its repeated final
+or late frame to create a second carrier. Tombstones were also written only
+after an ordinary suffix fallback, leaving successful native seals,
+first-frame/final-only degradation, committed-only rollover completion, and
+abandon cleanup without replay protection.
+
+The new pre-install backup mechanism also trusted filesystem names without
+fully enforcing canonical boundaries. A symlinked `plugin-backups` root could
+place an old manifest below recursive plugin discovery; a symlinked active
+plugin could write through to an external directory and retain stale files; and
+restore accepted `.` as a manifest/plugin name, allowing `plugins/.` to become
+the destructive target.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.10.
+- Replaced the global completed-owner FIFO with an independent 256-entry quota
+  for each QQ private chat. More-than-capacity traffic in chat B no longer
+  consumes chat A's quota; each chat still evicts its own oldest identities.
+- Added completed owners before every successful managed completion leaves its
+  active/pending state. Capacity-triggered final-only turns retain a bounded
+  per-chat pending draft identity until the ordinary final succeeds.
+- Added public lifecycle regressions for ordinary fallback, all-native and
+  rollover seals, first-frame/final-only and capacity-final-only paths,
+  committed-only rollover heads, abandon completion, late frames, repeated
+  finals, same-chat eviction, and cross-chat isolation.
+- Hardened install and restore with explicit `.`/`..` rejection, symlink checks
+  for backup roots and active targets, canonical backup containment, and an
+  exact canonical direct-child requirement for active plugin directories.
+- Expanded the shell regression to prove normal install/restore remains
+  recoverable while every unsafe path is rejected before active data changes.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh`, the five QQ regressions against Hermes
+0.20.0 and 0.20.5, and the complete offline plugin/MCP matrix. An unsafe path
+must exit non-zero without changing the active plugin. Roll back only from the
+exact external backup path printed by the installer; never move that backup
+under `plugins` or replace a rejected directory with a symlink workaround.
+
 ## 2026-08-28 — Preserve QQ final ownership after recovery close
 
 ### Problem

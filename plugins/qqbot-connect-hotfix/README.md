@@ -24,6 +24,30 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.10 isolates completed-turn ownership per private chat. Each chat has
+its own 256-entry FIFO quota, so high completion volume in one QQ conversation
+cannot evict another conversation's replay protection. Tombstones are now
+created for every successful managed completion path: ordinary suffix fallback,
+all-native seal (including rollover and second-round recovery), first-frame
+final-only degradation, capacity-triggered final-only degradation, a
+committed-only rollover head, and successful draft abandonment. Capacity-only
+turns retain a separate per-chat pending identity until their ordinary final
+succeeds, allowing the completed owner to keep the original Hermes draft id.
+Repeated final callbacks and late draft frames for each path are regression
+tested through the public adapter lifecycle.
+
+The installer used by this release validates canonical filesystem boundaries
+before any backup or replacement. A profile-level `plugin-backups` symlink is
+rejected even on a first install; an active `plugins/<name>` symlink is rejected
+for both install and restore; the canonical active target must be one direct
+child of the canonical plugin root; and `.`/`..` are not valid plugin names.
+These checks prevent an old manifest from escaping into recursive discovery,
+prevent writes through an external active-target link, and prevent restore from
+clearing the whole plugin root. `scripts/test_install_plugins.sh` covers normal
+canonical install/restore plus every rejected boundary before active data is
+changed. Roll back with an exact installer-created external backup as described
+below.
+
 Version 1.8.9 keeps final ownership after a successful native recovery close.
 When an ordinary fallback has already delivered the unseen final suffix, the
 adapter records a completed-turn tombstone keyed by private chat, inbound reply

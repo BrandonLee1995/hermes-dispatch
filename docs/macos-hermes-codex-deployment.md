@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.9 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.10 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.9 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.10 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -366,6 +366,9 @@ scripts/install-plugins.sh --restore \
 
 恢复命令会先备份当前活动版本，并拒绝使用位于 `plugins` 发现路径内的备份；
 恢复后只重启目标 profile，并重新检查插件版本和 QQ `Ready`。
+安装和恢复都会拒绝符号链接形式的 `plugin-backups` 或活动插件目录，并要求活动插件的
+canonical 路径是 canonical `plugins` 根的直接子目录；`.` 和 `..` 不是合法插件名。
+出现任一拒绝时，不得手工绕过检查，应先修复 profile 的目录布局。
 
 启用插件和消息检索工具集：
 

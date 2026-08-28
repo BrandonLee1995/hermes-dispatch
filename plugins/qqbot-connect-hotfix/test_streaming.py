@@ -594,6 +594,24 @@ async def main():
         assert capacity_final.success
         assert capacity.normal_sends[-1][1] == "C final"
         assert set(capacity_streams) == {3201, 3202}
+        capacity_final_repeat = await capacity.send(
+            "user-cap-c",
+            "C final",
+            reply_to="msg-cap-c",
+            metadata={"notify": True, "reply_to_message_id": "msg-cap-c"},
+        )
+        assert capacity_final_repeat.success
+        assert [item[1] for item in capacity.normal_sends] == ["C final"]
+        await capacity.abandon_open_draft(
+            "user-cap-a", "A", {"reply_to_message_id": "msg-cap-a"}
+        )
+        await capacity.abandon_open_draft(
+            "user-cap-b", "B", {"reply_to_message_id": "msg-cap-b"}
+        )
+        await capacity.send_draft(
+            "user-cap-c", 3203, "C final", {"reply_to_message_id": "msg-cap-c"}
+        )
+        assert 3203 not in capacity_streams
     finally:
         streaming_mod._MAX_OPEN_STREAMS = previous_capacity
 
@@ -1002,6 +1020,24 @@ async def main():
     ]
     assert "".join(final_growth_seals) == final_growth_text
     assert_exact_final_ownership(final_growth, final_growth_text)
+    final_growth_repeat = await final_growth.send(
+        "user-final-growth",
+        final_growth_text,
+        reply_to="inbound-final-growth",
+        metadata={"notify": True, **final_growth_metadata},
+    )
+    assert final_growth_repeat.success
+    await final_growth.send_draft(
+        "user-final-growth",
+        5101,
+        final_growth_text,
+        final_growth_metadata,
+    )
+    final_growth_streams, _final_growth_anchors = streaming_mod._stream_maps(
+        final_growth
+    )
+    assert not final_growth.normal_sends
+    assert 5101 not in final_growth_streams
 
     # A full 4000-character commentary followed by an independent short final
     # must roll into another native message instead of silently dropping the
@@ -1328,15 +1364,145 @@ async def main():
     assert 5116 in completed_owner_streams
     assert completed_owner_streams[5116].reply_to == reused_anchor
 
+    # A successful all-native completion also needs a completed-turn owner.
+    # Once the seal removes the active state, repeated finals and late frames
+    # for the same full identity remain stale lifecycle events.
+    native_completed = DummyAdapter()
+    native_completed_metadata = {
+        "reply_to_message_id": "inbound-native-completed"
+    }
+    native_completed_target = "全部原生完成"
+    await native_completed.send_draft(
+        "user-native-completed",
+        5118,
+        native_completed_target,
+        native_completed_metadata,
+    )
+    native_completed_result = await native_completed.send(
+        "user-native-completed",
+        native_completed_target,
+        reply_to="inbound-native-completed",
+        metadata={"notify": True, **native_completed_metadata},
+    )
+    assert native_completed_result.success
+    native_completed_streams, _native_completed_anchors = (
+        streaming_mod._stream_maps(native_completed)
+    )
+    assert not native_completed_streams
+
+    native_completed_repeat = await native_completed.send(
+        "user-native-completed",
+        native_completed_target,
+        reply_to="inbound-native-completed",
+        metadata={"notify": True, **native_completed_metadata},
+    )
+    assert native_completed_repeat.success
+    await native_completed.send_draft(
+        "user-native-completed",
+        5118,
+        native_completed_target,
+        native_completed_metadata,
+    )
+    assert not native_completed_streams
+    assert not native_completed.normal_sends
+    assert_exact_final_ownership(native_completed, native_completed_target)
+
+    # If the first native frame never opens, the single ordinary final is the
+    # completed turn's owner. Removing the placeholder must not permit a final
+    # retry or late draft to create a second carrier.
+    final_only_completed = DummyAdapter()
+    final_only_completed_metadata = {
+        "reply_to_message_id": "inbound-final-only-completed"
+    }
+    final_only_completed.fail_next_stream = True
+    await final_only_completed.send_draft(
+        "user-final-only-completed",
+        5119,
+        "不可见草稿",
+        final_only_completed_metadata,
+    )
+    final_only_result = await final_only_completed.send(
+        "user-final-only-completed",
+        "普通最终答复",
+        reply_to="inbound-final-only-completed",
+        metadata={"notify": True, **final_only_completed_metadata},
+    )
+    assert final_only_result.success
+    final_only_streams, _final_only_anchors = streaming_mod._stream_maps(
+        final_only_completed
+    )
+    assert not final_only_streams
+
+    final_only_repeat = await final_only_completed.send(
+        "user-final-only-completed",
+        "普通最终答复",
+        reply_to="inbound-final-only-completed",
+        metadata={"notify": True, **final_only_completed_metadata},
+    )
+    assert final_only_repeat.success
+    await final_only_completed.send_draft(
+        "user-final-only-completed",
+        5119,
+        "不可见草稿\n普通最终答复",
+        final_only_completed_metadata,
+    )
+    assert not final_only_streams
+    assert [item[1] for item in final_only_completed.normal_sends] == [
+        "普通最终答复"
+    ]
+
+    # A previously sealed rollover head can itself become the authoritative
+    # final after a tail-open failure. Completing that no-active-stream state
+    # must retain ownership just like an active native seal.
+    committed_only = DummyAdapter()
+    committed_only_metadata = {
+        "reply_to_message_id": "inbound-committed-only"
+    }
+    committed_only_head = "C" * 4000
+    committed_only.fail_tail_open_attempts = 1
+    await committed_only.send_draft(
+        "user-committed-only",
+        5120,
+        committed_only_head + ("T" * 100),
+        committed_only_metadata,
+    )
+    committed_only_result = await committed_only.send(
+        "user-committed-only",
+        committed_only_head,
+        reply_to="inbound-committed-only",
+        metadata={"notify": True, **committed_only_metadata},
+    )
+    assert committed_only_result.success
+    committed_only_streams, _committed_only_anchors = streaming_mod._stream_maps(
+        committed_only
+    )
+    assert not committed_only_streams
+
+    committed_only_repeat = await committed_only.send(
+        "user-committed-only",
+        committed_only_head,
+        reply_to="inbound-committed-only",
+        metadata={"notify": True, **committed_only_metadata},
+    )
+    assert committed_only_repeat.success
+    await committed_only.send_draft(
+        "user-committed-only",
+        5120,
+        committed_only_head,
+        committed_only_metadata,
+    )
+    assert not committed_only_streams
+    assert not committed_only.normal_sends
+
     # Completed ownership is deliberately bounded. Once the oldest identity
     # is evicted, a replay can open normally; the newest retained identity
     # must still reject its stale late frame.
     bounded_owners = DummyAdapter()
     first_bounded_draft = 5200
-    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS
-    streaming_mod._MAX_COMPLETED_OWNERS = 2
+    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+    streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 2
     try:
-        for offset in range(streaming_mod._MAX_COMPLETED_OWNERS + 1):
+        for offset in range(streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT + 1):
             bounded_draft_id = first_bounded_draft + offset
             bounded_anchor = f"inbound-bounded-owner-{offset}"
             bounded_metadata = {"reply_to_message_id": bounded_anchor}
@@ -1362,7 +1528,7 @@ async def main():
             {"reply_to_message_id": "inbound-bounded-owner-0"},
         )
         newest_bounded_draft = (
-            first_bounded_draft + streaming_mod._MAX_COMPLETED_OWNERS
+            first_bounded_draft + streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
         )
         await bounded_owners.send_draft(
             "user-bounded-owner",
@@ -1371,7 +1537,7 @@ async def main():
             {
                 "reply_to_message_id": (
                     "inbound-bounded-owner-"
-                    f"{streaming_mod._MAX_COMPLETED_OWNERS}"
+                    f"{streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT}"
                 )
             },
         )
@@ -1381,7 +1547,63 @@ async def main():
         assert first_bounded_draft in bounded_streams
         assert newest_bounded_draft not in bounded_streams
     finally:
-        streaming_mod._MAX_COMPLETED_OWNERS = completed_owner_limit
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+
+    # Capacity is isolated per private chat. Heavy completion traffic in chat
+    # B must not evict chat A's replay protection.
+    cross_chat_owners = DummyAdapter()
+    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+    streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 2
+    try:
+        await cross_chat_owners.send_draft(
+            "user-owner-a",
+            5300,
+            "A final",
+            {"reply_to_message_id": "inbound-owner-a"},
+        )
+        await cross_chat_owners.send(
+            "user-owner-a",
+            "A final",
+            reply_to="inbound-owner-a",
+            metadata={"notify": True, "reply_to_message_id": "inbound-owner-a"},
+        )
+        for offset in range(3):
+            await cross_chat_owners.send_draft(
+                "user-owner-b",
+                5301 + offset,
+                f"B final {offset}",
+                {"reply_to_message_id": f"inbound-owner-b-{offset}"},
+            )
+            await cross_chat_owners.send(
+                "user-owner-b",
+                f"B final {offset}",
+                reply_to=f"inbound-owner-b-{offset}",
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": f"inbound-owner-b-{offset}",
+                },
+            )
+
+        replay_a = await cross_chat_owners.send(
+            "user-owner-a",
+            "A final",
+            reply_to="inbound-owner-a",
+            metadata={"notify": True, "reply_to_message_id": "inbound-owner-a"},
+        )
+        assert replay_a.success
+        await cross_chat_owners.send_draft(
+            "user-owner-a",
+            5300,
+            "A final",
+            {"reply_to_message_id": "inbound-owner-a"},
+        )
+        cross_chat_streams, _cross_chat_anchors = streaming_mod._stream_maps(
+            cross_chat_owners
+        )
+        assert not cross_chat_owners.normal_sends
+        assert 5300 not in cross_chat_streams
+    finally:
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
 
     # Independent finals are payloads, not substring searches. An earlier,
     # non-terminal occurrence of the same value does not own the final.
@@ -1536,6 +1758,22 @@ async def main():
     )
     assert closed.success
     assert cancelled.api_calls[-1][2]["input_state"] == 10
+    cancelled_repeat = await cancelled.send(
+        "user-cancel",
+        "部分结果",
+        reply_to="inbound-cancel",
+        metadata={"notify": True, "reply_to_message_id": "inbound-cancel"},
+    )
+    assert cancelled_repeat.success
+    await cancelled.send_draft(
+        "user-cancel",
+        5001,
+        "部分结果",
+        {"reply_to_message_id": "inbound-cancel"},
+    )
+    cancelled_streams, _cancelled_anchors = streaming_mod._stream_maps(cancelled)
+    assert not cancelled.normal_sends
+    assert 5001 not in cancelled_streams
 
     print("qq_c2c_stream_open_continue_seal=ok")
     print("qq_c2c_stream_seal_preserves_prefix=ok")
@@ -1570,13 +1808,18 @@ async def main():
     print("qq_c2c_ordinary_owned_late_frame_ignored=ok")
     print("qq_c2c_ordinary_owned_final_retry=ok")
     print("qq_c2c_completed_owner_replay_dedup=ok")
+    print("qq_c2c_native_completed_owner_replay_dedup=ok")
+    print("qq_c2c_final_only_completed_owner_replay_dedup=ok")
+    print("qq_c2c_committed_only_completed_owner_replay_dedup=ok")
     print("qq_c2c_completed_owner_anchor_isolation=ok")
     print("qq_c2c_completed_owner_bounded=ok")
+    print("qq_c2c_completed_owner_cross_chat_isolation=ok")
     print("qq_c2c_nonterminal_repeated_final=ok")
     print("qq_c2c_terminal_final_single_owner=ok")
     print("qq_c2c_partial_overlap_not_ownership=ok")
     print("qq_c2c_leading_boundary_not_duplicated=ok")
     print("qq_c2c_cumulative_final_replace=ok")
+    print("qq_c2c_abandoned_completed_owner_replay_dedup=ok")
 
 
 anyio.run(main)

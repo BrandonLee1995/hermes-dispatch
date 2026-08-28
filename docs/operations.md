@@ -18,6 +18,13 @@ cannot register as a second plugin. The copy includes hidden files and is
 completed before the active directory is replaced. A first installation does
 not create an empty backup.
 
+The backup root and active plugin directory must be real directories, not
+symbolic links. The installer resolves canonical paths and requires the active
+target to be exactly one direct child below the canonical `plugins` root; it
+also rejects `.` and `..` as plugin names. These checks run before backup,
+clear, or copy operations. Fix a rejected profile layout instead of bypassing
+the guard.
+
 To restore an exact installer-created copy:
 
 ```bash
