@@ -24,6 +24,25 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.18 fixes a real QQ regression discovered during the 1.8.17 age
+rollover canary. Codex can finish consecutive commentary items whose streamed
+deltas are concatenated without whitespace, for example `STARTSTEP1`. Hermes
+then emits a completed `_interim_send` callback containing only `STEP1`. The
+general token-boundary guard correctly refused to infer ownership from that
+word-internal suffix, but the result was one growing native bubble plus one
+ordinary duplicate bubble for every completed stage.
+
+The plugin now wraps only `GatewayStreamConsumer._send_commentary()` for an
+active QQ C2C native lane and publishes a task-local completed-commentary
+context while the original callback runs. The adapter may accept a boundaryless
+terminal suffix only when adapter, chat, inbound reply anchor, and exact cleaned
+commentary all match that same consumer callback and the native carrier already
+ends with the text. Generic `_interim_send` calls, unrelated statuses, other
+anchors, ambiguous streams, and existing word-internal overlap negatives keep
+their prior behavior. Verify with the consecutive-commentary consumer
+regression and a real QQ private task that emits at least two alphanumeric stage
+markers; only one growing native carrier may be visible before the final.
+
 Version 1.8.17 prevents expired QQ C2C native carriers from entering a stale
 index/seal retry loop. QQ documents monotonically increasing `index` values and
 one stable `stream_msg_id`, but does not publish a carrier lifetime. Production

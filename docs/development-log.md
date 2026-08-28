@@ -1,5 +1,35 @@
 # Development Log
 
+## 2026-08-28 — Bind completed commentary to its native consumer
+
+### Problem
+
+The 1.8.17 procurement canary exposed a duplicate-carrier boundary not covered
+by the existing single-commentary regression. Consecutive Codex commentary
+items were concatenated as `STARTSTEP1` in one native stream, then Hermes sent
+the completed `STEP1` item through ordinary `_interim_send`. The conservative
+token-boundary predicate treated that word-internal suffix as independent, so
+each minute produced both a growing native bubble and a new ordinary bubble.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.18.
+- Wrapped the original `GatewayStreamConsumer._send_commentary()` only for an
+  active QQ C2C lane and exposed its exact adapter/chat/anchor/text identity in
+  a task-local context while the original callback executes.
+- Allowed boundaryless suffix ownership only under that trusted context and
+  only after the same native carrier visibly ends with the exact cleaned item.
+  General interim sends and word-internal overlap negatives remain unchanged.
+- Added a real-consumer regression with two consecutive alphanumeric commentary
+  items that reproduced the visible duplicate before the fix.
+
+### Verify and roll back
+
+Run the complete QQ and plugin matrices, installer/static checks, then a real QQ
+C2C canary with at least two consecutive stage markers. The UI must show one
+growing native carrier and no per-stage ordinary bubbles. Restore the exact
+installer backup and restart only the affected profile to roll back.
+
 ## 2026-08-28 — Retire expired QQ C2C carriers
 
 ### Problem

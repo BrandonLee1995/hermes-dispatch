@@ -13,6 +13,7 @@ different passive-reply contract and do not expose the C2C stream endpoint.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import re
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 _STREAM_PATCHED = "_qqbot_native_c2c_streaming_patched"
 _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
 _OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
+_COMMENTARY_PATCHED = "_qqbot_native_c2c_commentary_context_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
 _MAX_COMPLETED_OWNERS_PER_CHAT = 256
@@ -39,6 +41,10 @@ _MAX_FINAL_DELIVERY_RESULTS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _NATIVE_STREAM_MAX_AGE_SECONDS = 480.0
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
+_COMPLETED_COMMENTARY_CONTEXT = contextvars.ContextVar(
+    "qqbot_completed_commentary_context",
+    default=None,
+)
 
 
 def _hermes_version_tuple() -> tuple[int, ...]:
@@ -956,6 +962,53 @@ def _patch_gateway_overflow_limit(QQAdapter) -> str:
     setattr(_raw_message_limit, _OVERFLOW_PATCHED, True)
     GatewayStreamConsumer._raw_message_limit = _raw_message_limit
     return "QQ C2C native overflow patched"
+
+
+def _patch_gateway_commentary_context(QQAdapter) -> str:
+    """Identify the completed commentary callback that owns streamed deltas.
+
+    Consecutive Codex commentary items can be concatenated without a textual
+    boundary. A task-local context distinguishes that trusted consumer callback
+    from unrelated interim sends while avoiding any wire metadata change.
+    """
+
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch commentary context: %s",
+            exc,
+        )
+        return "QQ C2C commentary context unavailable"
+
+    original_send_commentary = GatewayStreamConsumer._send_commentary
+    if getattr(original_send_commentary, _COMMENTARY_PATCHED, False):
+        return "QQ C2C commentary context already patched"
+
+    @functools.wraps(original_send_commentary)
+    async def _send_commentary(self, text: str):
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        if (
+            not isinstance(adapter, QQAdapter)
+            or chat_id not in _native_lane_chats(adapter)
+            or not _is_c2c(adapter, chat_id)
+        ):
+            return await original_send_commentary(self, text)
+
+        cleaned = str(self._clean_for_display(text) or "")
+        anchor = str(getattr(self, "_initial_reply_to_id", "") or "")
+        token = _COMPLETED_COMMENTARY_CONTEXT.set(
+            (id(adapter), chat_id, anchor, cleaned)
+        )
+        try:
+            return await original_send_commentary(self, text)
+        finally:
+            _COMPLETED_COMMENTARY_CONTEXT.reset(token)
+
+    setattr(_send_commentary, _COMMENTARY_PATCHED, True)
+    GatewayStreamConsumer._send_commentary = _send_commentary
+    return "QQ C2C commentary context patched"
 
 
 def _reply_anchor(metadata: Optional[Dict[str, Any]]) -> str:
@@ -2210,9 +2263,18 @@ def patch_qq_c2c_streaming(QQAdapter):
             and metadata.get("_interim_send") is True
             and _is_c2c(self, str(chat_id))
         ):
+            commentary_context = _COMPLETED_COMMENTARY_CONTEXT.get()
+            trusted_commentary = bool(
+                isinstance(commentary_context, tuple)
+                and len(commentary_context) == 4
+                and commentary_context[0] == id(self)
+                and commentary_context[1] == str(chat_id)
+                and commentary_context[3] == str(content or "")
+            )
             anchor = str(
                 reply_to
                 or metadata.get("reply_to_message_id")
+                or (commentary_context[2] if trusted_commentary else "")
                 or ""
             ).strip()
             streams, anchors = _stream_maps(self)
@@ -2243,9 +2305,17 @@ def patch_qq_c2c_streaming(QQAdapter):
                 state is not None
                 and state.stream_msg_id
                 and not state.sealed
-                and _terminal_payload_is_owned(
-                    _visible_stream_content(state),
-                    str(content or ""),
+                and (
+                    _terminal_payload_is_owned(
+                        _visible_stream_content(state),
+                        str(content or ""),
+                    )
+                    or (
+                        trusted_commentary
+                        and _visible_stream_content(state).endswith(
+                            str(content or "")
+                        )
+                    )
                 )
             ):
                 logger.debug(
@@ -2338,6 +2408,8 @@ def patch_qq_c2c_streaming(QQAdapter):
     QQAdapter.send_typing = send_typing
     gate_status = _patch_gateway_stream_gate(QQAdapter)
     overflow_status = _patch_gateway_overflow_limit(QQAdapter)
+    commentary_status = _patch_gateway_commentary_context(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
     logger.info("qqbot-connect-hotfix: %s", overflow_status)
+    logger.info("qqbot-connect-hotfix: %s", commentary_status)
     return "QQ C2C native streaming patched"

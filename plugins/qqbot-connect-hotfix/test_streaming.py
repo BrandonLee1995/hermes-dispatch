@@ -2558,6 +2558,38 @@ async def main():
         "PR187_TERMINAL_ONCE"
     ) is True
 
+    # Consecutive Codex commentary items can be concatenated by the consumer
+    # without a textual token boundary. The completed-item callback is still
+    # the same consumer-owned segment and must not create one ordinary bubble
+    # per minute beside the growing native carrier.
+    commentary_sequence = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(
+        commentary_sequence,
+        "user-commentary-sequence",
+    )
+    commentary_sequence_consumer = GatewayStreamConsumer(
+        commentary_sequence,
+        "user-commentary-sequence",
+        cfg,
+        initial_reply_to_id="inbound-commentary-sequence",
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(commentary_sequence_consumer.run)
+        commentary_sequence_consumer.on_delta("QQ_AGE_START")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_commentary("QQ_AGE_START")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_delta("QQ_AGE_STEP_1")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_commentary("QQ_AGE_STEP_1")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.finish("QQ_AGE_FINAL")
+
+    assert not commentary_sequence.normal_sends, (
+        commentary_sequence.api_calls,
+        commentary_sequence.normal_sends,
+    )
+
     # A response beyond one QQ message must roll over as complete native
     # stream chunks. Generic Hermes overflow would emit an ordinary head and
     # then reuse the draft id with a shorter tail, violating replace-prefix.
@@ -3555,6 +3587,7 @@ async def main():
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
     print("qq_c2c_streamed_commentary_single_carrier=ok")
+    print("qq_c2c_consecutive_commentary_single_carrier=ok")
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_native_lane_registry_bounded=ok")
