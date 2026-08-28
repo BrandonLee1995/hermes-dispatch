@@ -457,6 +457,32 @@ async def main():
     assert "stream_msg_id" not in bodies[1]
     assert bodies[2]["stream_msg_id"].startswith("stream-")
 
+    # Draft ids are unique only within one chat at the public adapter seam.
+    # Two private chats may therefore use the same id concurrently without
+    # sharing, rejecting, or replacing each other's native stream state.
+    same_draft_id = DummyAdapter()
+    same_a = await same_draft_id.send_draft(
+        "user-same-draft-a",
+        2003,
+        "A",
+        {"reply_to_message_id": "msg-same-draft-a"},
+    )
+    same_b = await same_draft_id.send_draft(
+        "user-same-draft-b",
+        2003,
+        "B",
+        {"reply_to_message_id": "msg-same-draft-b"},
+    )
+    assert same_a.success and same_b.success
+    assert [call[2]["msg_id"] for call in same_draft_id.api_calls] == [
+        "msg-same-draft-a",
+        "msg-same-draft-b",
+    ]
+    assert [call[2]["content_raw"] for call in same_draft_id.api_calls] == [
+        "A",
+        "B",
+    ]
+
     # Cancelling a turn seals the visible stream instead of leaving it live.
     abandoned = await adapter.abandon_open_draft(
         "user-a",
@@ -554,7 +580,7 @@ async def main():
     assert recovered_fallback.success
     assert not seal_recover.normal_sends
     recover_streams, _recover_anchors = streaming_mod._stream_maps(seal_recover)
-    assert 3103 in recover_streams
+    assert ("user-seal-recover", 3103) in recover_streams
     assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
     closed_after_failure = await seal_recover.abandon_open_draft(
         "user-seal-recover",
@@ -562,7 +588,7 @@ async def main():
         {"reply_to_message_id": "msg-seal-recover"},
     )
     assert closed_after_failure.success
-    assert 3103 not in recover_streams
+    assert ("user-seal-recover", 3103) not in recover_streams
     assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
 
     # Capacity pressure never discards an opened stream. The extra turn stays
@@ -584,7 +610,10 @@ async def main():
         assert extra.success
         assert len(capacity.api_calls) == before_extra
         capacity_streams, _capacity_anchors = streaming_mod._stream_maps(capacity)
-        assert set(capacity_streams) == {3201, 3202}
+        assert set(capacity_streams) == {
+            ("user-cap-a", 3201),
+            ("user-cap-b", 3202),
+        }
         capacity_final = await capacity.send(
             "user-cap-c",
             "C final",
@@ -593,7 +622,10 @@ async def main():
         )
         assert capacity_final.success
         assert capacity.normal_sends[-1][1] == "C final"
-        assert set(capacity_streams) == {3201, 3202}
+        assert set(capacity_streams) == {
+            ("user-cap-a", 3201),
+            ("user-cap-b", 3202),
+        }
         capacity_final_repeat = await capacity.send(
             "user-cap-c",
             "C final",
@@ -611,7 +643,112 @@ async def main():
         await capacity.send_draft(
             "user-cap-c", 3203, "C final", {"reply_to_message_id": "msg-cap-c"}
         )
-        assert 3203 not in capacity_streams
+        assert ("user-cap-c", 3203) not in capacity_streams
+    finally:
+        streaming_mod._MAX_OPEN_STREAMS = previous_capacity
+
+    # Capacity-final-only identities also need a total chat bound. Once the
+    # pending-chat LRU exceeds that bound, the oldest identity may expire, but
+    # the newest pending chat must remain acknowledged without a QQ frame.
+    pending_chat_limit_existed = hasattr(
+        streaming_mod,
+        "_MAX_FINAL_ONLY_PENDING_CHATS",
+    )
+    pending_chat_limit = getattr(
+        streaming_mod,
+        "_MAX_FINAL_ONLY_PENDING_CHATS",
+        None,
+    )
+    previous_capacity = streaming_mod._MAX_OPEN_STREAMS
+    streaming_mod._MAX_FINAL_ONLY_PENDING_CHATS = 2
+    streaming_mod._MAX_OPEN_STREAMS = 1
+    try:
+        bounded_pending_chats = DummyAdapter()
+        await bounded_pending_chats.send_draft(
+            "user-pending-registry-blocker",
+            3210,
+            "blocker",
+            {"reply_to_message_id": "msg-pending-registry-blocker"},
+        )
+        for offset in range(3):
+            await bounded_pending_chats.send_draft(
+                f"user-pending-registry-{offset}",
+                3211 + offset,
+                f"pending {offset}",
+                {"reply_to_message_id": f"msg-pending-registry-{offset}"},
+            )
+        await bounded_pending_chats.abandon_open_draft(
+            "user-pending-registry-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-pending-registry-blocker"},
+        )
+
+        before_oldest_pending = len(bounded_pending_chats.api_calls)
+        await bounded_pending_chats.send_draft(
+            "user-pending-registry-0",
+            3211,
+            "pending 0",
+            {"reply_to_message_id": "msg-pending-registry-0"},
+        )
+        assert len(bounded_pending_chats.api_calls) == before_oldest_pending + 1
+
+        before_newest_pending = len(bounded_pending_chats.api_calls)
+        newest_pending = await bounded_pending_chats.send_draft(
+            "user-pending-registry-2",
+            3213,
+            "pending 2",
+            {"reply_to_message_id": "msg-pending-registry-2"},
+        )
+        assert newest_pending.success
+        assert newest_pending.raw_response["qq_final_only_pending"] is True
+        assert len(bounded_pending_chats.api_calls) == before_newest_pending
+    finally:
+        streaming_mod._MAX_OPEN_STREAMS = previous_capacity
+        if pending_chat_limit_existed:
+            streaming_mod._MAX_FINAL_ONLY_PENDING_CHATS = pending_chat_limit
+        else:
+            del streaming_mod._MAX_FINAL_ONLY_PENDING_CHATS
+
+    # A capacity-degraded turn still has a lifecycle identity. Successful
+    # abandonment must complete that identity so a delayed draft callback
+    # cannot re-arm it after native capacity becomes available again.
+    abandoned_pending = DummyAdapter()
+    previous_capacity = streaming_mod._MAX_OPEN_STREAMS
+    streaming_mod._MAX_OPEN_STREAMS = 1
+    try:
+        await abandoned_pending.send_draft(
+            "user-pending-blocker",
+            3204,
+            "blocker",
+            {"reply_to_message_id": "msg-pending-blocker"},
+        )
+        pending_draft = await abandoned_pending.send_draft(
+            "user-pending-abandon",
+            3205,
+            "pending",
+            {"reply_to_message_id": "msg-pending-abandon"},
+        )
+        assert pending_draft.success
+        pending_abandon = await abandoned_pending.abandon_open_draft(
+            "user-pending-abandon",
+            "pending",
+            {"reply_to_message_id": "msg-pending-abandon"},
+        )
+        assert pending_abandon.success
+        await abandoned_pending.abandon_open_draft(
+            "user-pending-blocker",
+            "blocker",
+            {"reply_to_message_id": "msg-pending-blocker"},
+        )
+        before_late_pending = len(abandoned_pending.api_calls)
+        late_pending = await abandoned_pending.send_draft(
+            "user-pending-abandon",
+            3205,
+            "pending",
+            {"reply_to_message_id": "msg-pending-abandon"},
+        )
+        assert late_pending.success
+        assert len(abandoned_pending.api_calls) == before_late_pending
     finally:
         streaming_mod._MAX_OPEN_STREAMS = previous_capacity
 
@@ -1037,7 +1174,7 @@ async def main():
         final_growth
     )
     assert not final_growth.normal_sends
-    assert 5101 not in final_growth_streams
+    assert ("user-final-growth", 5101) not in final_growth_streams
 
     # A full 4000-character commentary followed by an independent short final
     # must roll into another native message instead of silently dropping the
@@ -1226,7 +1363,7 @@ async def main():
     delayed_close_streams, _delayed_close_anchors = streaming_mod._stream_maps(
         delayed_close
     )
-    assert 5107 in delayed_close_streams
+    assert ("user-delayed-close", 5107) in delayed_close_streams
     assert_exact_final_ownership(delayed_close, delayed_close_target)
     delayed_closed = await delayed_close.abandon_open_draft(
         "user-delayed-close",
@@ -1234,7 +1371,7 @@ async def main():
         delayed_close_metadata,
     )
     assert delayed_closed.success
-    assert 5107 not in delayed_close_streams
+    assert ("user-delayed-close", 5107) not in delayed_close_streams
     assert_exact_final_ownership(delayed_close, delayed_close_target)
 
     # Once an ordinary fallback owns the suffix, late draft frames from the
@@ -1361,8 +1498,11 @@ async def main():
         {"reply_to_message_id": reused_anchor},
     )
     assert reused_draft.success
-    assert 5116 in completed_owner_streams
-    assert completed_owner_streams[5116].reply_to == reused_anchor
+    assert ("user-completed-owner", 5116) in completed_owner_streams
+    assert (
+        completed_owner_streams[("user-completed-owner", 5116)].reply_to
+        == reused_anchor
+    )
 
     # A successful all-native completion also needs a completed-turn owner.
     # Once the seal removes the active state, repeated finals and late frames
@@ -1544,10 +1684,69 @@ async def main():
         bounded_streams, _bounded_anchors = streaming_mod._stream_maps(
             bounded_owners
         )
-        assert first_bounded_draft in bounded_streams
-        assert newest_bounded_draft not in bounded_streams
+        assert ("user-bounded-owner", first_bounded_draft) in bounded_streams
+        assert (
+            "user-bounded-owner",
+            newest_bounded_draft,
+        ) not in bounded_streams
     finally:
         streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+
+    # Per-chat quotas must not leave the outer chat registry unbounded. The
+    # least-recently-used completed chat may expire once the total chat bound
+    # is exceeded, while the newest chat keeps replay protection.
+    completed_chat_limit_existed = hasattr(
+        streaming_mod,
+        "_MAX_COMPLETED_OWNER_CHATS",
+    )
+    completed_chat_limit = getattr(
+        streaming_mod,
+        "_MAX_COMPLETED_OWNER_CHATS",
+        None,
+    )
+    streaming_mod._MAX_COMPLETED_OWNER_CHATS = 2
+    try:
+        bounded_owner_chats = DummyAdapter()
+        for offset in range(3):
+            chat_id = f"user-owner-registry-{offset}"
+            draft_id = 5400 + offset
+            anchor = f"inbound-owner-registry-{offset}"
+            payload = f"owner final {offset}"
+            await bounded_owner_chats.send_draft(
+                chat_id,
+                draft_id,
+                payload,
+                {"reply_to_message_id": anchor},
+            )
+            await bounded_owner_chats.send(
+                chat_id,
+                payload,
+                reply_to=anchor,
+                metadata={"notify": True, "reply_to_message_id": anchor},
+            )
+
+        before_oldest_owner = len(bounded_owner_chats.api_calls)
+        await bounded_owner_chats.send_draft(
+            "user-owner-registry-0",
+            5400,
+            "owner final 0",
+            {"reply_to_message_id": "inbound-owner-registry-0"},
+        )
+        assert len(bounded_owner_chats.api_calls) == before_oldest_owner + 1
+
+        before_newest_owner = len(bounded_owner_chats.api_calls)
+        await bounded_owner_chats.send_draft(
+            "user-owner-registry-2",
+            5402,
+            "owner final 2",
+            {"reply_to_message_id": "inbound-owner-registry-2"},
+        )
+        assert len(bounded_owner_chats.api_calls) == before_newest_owner
+    finally:
+        if completed_chat_limit_existed:
+            streaming_mod._MAX_COMPLETED_OWNER_CHATS = completed_chat_limit
+        else:
+            del streaming_mod._MAX_COMPLETED_OWNER_CHATS
 
     # Capacity is isolated per private chat. Heavy completion traffic in chat
     # B must not evict chat A's replay protection.
@@ -1601,7 +1800,7 @@ async def main():
             cross_chat_owners
         )
         assert not cross_chat_owners.normal_sends
-        assert 5300 not in cross_chat_streams
+        assert ("user-owner-a", 5300) not in cross_chat_streams
     finally:
         streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
 
@@ -1773,11 +1972,12 @@ async def main():
     )
     cancelled_streams, _cancelled_anchors = streaming_mod._stream_maps(cancelled)
     assert not cancelled.normal_sends
-    assert 5001 not in cancelled_streams
+    assert ("user-cancel", 5001) not in cancelled_streams
 
     print("qq_c2c_stream_open_continue_seal=ok")
     print("qq_c2c_stream_seal_preserves_prefix=ok")
     print("qq_c2c_stream_parallel_dm_isolation=ok")
+    print("qq_c2c_same_draft_id_cross_chat_isolation=ok")
     print("qq_c2c_stream_nonfinal_send_isolation=ok")
     print("qq_c2c_streamed_interim_carrier_dedup=ok")
     print("qq_c2c_interim_ownership_boundaries=ok")
@@ -1788,6 +1988,8 @@ async def main():
     print("qq_c2c_stream_safe_final_fallback_close=ok")
     print("qq_c2c_stream_seal_state_retained=ok")
     print("qq_c2c_stream_capacity_preserves_opened=ok")
+    print("qq_c2c_capacity_pending_abandon_replay_dedup=ok")
+    print("qq_c2c_final_only_pending_chat_registry_bounded=ok")
     print("qq_c2c_disabled_typing_unchanged=ok")
     print("qq_c2c_interim_only_runner_stays_disabled=ok")
     print("qq_c2c_prerelease_version_fail_closed=ok")
@@ -1814,6 +2016,7 @@ async def main():
     print("qq_c2c_completed_owner_anchor_isolation=ok")
     print("qq_c2c_completed_owner_bounded=ok")
     print("qq_c2c_completed_owner_cross_chat_isolation=ok")
+    print("qq_c2c_completed_owner_chat_registry_bounded=ok")
     print("qq_c2c_nonterminal_repeated_final=ok")
     print("qq_c2c_terminal_final_single_owner=ok")
     print("qq_c2c_partial_overlap_not_ownership=ok")

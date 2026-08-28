@@ -24,6 +24,24 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.11 makes the public adapter identity boundary explicit. Active
+native streams are keyed by `(chat_id, draft_id)`, so two private chats may use
+the same Hermes draft id concurrently without sharing or rejecting state. A
+capacity-triggered final-only turn that is successfully abandoned now records
+a completed owner before its pending identity is removed, preventing a late
+draft callback from reopening that cancelled turn after capacity is freed.
+
+The completed-owner and final-only-pending registries retain their independent
+256-entry per-chat quotas and now also cap their least-recently-used outer chat
+sets at 1024. Recent activity moves a chat to the end of its own registry; when
+the total-chat bound is exceeded, only the least-recently-used chat bucket in
+that registry expires. This bounds adapter memory while preserving independent
+quotas for recently active conversations. The installer also validates the
+profile-level backup root before it creates an absent active plugin directory,
+so a rejected fresh install leaves no empty `plugins/<name>` artifact. Public
+adapter and installer regressions cover each behavior. Roll back only from the
+exact external backup printed by the installer.
+
 Version 1.8.10 isolates completed-turn ownership per private chat. Each chat has
 its own 256-entry FIFO quota, so high completion volume in one QQ conversation
 cannot evict another conversation's replay protection. Tombstones are now

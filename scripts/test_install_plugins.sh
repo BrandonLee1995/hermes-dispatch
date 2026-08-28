@@ -56,6 +56,10 @@ if "${repo_root}/scripts/install-plugins.sh" \
   exit 1
 fi
 [[ -z "$(find "${fresh_backup_symlink_root}/plugins/escaped-backups" -name plugin.yaml -print -quit)" ]]
+if [[ -e "${fresh_backup_symlink_root}/plugins/${plugin}" ]]; then
+  echo "rejected fresh install unexpectedly changed the active layout" >&2
+  exit 1
+fi
 
 # The active plugin must be a real direct child of the canonical plugin root.
 # Installing through a symlink would mutate an external directory and preserve
@@ -142,6 +146,7 @@ fresh_root="${test_root}/fresh"
 
 echo "plugin_install_external_backup=ok"
 echo "plugin_install_backup_root_symlink_guard=ok"
+echo "plugin_install_rejected_fresh_layout_unchanged=ok"
 echo "plugin_install_active_symlink_guard=ok"
 echo "plugin_restore_active_symlink_guard=ok"
 echo "plugin_install_restore=ok"

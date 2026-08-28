@@ -28,7 +28,9 @@ _OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
 _MAX_COMPLETED_OWNERS_PER_CHAT = 256
+_MAX_COMPLETED_OWNER_CHATS = 1024
 _MAX_FINAL_ONLY_PENDING = 256
+_MAX_FINAL_ONLY_PENDING_CHATS = 1024
 _MAX_TYPING_ANCHORS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
@@ -116,6 +118,12 @@ def _stream_maps(adapter):
     return streams, anchors
 
 
+def _stream_key(chat_id: str, draft_id: int) -> tuple[str, int]:
+    """Return the adapter-contract identity for one active draft."""
+
+    return str(chat_id), int(draft_id)
+
+
 def _completed_owners(
     adapter,
 ) -> Dict[str, Dict[tuple[str, int], _QQC2CCompletedOwner]]:
@@ -136,7 +144,10 @@ def _remember_completed_owner(
     """Retain exact completed-turn ownership without growing indefinitely."""
 
     owners = _completed_owners(adapter)
-    bucket = owners.setdefault(state.chat_id, {})
+    bucket = owners.pop(state.chat_id, None)
+    if bucket is None:
+        bucket = {}
+    owners[state.chat_id] = bucket
     key = (state.reply_to, state.draft_id)
     bucket.pop(key, None)
     bucket[key] = _QQC2CCompletedOwner(
@@ -149,6 +160,8 @@ def _remember_completed_owner(
     )
     while len(bucket) > _MAX_COMPLETED_OWNERS_PER_CHAT:
         bucket.pop(next(iter(bucket)))
+    while len(owners) > _MAX_COMPLETED_OWNER_CHATS:
+        owners.pop(next(iter(owners)))
 
 
 def _completed_owner_for_draft(
@@ -158,8 +171,14 @@ def _completed_owner_for_draft(
     reply_to: str,
     draft_id: int,
 ) -> Optional[_QQC2CCompletedOwner]:
-    bucket = _completed_owners(adapter).get(str(chat_id), {})
-    return bucket.get((str(reply_to), int(draft_id)))
+    owners = _completed_owners(adapter)
+    chat_key = str(chat_id)
+    bucket = owners.get(chat_key, {})
+    owner = bucket.get((str(reply_to), int(draft_id)))
+    if owner is not None:
+        owners.pop(chat_key, None)
+        owners[chat_key] = bucket
+    return owner
 
 
 def _completed_owner_for_final(
@@ -170,13 +189,17 @@ def _completed_owner_for_final(
     content: str,
 ) -> Optional[_QQC2CCompletedOwner]:
     payload = str(content or "")
-    bucket = _completed_owners(adapter).get(str(chat_id), {})
+    owners = _completed_owners(adapter)
+    chat_key = str(chat_id)
+    bucket = owners.get(chat_key, {})
     for owner in reversed(tuple(bucket.values())):
         if (
             owner.chat_id == str(chat_id)
             and owner.reply_to == str(reply_to)
             and payload in (owner.final_payload, owner.final_content)
         ):
+            owners.pop(chat_key, None)
+            owners[chat_key] = bucket
             return owner
     return None
 
@@ -191,12 +214,17 @@ def _final_only_pending(adapter) -> Dict[str, Dict[tuple[str, int], _QQC2CStream
 
 def _remember_final_only_pending(adapter, state: _QQC2CStream) -> None:
     pending = _final_only_pending(adapter)
-    bucket = pending.setdefault(state.chat_id, {})
+    bucket = pending.pop(state.chat_id, None)
+    if bucket is None:
+        bucket = {}
+    pending[state.chat_id] = bucket
     key = (state.reply_to, state.draft_id)
     bucket.pop(key, None)
     bucket[key] = state
     while len(bucket) > _MAX_FINAL_ONLY_PENDING:
         bucket.pop(next(iter(bucket)))
+    while len(pending) > _MAX_FINAL_ONLY_PENDING_CHATS:
+        pending.pop(next(iter(pending)))
 
 
 def _final_only_pending_for_draft(
@@ -206,8 +234,14 @@ def _final_only_pending_for_draft(
     reply_to: str,
     draft_id: int,
 ) -> Optional[_QQC2CStream]:
-    bucket = _final_only_pending(adapter).get(str(chat_id), {})
-    return bucket.get((str(reply_to), int(draft_id)))
+    pending = _final_only_pending(adapter)
+    chat_key = str(chat_id)
+    bucket = pending.get(chat_key, {})
+    state = bucket.get((str(reply_to), int(draft_id)))
+    if state is not None:
+        pending.pop(chat_key, None)
+        pending[chat_key] = bucket
+    return state
 
 
 def _final_only_pending_for_anchor(
@@ -216,9 +250,13 @@ def _final_only_pending_for_anchor(
     chat_id: str,
     reply_to: str,
 ) -> Optional[_QQC2CStream]:
-    bucket = _final_only_pending(adapter).get(str(chat_id), {})
+    pending = _final_only_pending(adapter)
+    chat_key = str(chat_id)
+    bucket = pending.get(chat_key, {})
     for (owner_reply_to, _draft_id), state in reversed(tuple(bucket.items())):
         if owner_reply_to == str(reply_to):
+            pending.pop(chat_key, None)
+            pending[chat_key] = bucket
             return state
     return None
 
@@ -235,9 +273,10 @@ def _remove_final_only_pending(adapter, state: _QQC2CStream) -> None:
 
 def _remove_stream(adapter, state: _QQC2CStream) -> None:
     streams, anchors = _stream_maps(adapter)
-    streams.pop(state.draft_id, None)
+    state_key = _stream_key(state.chat_id, state.draft_id)
+    streams.pop(state_key, None)
     anchor_key = (state.chat_id, state.reply_to)
-    if anchors.get(anchor_key) == state.draft_id:
+    if anchors.get(anchor_key) == state_key:
         anchors.pop(anchor_key, None)
 
 
@@ -669,8 +708,9 @@ async def _post_seal_with_retries(
 
 def _replace_active_stream(adapter, state: _QQC2CStream) -> None:
     streams, anchors = _stream_maps(adapter)
-    streams[state.draft_id] = state
-    anchors[(state.chat_id, state.reply_to)] = state.draft_id
+    state_key = _stream_key(state.chat_id, state.draft_id)
+    streams[state_key] = state
+    anchors[(state.chat_id, state.reply_to)] = state_key
 
 
 async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
@@ -868,7 +908,8 @@ def patch_qq_c2c_streaming(QQAdapter):
             )
 
         streams, anchors = _stream_maps(self)
-        state = streams.get(int(draft_id))
+        state_key = _stream_key(chat_id, int(draft_id))
+        state = streams.get(state_key)
         if state is None:
             completed_owner = _completed_owner_for_draft(
                 self,
@@ -923,10 +964,10 @@ def patch_qq_c2c_streaming(QQAdapter):
                 reply_to=reply_to,
                 msg_seq=int(self._next_msg_seq(reply_to)),
             )
-            streams[state.draft_id] = state
-            anchors[(chat_id, reply_to)] = state.draft_id
+            streams[state_key] = state
+            anchors[(chat_id, reply_to)] = state_key
             _mark_native_lane(self, chat_id)
-        elif state.chat_id != chat_id or state.reply_to != reply_to:
+        elif state.reply_to != reply_to:
             return _send_result(
                 success=False,
                 error="QQ native stream draft identity changed mid-turn",
@@ -984,8 +1025,8 @@ def patch_qq_c2c_streaming(QQAdapter):
     ):
         anchor = _reply_anchor(metadata)
         streams, anchors = _stream_maps(self)
-        draft_id = anchors.get((str(chat_id), anchor))
-        state = streams.get(draft_id) if draft_id is not None else None
+        state_key = anchors.get((str(chat_id), anchor))
+        state = streams.get(state_key) if state_key is not None else None
         if state is None:
             pending_state = _final_only_pending_for_anchor(
                 self,
@@ -993,6 +1034,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                 reply_to=anchor,
             )
             if pending_state is not None:
+                _remember_completed_owner(
+                    self,
+                    pending_state,
+                    final_payload=str(content or ""),
+                    final_content=str(content or ""),
+                )
                 _remove_final_only_pending(self, pending_state)
             return _send_result(success=True)
         if state.ordinary_owned_suffix:
@@ -1061,8 +1108,8 @@ def patch_qq_c2c_streaming(QQAdapter):
                 or ""
             ).strip()
             streams, anchors = _stream_maps(self)
-            draft_id = anchors.get((str(chat_id), anchor))
-            state = streams.get(draft_id) if draft_id is not None else None
+            state_key = anchors.get((str(chat_id), anchor))
+            state = streams.get(state_key) if state_key is not None else None
             if state is None and not anchor:
                 # GatewayStreamConsumer._send_commentary currently omits its
                 # initial_reply_to_id from metadata. Recover only when content
@@ -1118,8 +1165,8 @@ def patch_qq_c2c_streaming(QQAdapter):
                 or ""
             ).strip()
             streams, anchors = _stream_maps(self)
-            draft_id = anchors.get((str(chat_id), anchor))
-            state = streams.get(draft_id) if draft_id is not None else None
+            state_key = anchors.get((str(chat_id), anchor))
+            state = streams.get(state_key) if state_key is not None else None
             if state is None:
                 completed_owner = _completed_owner_for_final(
                     self,
@@ -1222,7 +1269,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                     # from the latest acknowledged state, never the stale
                     # object captured before rollover.
                     latest_streams, _latest_anchors = _stream_maps(self)
-                    latest_state = latest_streams.get(draft_id)
+                    latest_state = latest_streams.get(state_key)
                     if latest_state is not None:
                         state = latest_state
 

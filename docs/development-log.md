@@ -1,5 +1,40 @@
 # Development Log
 
+## 2026-08-28 — Scope active streams and bound chat registries
+
+### Problem
+
+Version 1.8.10 keyed active native streams by draft id alone even though the
+public adapter contract only requires draft ids to be unique within one chat.
+Two private chats using the same id therefore collided. A capacity-final-only
+turn also lost its identity when abandonment removed pending state, allowing a
+late callback to re-arm the cancelled turn. Finally, per-chat inner quotas did
+not bound the number of retained chat buckets, and a rejected fresh install
+could create an empty active plugin directory before detecting an invalid
+backup-root symlink.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.11.
+- Keyed every active stream and anchor reference by `(chat_id, draft_id)` and
+  added a same-id/two-chat public adapter regression.
+- Recorded a completed owner before removing a successfully abandoned
+  capacity-final-only pending identity.
+- Added 1024-chat least-recently-used bounds to the completed-owner and
+  final-only-pending registries while preserving each chat's 256-entry quota.
+- Moved canonical backup-root validation ahead of active-target creation and
+  made the rejected-fresh-install regression explicitly fail on any artifact.
+
+### Verify and roll back
+
+Run `scripts/test_install_plugins.sh`, the complete QQ streaming lifecycle test,
+the five QQ regressions against Hermes 0.20.0 and 0.20.5, and the offline
+plugin/MCP matrix. Verify same-id private chats produce two independent native
+frames, abandoned pending turns produce no late frame, recent chat buckets
+retain ownership across LRU eviction, and rejected fresh installs leave no
+active directory. Restore only an exact installer-created external backup and
+restart only the affected profile after verification.
+
 ## 2026-08-28 — Isolate completed owners and harden plugin paths
 
 ### Problem

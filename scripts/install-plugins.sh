@@ -17,16 +17,18 @@ plugin_version() {
   printf '%s\n' "$version"
 }
 
-backup_existing_plugin() {
+validate_backup_root() {
   local data_root="$1"
-  local plugin="$2"
-  local active_dir="$3"
-  local existing_version backup_root plugin_root timestamp backup_dir suffix
+  local backup_root="${data_root}/plugin-backups"
+  local plugin_root
 
-  backup_root="${data_root}/plugin-backups"
   if [[ -L "$backup_root" ]]; then
     echo "plugin backup root must not be a symlink: ${backup_root}" >&2
-    exit 2
+    return 2
+  fi
+  if [[ -e "$backup_root" && ! -d "$backup_root" ]]; then
+    echo "plugin backup root must be a directory: ${backup_root}" >&2
+    return 2
   fi
   plugin_root="$(cd -- "${data_root}/plugins" && pwd -P)"
   if [[ -d "$backup_root" ]]; then
@@ -34,10 +36,20 @@ backup_existing_plugin() {
     case "${backup_root}/" in
       "${plugin_root}/"*)
         echo "plugin backup root must be outside discovery root: ${plugin_root}" >&2
-        exit 2
+        return 2
         ;;
     esac
   fi
+}
+
+backup_existing_plugin() {
+  local data_root="$1"
+  local plugin="$2"
+  local active_dir="$3"
+  local existing_version backup_root timestamp backup_dir suffix
+
+  backup_root="${data_root}/plugin-backups"
+  validate_backup_root "$data_root"
 
   if [[ ! -d "$active_dir" ]] || [[ -z "$(find "$active_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     return
@@ -45,13 +57,8 @@ backup_existing_plugin() {
 
   existing_version="$(plugin_version "$active_dir")"
   mkdir -p "$backup_root"
+  validate_backup_root "$data_root"
   backup_root="$(cd -- "$backup_root" && pwd -P)"
-  case "${backup_root}/" in
-    "${plugin_root}/"*)
-      echo "plugin backup root must be outside discovery root: ${plugin_root}" >&2
-      exit 2
-      ;;
-  esac
   timestamp="$(date -u +%Y%m%d-%H%M%S)"
   backup_dir="${backup_root}/${plugin}-${existing_version}-${timestamp}"
   suffix=1
@@ -128,6 +135,7 @@ if [[ "${1:-}" == "--restore" ]]; then
     exit 2
   fi
 
+  validate_backup_root "$target_root"
   target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"
   backup_existing_plugin "$target_root" "$plugin" "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -161,6 +169,7 @@ for plugin in "${plugins[@]}"; do
   fi
 done
 
+validate_backup_root "$target_root"
 for plugin in "${plugins[@]}"; do
   source_dir="${repo_root}/plugins/${plugin}"
   target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"

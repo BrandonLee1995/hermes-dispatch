@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.10 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.11 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.10 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.11 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -211,6 +211,10 @@ hermes config check
   streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
   native lane；同一 Gateway 进程的下一轮配置解析还会撤销旧 lane，并保留 Hermes 原始
   typing 和 final-only 行为。已打开的 stream 仍保留到封口或取消。
+- 活动 stream 以 `(chat_id, draft_id)` 为身份，两个私聊可安全复用相同 draft id。
+  completed-owner 与 final-only-pending 各保留每 chat 256 条，并按最近使用顺序限制为
+  1024 个 chat；capacity-final-only 被成功 abandon 后也会保留 completed tombstone，避免
+  释放容量后被 late frame 重新激活。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -368,6 +372,7 @@ scripts/install-plugins.sh --restore \
 恢复后只重启目标 profile，并重新检查插件版本和 QQ `Ready`。
 安装和恢复都会拒绝符号链接形式的 `plugin-backups` 或活动插件目录，并要求活动插件的
 canonical 路径是 canonical `plugins` 根的直接子目录；`.` 和 `..` 不是合法插件名。
+备份根验证先于缺失活动目录的创建，因此 fresh install 被拒绝时不会留下空插件目录。
 出现任一拒绝时，不得手工绕过检查，应先修复 profile 的目录布局。
 
 启用插件和消息检索工具集：
