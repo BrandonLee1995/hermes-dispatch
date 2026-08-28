@@ -749,6 +749,32 @@ async def main():
         )
         assert late_pending.success
         assert len(abandoned_pending.api_calls) == before_late_pending
+        delivered_after_abandon = await abandoned_pending.send(
+            "user-pending-abandon",
+            "pending",
+            reply_to="msg-pending-abandon",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-pending-abandon",
+            },
+        )
+        assert delivered_after_abandon.success
+        assert [item[1] for item in abandoned_pending.normal_sends] == [
+            "pending"
+        ]
+        repeated_after_abandon = await abandoned_pending.send(
+            "user-pending-abandon",
+            "pending",
+            reply_to="msg-pending-abandon",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-pending-abandon",
+            },
+        )
+        assert repeated_after_abandon.success
+        assert [item[1] for item in abandoned_pending.normal_sends] == [
+            "pending"
+        ]
     finally:
         streaming_mod._MAX_OPEN_STREAMS = previous_capacity
 
@@ -999,6 +1025,69 @@ async def main():
             {"reply_to_message_id": "toggle-open-msg"},
         )
         assert closed_toggle.success
+
+        # Lane selection is an LRU registry, not an adapter-lifetime history.
+        # It may retain a currently open stream past the nominal bound, but
+        # must evict inactive chats and converge after that stream closes.
+        previous_lane_limit = getattr(
+            streaming_mod,
+            "_MAX_NATIVE_LANE_CHATS",
+            1024,
+        )
+        streaming_mod._MAX_NATIVE_LANE_CHATS = 2
+        try:
+            gateway_run._load_gateway_config = lambda: {
+                "display": {"platforms": {"qqbot": {"streaming": True}}}
+            }
+            lane_adapter = GatewayDummyAdapter()
+            for lane_chat in ("lane-active", "lane-idle-1", "lane-idle-2"):
+                runner._build_stream_consumer_config(
+                    SimpleNamespace(
+                        platform=Platform.QQBOT,
+                        chat_id=lane_chat,
+                        chat_type="dm",
+                    ),
+                    StreamingConfig(enabled=True, transport="auto"),
+                    lane_adapter,
+                    on_missing_cursor="raise",
+                )
+                if lane_chat == "lane-active":
+                    opened_lane = await lane_adapter.send_draft(
+                        lane_chat,
+                        3451,
+                        "处理中",
+                        {"reply_to_message_id": "lane-active-msg"},
+                    )
+                    assert opened_lane.success
+            lane_chats = streaming_mod._native_lane_chats(lane_adapter)
+            assert len(lane_chats) == 2
+            assert "lane-active" in lane_chats
+            assert "lane-idle-2" in lane_chats
+            assert "lane-idle-1" not in lane_chats
+
+            closed_lane = await lane_adapter.abandon_open_draft(
+                "lane-active",
+                "处理中",
+                {"reply_to_message_id": "lane-active-msg"},
+            )
+            assert closed_lane.success
+            runner._build_stream_consumer_config(
+                SimpleNamespace(
+                    platform=Platform.QQBOT,
+                    chat_id="lane-idle-3",
+                    chat_type="dm",
+                ),
+                StreamingConfig(enabled=True, transport="auto"),
+                lane_adapter,
+                on_missing_cursor="raise",
+            )
+            lane_chats = streaming_mod._native_lane_chats(lane_adapter)
+            assert len(lane_chats) == 2
+            assert "lane-active" not in lane_chats
+            assert "lane-idle-2" in lane_chats
+            assert "lane-idle-3" in lane_chats
+        finally:
+            streaming_mod._MAX_NATIVE_LANE_CHATS = previous_lane_limit
 
         disabled_gate_adapter._last_msg_id["user-interim-only"] = "typing-off"
         await disabled_gate_adapter.send_typing("user-interim-only")
@@ -1999,6 +2088,7 @@ async def main():
     print("qq_c2c_streamed_commentary_single_carrier=ok")
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
+    print("qq_c2c_native_lane_registry_bounded=ok")
     print("qq_c2c_overflow_rollover=ok")
     print("qq_c2c_final_first_overflow_rollover=ok")
     print("qq_c2c_independent_final_full_rollover=ok")

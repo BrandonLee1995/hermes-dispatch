@@ -1,5 +1,39 @@
 # Development Log
 
+## 2026-08-28 — Separate cancellation ownership and preflight complete updates
+
+### Problem
+
+The capacity-abandon path recorded invisible content as completed delivery, so
+a later ordinary turn-final with the same anchor and content could be
+suppressed even though QQ had never received it. Multi-plugin installation
+validated and replaced one target at a time, allowing an invalid later target
+to leave an earlier plugin already updated. Native-lane membership also used an
+adapter-lifetime set with no chat-count bound.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.12.
+- Split cancelled and delivered completed-owner semantics. Cancellation still
+  blocks a late draft; a successful later ordinary final promotes the record
+  to delivered ownership and only then suppresses final replays.
+- Changed native-lane membership to a 1024-chat LRU that evicts inactive chats,
+  protects open streams, converges after close, and preserves live config
+  disable behavior.
+- Split plugin installation into a complete target-preflight pass and a later
+  mutation pass. A two-plugin regression compares the first active directory
+  recursively and verifies that no backup exists when the second target fails.
+
+### Verify and roll back
+
+Run `plugins/qqbot-connect-hotfix/test_streaming.py` and
+`scripts/test_install_plugins.sh`, then run the complete offline plugin/MCP and
+Hermes 0.20.0/0.20.5 QQ matrices. Verify capacity abandonment produces one
+ordinary final and suppresses only its replay, lane membership stays bounded
+without evicting an open stream, and an invalid second install target leaves
+the first untouched. Restore only an exact installer-created external backup
+and restart only the affected profile after verification.
+
 ## 2026-08-28 — Scope active streams and bound chat registries
 
 ### Problem

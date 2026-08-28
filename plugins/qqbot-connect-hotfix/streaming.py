@@ -31,6 +31,7 @@ _MAX_COMPLETED_OWNERS_PER_CHAT = 256
 _MAX_COMPLETED_OWNER_CHATS = 1024
 _MAX_FINAL_ONLY_PENDING = 256
 _MAX_FINAL_ONLY_PENDING_CHATS = 1024
+_MAX_NATIVE_LANE_CHATS = 1024
 _MAX_TYPING_ANCHORS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
@@ -95,8 +96,8 @@ class _QQC2CStream:
 
 
 @dataclass(frozen=True)
-class _QQC2CCompletedOwner:
-    """Bounded ownership evidence for a turn removed from the active maps."""
+class _QQC2CTurnTombstone:
+    """Bounded lifecycle evidence for a turn removed from the active maps."""
 
     chat_id: str
     draft_id: int
@@ -104,6 +105,7 @@ class _QQC2CCompletedOwner:
     final_payload: str
     final_content: str
     message_id: Optional[str] = None
+    final_delivered: bool = True
 
 
 def _stream_maps(adapter):
@@ -124,9 +126,9 @@ def _stream_key(chat_id: str, draft_id: int) -> tuple[str, int]:
     return str(chat_id), int(draft_id)
 
 
-def _completed_owners(
+def _turn_tombstones(
     adapter,
-) -> Dict[str, Dict[tuple[str, int], _QQC2CCompletedOwner]]:
+) -> Dict[str, Dict[tuple[str, int], _QQC2CTurnTombstone]]:
     owners = getattr(adapter, "_qq_native_c2c_completed_owners", None)
     if owners is None:
         owners = {}
@@ -134,29 +136,31 @@ def _completed_owners(
     return owners
 
 
-def _remember_completed_owner(
+def _remember_turn_tombstone(
     adapter,
     state: _QQC2CStream,
     *,
     final_payload: str,
     final_content: str,
+    final_delivered: bool = True,
 ) -> None:
-    """Retain exact completed-turn ownership without growing indefinitely."""
+    """Retain exact turn lifecycle evidence without growing indefinitely."""
 
-    owners = _completed_owners(adapter)
+    owners = _turn_tombstones(adapter)
     bucket = owners.pop(state.chat_id, None)
     if bucket is None:
         bucket = {}
     owners[state.chat_id] = bucket
     key = (state.reply_to, state.draft_id)
     bucket.pop(key, None)
-    bucket[key] = _QQC2CCompletedOwner(
+    bucket[key] = _QQC2CTurnTombstone(
         chat_id=state.chat_id,
         draft_id=state.draft_id,
         reply_to=state.reply_to,
         final_payload=str(final_payload or ""),
         final_content=str(final_content or ""),
         message_id=state.stream_msg_id or state.last_completed_stream_id,
+        final_delivered=final_delivered,
     )
     while len(bucket) > _MAX_COMPLETED_OWNERS_PER_CHAT:
         bucket.pop(next(iter(bucket)))
@@ -170,8 +174,8 @@ def _completed_owner_for_draft(
     chat_id: str,
     reply_to: str,
     draft_id: int,
-) -> Optional[_QQC2CCompletedOwner]:
-    owners = _completed_owners(adapter)
+) -> Optional[_QQC2CTurnTombstone]:
+    owners = _turn_tombstones(adapter)
     chat_key = str(chat_id)
     bucket = owners.get(chat_key, {})
     owner = bucket.get((str(reply_to), int(draft_id)))
@@ -187,14 +191,15 @@ def _completed_owner_for_final(
     chat_id: str,
     reply_to: str,
     content: str,
-) -> Optional[_QQC2CCompletedOwner]:
+) -> Optional[_QQC2CTurnTombstone]:
     payload = str(content or "")
-    owners = _completed_owners(adapter)
+    owners = _turn_tombstones(adapter)
     chat_key = str(chat_id)
     bucket = owners.get(chat_key, {})
     for owner in reversed(tuple(bucket.values())):
         if (
-            owner.chat_id == str(chat_id)
+            owner.final_delivered
+            and owner.chat_id == str(chat_id)
             and owner.reply_to == str(reply_to)
             and payload in (owner.final_payload, owner.final_content)
         ):
@@ -202,6 +207,57 @@ def _completed_owner_for_final(
             owners[chat_key] = bucket
             return owner
     return None
+
+
+def _cancelled_owner_for_anchor(
+    adapter,
+    *,
+    chat_id: str,
+    reply_to: str,
+) -> Optional[_QQC2CTurnTombstone]:
+    """Return cancellation evidence that still needs one visible final."""
+
+    owners = _turn_tombstones(adapter)
+    chat_key = str(chat_id)
+    bucket = owners.get(chat_key, {})
+    for owner in reversed(tuple(bucket.values())):
+        if (
+            not owner.final_delivered
+            and owner.chat_id == chat_key
+            and owner.reply_to == str(reply_to)
+        ):
+            owners.pop(chat_key, None)
+            owners[chat_key] = bucket
+            return owner
+    return None
+
+
+def _promote_cancelled_owner(
+    adapter,
+    owner: _QQC2CTurnTombstone,
+    *,
+    final_content: str,
+    message_id: Optional[str],
+) -> None:
+    """Record that a formerly cancelled turn now owns one delivered final."""
+
+    owners = _turn_tombstones(adapter)
+    bucket = owners.get(owner.chat_id, {})
+    key = (owner.reply_to, owner.draft_id)
+    if bucket.get(key) != owner:
+        return
+    payload = str(final_content or "")
+    bucket[key] = _QQC2CTurnTombstone(
+        chat_id=owner.chat_id,
+        draft_id=owner.draft_id,
+        reply_to=owner.reply_to,
+        final_payload=payload,
+        final_content=payload,
+        message_id=message_id,
+        final_delivered=True,
+    )
+    owners.pop(owner.chat_id, None)
+    owners[owner.chat_id] = bucket
 
 
 def _final_only_pending(adapter) -> Dict[str, Dict[tuple[str, int], _QQC2CStream]]:
@@ -278,6 +334,7 @@ def _remove_stream(adapter, state: _QQC2CStream) -> None:
     anchor_key = (state.chat_id, state.reply_to)
     if anchors.get(anchor_key) == state_key:
         anchors.pop(anchor_key, None)
+    _prune_native_lane_chats(adapter)
 
 
 def _evict_unopened_streams(adapter, *, limit: int) -> None:
@@ -308,22 +365,54 @@ def _evict_unopened_streams(adapter, *, limit: int) -> None:
             anchors.pop(anchor_key, None)
 
 
-def _native_lane_chats(adapter) -> set[str]:
+def _native_lane_chats(adapter) -> Dict[str, None]:
     chats = getattr(adapter, "_qq_native_c2c_lane_chats", None)
     if chats is None:
-        chats = set()
+        chats = {}
         adapter._qq_native_c2c_lane_chats = chats
+    elif isinstance(chats, set):
+        # Accept an adapter created by an older in-process patch while
+        # upgrading the lifetime-wide set to the bounded LRU representation.
+        chats = dict.fromkeys(str(chat_id) for chat_id in chats)
+        adapter._qq_native_c2c_lane_chats = chats
+    _prune_native_lane_chats(adapter, chats)
     return chats
+
+
+def _prune_native_lane_chats(
+    adapter,
+    chats: Optional[Dict[str, None]] = None,
+) -> None:
+    if chats is None:
+        chats = _native_lane_chats(adapter)
+    streams, _anchors = _stream_maps(adapter)
+    active_chats = {state.chat_id for state in streams.values()}
+    while len(chats) > max(0, _MAX_NATIVE_LANE_CHATS):
+        removable = next(
+            (chat_id for chat_id in chats if chat_id not in active_chats),
+            None,
+        )
+        if removable is None:
+            # Open native streams must stay selectable until sealed. The
+            # registry converges as soon as one is removed.
+            break
+        chats.pop(removable, None)
 
 
 def _mark_native_lane(adapter, chat_id: str) -> None:
     if chat_id:
-        _native_lane_chats(adapter).add(str(chat_id))
+        chats = _native_lane_chats(adapter)
+        chat_key = str(chat_id)
+        chats.pop(chat_key, None)
+        chats[chat_key] = None
+        _prune_native_lane_chats(adapter, chats)
 
 
 def _unmark_native_lane(adapter, chat_id: str) -> None:
     if chat_id:
-        _native_lane_chats(adapter).discard(str(chat_id))
+        chats = _native_lane_chats(adapter)
+        chats.pop(str(chat_id), None)
+        _prune_native_lane_chats(adapter, chats)
 
 
 def _typing_budget_applies(adapter, chat_id: str) -> bool:
@@ -1034,11 +1123,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                 reply_to=anchor,
             )
             if pending_state is not None:
-                _remember_completed_owner(
+                _remember_turn_tombstone(
                     self,
                     pending_state,
                     final_payload=str(content or ""),
                     final_content=str(content or ""),
+                    final_delivered=False,
                 )
                 _remove_final_only_pending(self, pending_state)
             return _send_result(success=True)
@@ -1060,7 +1150,7 @@ def patch_qq_c2c_streaming(QQAdapter):
         )
         if not state.stream_msg_id and state.committed_prefix and not active_content:
             completed_id = state.last_completed_stream_id
-            _remember_completed_owner(
+            _remember_turn_tombstone(
                 self,
                 state,
                 final_payload=str(content or ""),
@@ -1074,7 +1164,7 @@ def patch_qq_c2c_streaming(QQAdapter):
             active_content or state.last_content,
         )
         if sealed.success:
-            _remember_completed_owner(
+            _remember_turn_tombstone(
                 self,
                 state,
                 final_payload=str(content or ""),
@@ -1180,6 +1270,31 @@ def patch_qq_c2c_streaming(QQAdapter):
                         message_id=completed_owner.message_id,
                         raw_response={"qq_completed_turn_owned": True},
                     )
+                cancelled_owner = _cancelled_owner_for_anchor(
+                    self,
+                    chat_id=str(chat_id),
+                    reply_to=anchor,
+                )
+                if cancelled_owner is not None:
+                    normal_result = await original_send(
+                        self,
+                        chat_id,
+                        content,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    if getattr(normal_result, "success", False):
+                        _promote_cancelled_owner(
+                            self,
+                            cancelled_owner,
+                            final_content=str(content or ""),
+                            message_id=getattr(
+                                normal_result,
+                                "message_id",
+                                None,
+                            ),
+                        )
+                    return normal_result
                 pending_state = _final_only_pending_for_anchor(
                     self,
                     chat_id=str(chat_id),
@@ -1194,7 +1309,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                         metadata=metadata,
                     )
                     if getattr(normal_result, "success", False):
-                        _remember_completed_owner(
+                        _remember_turn_tombstone(
                             self,
                             pending_state,
                             final_payload=str(content or ""),
@@ -1233,7 +1348,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                         metadata=metadata,
                     )
                     if getattr(normal_result, "success", False):
-                        _remember_completed_owner(
+                        _remember_turn_tombstone(
                             self,
                             state,
                             final_payload=str(content or ""),
@@ -1299,7 +1414,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                         metadata=metadata,
                     )
                     if getattr(normal_result, "success", False):
-                        _remember_completed_owner(
+                        _remember_turn_tombstone(
                             self,
                             state,
                             final_payload=str(content or ""),
@@ -1327,7 +1442,7 @@ def patch_qq_c2c_streaming(QQAdapter):
 
                 if not state.stream_msg_id and state.committed_prefix == target:
                     completed_id = state.last_completed_stream_id
-                    _remember_completed_owner(
+                    _remember_turn_tombstone(
                         self,
                         state,
                         final_payload=str(content or ""),
@@ -1339,7 +1454,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                 if not state.stream_msg_id:
                     # No visible active stream and no unseen suffix is only
                     # possible for an empty final. Clear the placeholder.
-                    _remember_completed_owner(
+                    _remember_turn_tombstone(
                         self,
                         state,
                         final_payload=str(content or ""),
@@ -1353,7 +1468,7 @@ def patch_qq_c2c_streaming(QQAdapter):
 
                 sealed = await _seal_stream(self, state, state.last_content)
                 if sealed.success:
-                    _remember_completed_owner(
+                    _remember_turn_tombstone(
                         self,
                         state,
                         final_payload=str(content or ""),
@@ -1368,7 +1483,7 @@ def patch_qq_c2c_streaming(QQAdapter):
                 # has exactly one visible owner.
                 recovery = await _seal_stream(self, state, state.last_content)
                 if recovery.success:
-                    _remember_completed_owner(
+                    _remember_turn_tombstone(
                         self,
                         state,
                         final_payload=str(content or ""),

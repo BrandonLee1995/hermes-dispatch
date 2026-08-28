@@ -73,8 +73,9 @@ Backups stay outside the recursive `plugins` discovery tree. See
 [`docs/operations.md`](docs/operations.md) for verification and rollback.
 The installer rejects symbolic-link backup roots/active plugin targets,
 non-direct canonical targets, and dot path components before it changes active
-data. Backup-root rejection on a fresh install also occurs before the active
-plugin directory is created.
+data. For a multi-plugin invocation it preflights every requested active target
+before it creates, backs up, clears, or copies any plugin. Backup-root rejection
+on a fresh install also occurs before the active plugin directory is created.
 
 Then enable the required plugins from inside the Hermes container or host
 runtime:

@@ -144,6 +144,28 @@ fresh_root="${test_root}/fresh"
 "${repo_root}/scripts/install-plugins.sh" "$fresh_root" "$plugin"
 [[ ! -e "${fresh_root}/plugin-backups" ]]
 
+# Every requested active target must pass validation before the installer
+# backs up or replaces any earlier plugin in the same invocation.
+multi_root="${test_root}/multi-preflight"
+multi_first="${multi_root}/plugins/qqbot-connect-hotfix"
+multi_expected="${test_root}/multi-preflight-expected"
+multi_external="${test_root}/multi-preflight-external"
+mkdir -p "$multi_first" "$multi_expected" "$multi_external"
+printf '%s\n' 'name: qqbot-connect-hotfix' 'version: 1.8.7' > \
+  "${multi_first}/plugin.yaml"
+printf '%s\n' 'keep-first' > "${multi_first}/marker.txt"
+printf '%s\n' 'keep-hidden' > "${multi_first}/.hidden-marker"
+cp -R "${multi_first}/." "$multi_expected/"
+ln -s "$multi_external" \
+  "${multi_root}/plugins/message-snapshot-store"
+if "${repo_root}/scripts/install-plugins.sh" "$multi_root" \
+  qqbot-connect-hotfix message-snapshot-store; then
+  echo "multi-plugin install unexpectedly accepted an invalid later target" >&2
+  exit 1
+fi
+diff -r "$multi_expected" "$multi_first"
+[[ ! -e "${multi_root}/plugin-backups" ]]
+
 echo "plugin_install_external_backup=ok"
 echo "plugin_install_backup_root_symlink_guard=ok"
 echo "plugin_install_rejected_fresh_layout_unchanged=ok"
@@ -153,3 +175,4 @@ echo "plugin_install_restore=ok"
 echo "plugin_install_restore_discovery_guard=ok"
 echo "plugin_restore_dot_component_guard=ok"
 echo "plugin_install_fresh_no_empty_backup=ok"
+echo "plugin_install_all_targets_preflight=ok"

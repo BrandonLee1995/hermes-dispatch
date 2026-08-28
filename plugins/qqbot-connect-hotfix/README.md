@@ -24,6 +24,26 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.12 separates cancellation evidence from successful final delivery.
+When a capacity-triggered final-only turn is abandoned, its cancellation
+tombstone still suppresses a stale `send_draft`, but it is not eligible to
+suppress a later normal turn-final send. The first successful normal final
+promotes that record to delivered ownership, so any repeated final is then
+acknowledged without another QQ message.
+
+Native-lane membership is now a 1024-chat least-recently-used registry instead
+of an adapter-lifetime set. Inactive chats expire first; a chat with an open
+native stream remains protected until the stream is sealed or abandoned, and a
+live streaming disable still revokes that chat immediately. The installer now
+preflights every requested plugin's canonical active target before any plugin
+is created, backed up, cleared, or copied. A two-plugin regression proves that
+an invalid second target leaves the first directory, including hidden files,
+unchanged and creates no backup. Install with `scripts/install-plugins.sh`, run
+the complete Python command in the Verification section plus
+`scripts/test_install_plugins.sh`, then restart only the affected profile. Roll
+back only from the exact external backup printed by a successful earlier
+install.
+
 Version 1.8.11 makes the public adapter identity boundary explicit. Active
 native streams are keyed by `(chat_id, draft_id)`, so two private chats may use
 the same Hermes draft id concurrently without sharing or rejecting state. A

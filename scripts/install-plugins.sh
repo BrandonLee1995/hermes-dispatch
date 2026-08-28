@@ -93,8 +93,11 @@ canonical_active_plugin_dir() {
     echo "active plugin target must be a directory: ${target_dir}" >&2
     return 2
   fi
-  mkdir -p "$target_dir"
-  resolved_target="$(cd -- "$target_dir" && pwd -P)"
+  if [[ -d "$target_dir" ]]; then
+    resolved_target="$(cd -- "$target_dir" && pwd -P)"
+  else
+    resolved_target="$target_dir"
+  fi
   if [[ "$resolved_target" != "${plugin_root}/${plugin}" ]]; then
     echo "active plugin target must be a direct child of ${plugin_root}" >&2
     return 2
@@ -137,6 +140,7 @@ if [[ "${1:-}" == "--restore" ]]; then
 
   validate_backup_root "$target_root"
   target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"
+  mkdir -p "$target_dir"
   backup_existing_plugin "$target_root" "$plugin" "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   cp -R "${backup_dir}/." "$target_dir/"
@@ -170,9 +174,16 @@ for plugin in "${plugins[@]}"; do
 done
 
 validate_backup_root "$target_root"
+target_dirs=()
 for plugin in "${plugins[@]}"; do
+  target_dirs+=("$(canonical_active_plugin_dir "$target_plugins" "$plugin")")
+done
+
+for ((index = 0; index < ${#plugins[@]}; index++)); do
+  plugin="${plugins[$index]}"
   source_dir="${repo_root}/plugins/${plugin}"
-  target_dir="$(canonical_active_plugin_dir "$target_plugins" "$plugin")"
+  target_dir="${target_dirs[$index]}"
+  mkdir -p "$target_dir"
   backup_existing_plugin "$target_root" "$plugin" "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   cp -R "${source_dir}/." "$target_dir/"

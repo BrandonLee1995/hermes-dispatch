@@ -22,10 +22,13 @@ The backup root and active plugin directory must be real directories, not
 symbolic links. The installer resolves canonical paths and requires the active
 target to be exactly one direct child below the canonical `plugins` root; it
 also rejects `.` and `..` as plugin names. These checks run before backup,
-clear, or copy operations. Backup-root validation also runs before an absent
-active plugin directory is created, so a rejected fresh install leaves no
-empty plugin artifact. Fix a rejected profile layout instead of bypassing the
-guard.
+clear, or copy operations. When several plugins are requested, the installer
+preflights and retains every canonical active target before mutating the first;
+if a later target is invalid, all earlier active plugin directories remain
+byte-for-byte unchanged and no backup is created. Backup-root validation also
+runs before an absent active plugin directory is created, so a rejected fresh
+install leaves no empty plugin artifact. Fix a rejected profile layout instead
+of bypassing the guard.
 
 To restore an exact installer-created copy:
 
