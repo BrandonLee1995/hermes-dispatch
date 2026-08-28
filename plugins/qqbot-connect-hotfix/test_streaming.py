@@ -1136,6 +1136,312 @@ async def main():
             == 0
         )
 
+        # Hermes cancellation cleanup can race a shielded final attempt. The
+        # abandon path must join the same anchor transaction; otherwise it can
+        # seal the complete native final while the already-started ordinary
+        # unseen-suffix request is still blocked, creating two visible owners.
+        abandon_race = DummyAdapter()
+        abandon_race_anchor = "msg-abandon-final-race"
+        abandon_race_target = "progress\nFINAL"
+        await abandon_race.send_draft(
+            "user-abandon-final-race",
+            3255,
+            "progress",
+            {"reply_to_message_id": abandon_race_anchor},
+        )
+        abandon_race.fail_next_stream = True
+        abandon_race.normal_send_entered = anyio.Event()
+        abandon_race.normal_send_release = anyio.Event()
+        abandon_race_results = {}
+
+        async def send_abandon_race_final():
+            abandon_race_results["final"] = await abandon_race.send(
+                "user-abandon-final-race",
+                "FINAL",
+                reply_to=abandon_race_anchor,
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": abandon_race_anchor,
+                },
+            )
+
+        async def abandon_racing_final():
+            abandon_race_results["abandon"] = (
+                await abandon_race.abandon_open_draft(
+                    "user-abandon-final-race",
+                    abandon_race_target,
+                    {"reply_to_message_id": abandon_race_anchor},
+                )
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_abandon_race_final)
+            await abandon_race.normal_send_entered.wait()
+            calls_before_abandon = len(abandon_race.api_calls)
+            task_group.start_soon(abandon_racing_final)
+            await anyio.sleep(0)
+            await anyio.sleep(0)
+            calls_while_final_blocked = len(abandon_race.api_calls)
+            abandon_race.normal_send_release.set()
+
+        assert calls_while_final_blocked == calls_before_abandon
+        assert abandon_race_results["final"].success
+        assert abandon_race_results["abandon"].success
+        assert [item[1] for item in abandon_race.normal_sends] == ["\nFINAL"]
+        assert_exact_final_ownership(abandon_race, abandon_race_target)
+
+        # The reverse order is also one lifecycle transaction. Cancellation
+        # may seal the complete cumulative target before the short notify=True
+        # callback enters the broker. Once that native seal succeeds, the
+        # terminal payload already has a visible owner and must not be sent as
+        # a second ordinary bubble.
+        abandon_first = DummyAdapter()
+        abandon_first_chat = "user-abandon-first"
+        abandon_first_anchor = "msg-abandon-first"
+        abandon_first_target = "progress\nFINAL"
+        await abandon_first.send_draft(
+            abandon_first_chat,
+            3256,
+            "progress",
+            {"reply_to_message_id": abandon_first_anchor},
+        )
+        seal_entered = anyio.Event()
+        seal_release = anyio.Event()
+        base_api_request = abandon_first._api_request
+
+        async def gated_seal_request(method, path, body):
+            if (
+                body["input_state"] == 10
+                and body["content_raw"] == abandon_first_target
+            ):
+                seal_entered.set()
+                await seal_release.wait()
+            return await base_api_request(method, path, body)
+
+        abandon_first._api_request = gated_seal_request
+        abandon_first_results = {}
+
+        async def abandon_before_final():
+            abandon_first_results["abandon"] = (
+                await abandon_first.abandon_open_draft(
+                    abandon_first_chat,
+                    abandon_first_target,
+                    {"reply_to_message_id": abandon_first_anchor},
+                )
+            )
+
+        async def send_after_abandon_started():
+            abandon_first_results["final"] = await abandon_first.send(
+                abandon_first_chat,
+                "FINAL",
+                reply_to=abandon_first_anchor,
+                metadata={
+                    "notify": True,
+                    "reply_to_message_id": abandon_first_anchor,
+                },
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(abandon_before_final)
+            await seal_entered.wait()
+            task_group.start_soon(send_after_abandon_started)
+            await wait_for_final_claim_users(
+                abandon_first,
+                abandon_first_chat,
+                abandon_first_anchor,
+                2,
+            )
+            assert abandon_first.normal_send_attempts == []
+            seal_release.set()
+
+        assert abandon_first_results["abandon"].success
+        assert abandon_first_results["final"].success
+        assert abandon_first.normal_sends == []
+        assert_exact_final_ownership(abandon_first, abandon_first_target)
+
+        abandon_word_overlap = DummyAdapter()
+        await abandon_word_overlap.send_draft(
+            "user-abandon-word-overlap",
+            3257,
+            "progressNOTFINAL",
+            {"reply_to_message_id": "msg-abandon-word-overlap"},
+        )
+        word_overlap_closed = await abandon_word_overlap.abandon_open_draft(
+            "user-abandon-word-overlap",
+            "progressNOTFINAL",
+            {"reply_to_message_id": "msg-abandon-word-overlap"},
+        )
+        word_overlap_final = await abandon_word_overlap.send(
+            "user-abandon-word-overlap",
+            "FINAL",
+            reply_to="msg-abandon-word-overlap",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-abandon-word-overlap",
+            },
+        )
+        assert word_overlap_closed.success
+        assert word_overlap_final.success
+        assert [item[1] for item in abandon_word_overlap.normal_sends] == [
+            "FINAL"
+        ]
+
+        # A late stream callback can arrive while the same-anchor final owns
+        # an external ordinary send but has not yet published its tombstone or
+        # broker completion. Both the original draft id and a changed draft id
+        # must wait for that final flight, then observe completion instead of
+        # opening/replacing another native carrier. A different anchor remains
+        # independent and may progress while the first final is blocked.
+        async def assert_late_frame_waits_for_final(
+            *,
+            label,
+            late_draft_id,
+            late_content,
+            fallback_anchor=False,
+        ):
+            adapter = DummyAdapter()
+            chat_id = f"user-late-frame-{label}"
+            anchor = f"msg-late-frame-{label}"
+            target = "progress\nFINAL"
+            initial_draft_id = 3260
+            await adapter.send_draft(
+                chat_id,
+                initial_draft_id,
+                "progress",
+                {"reply_to_message_id": anchor},
+            )
+            if fallback_anchor:
+                adapter._last_msg_id[chat_id] = anchor
+            adapter.fail_next_stream = True
+            adapter.normal_send_entered = anyio.Event()
+            adapter.normal_send_release = anyio.Event()
+            results = {}
+
+            async def send_final():
+                results["final"] = await adapter.send(
+                    chat_id,
+                    "FINAL",
+                    reply_to=anchor,
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": anchor,
+                    },
+                )
+
+            async def send_late_frame():
+                results["late"] = await adapter.send_draft(
+                    chat_id,
+                    late_draft_id,
+                    late_content,
+                    None if fallback_anchor else {
+                        "reply_to_message_id": anchor
+                    },
+                )
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(send_final)
+                await adapter.normal_send_entered.wait()
+                calls_before_late = len(adapter.api_calls)
+                task_group.start_soon(send_late_frame)
+                await wait_for_final_claim_users(
+                    adapter,
+                    chat_id,
+                    anchor,
+                    2,
+                )
+                assert len(adapter.api_calls) == calls_before_late
+                if fallback_anchor:
+                    adapter._last_msg_id[chat_id] = f"{anchor}-new-inbound"
+
+                independent = await adapter.send_draft(
+                    chat_id,
+                    3261,
+                    "independent",
+                    {"reply_to_message_id": f"{anchor}-independent"},
+                )
+                assert independent.success
+                # Capacity may route the independent anchor to final-only,
+                # but the call must return before the blocked final releases.
+                assert len(adapter.api_calls) == calls_before_late
+                adapter.normal_send_release.set()
+
+            assert results["final"].success
+            assert results["late"].success
+            assert [item[1] for item in adapter.normal_sends] == ["\nFINAL"]
+            streams, anchors = streaming_mod._stream_maps(adapter)
+            assert (chat_id, anchor) not in anchors
+            assert (chat_id, late_draft_id) not in streams
+            sealed_final = [
+                call[2]["content_raw"]
+                for call in adapter.successful_api_calls
+                if call[2]["input_state"] == 10
+            ]
+            assert "".join(sealed_final + ["\nFINAL"]) == target
+
+        await assert_late_frame_waits_for_final(
+            label="same-draft",
+            late_draft_id=3260,
+            late_content="progress\nFINAL\nLATE",
+        )
+        await assert_late_frame_waits_for_final(
+            label="changed-draft",
+            late_draft_id=3262,
+            late_content="LATE",
+        )
+        await assert_late_frame_waits_for_final(
+            label="fallback-anchor",
+            late_draft_id=3263,
+            late_content="LATE",
+            fallback_anchor=True,
+        )
+
+        # Missing reply identity is not a stable turn key. Two unanchored
+        # finals in one private chat must remain two real deliveries; caching
+        # `(chat_id, "")` would replay TURN-A and silently swallow TURN-B.
+        unanchored_finals = DummyAdapter()
+        first_unanchored = await unanchored_finals.send(
+            "user-unanchored-finals",
+            "TURN-A",
+            metadata={"notify": True},
+        )
+        second_unanchored = await unanchored_finals.send(
+            "user-unanchored-finals",
+            "TURN-B",
+            metadata={"notify": True},
+        )
+        assert first_unanchored.success
+        assert second_unanchored.success
+        assert [item[1] for item in unanchored_finals.normal_sends] == [
+            "TURN-A",
+            "TURN-B",
+        ]
+
+        unanchored_parallel = DummyAdapter()
+        unanchored_parallel.normal_send_concurrent_entered = anyio.Event()
+        unanchored_parallel.normal_send_release = anyio.Event()
+        unanchored_parallel_results = []
+
+        async def send_unanchored_parallel(content):
+            unanchored_parallel_results.append(
+                await unanchored_parallel.send(
+                    "user-unanchored-parallel",
+                    content,
+                    metadata={"notify": True},
+                )
+            )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(send_unanchored_parallel, "PARALLEL-A")
+            task_group.start_soon(send_unanchored_parallel, "PARALLEL-B")
+            with anyio.fail_after(1):
+                await unanchored_parallel.normal_send_concurrent_entered.wait()
+            unanchored_parallel.normal_send_release.set()
+
+        assert all(result.success for result in unanchored_parallel_results)
+        assert sorted(
+            item[1] for item in unanchored_parallel.normal_sends
+        ) == ["PARALLEL-A", "PARALLEL-B"]
+
         failed_claim = DummyAdapter()
         await failed_claim.send_draft(
             "user-failed-claim-blocker",
@@ -2427,6 +2733,16 @@ async def main():
         native_completed_metadata,
     )
     assert not native_completed_streams
+    native_calls_before_changed_draft = len(native_completed.api_calls)
+    native_changed_draft_late = await native_completed.send_draft(
+        "user-native-completed",
+        8118,
+        f"{native_completed_target}\nLATE",
+        native_completed_metadata,
+    )
+    assert native_changed_draft_late.success
+    assert len(native_completed.api_calls) == native_calls_before_changed_draft
+    assert not native_completed_streams
     assert not native_completed.normal_sends
     assert_exact_final_ownership(native_completed, native_completed_target)
 
@@ -2523,7 +2839,9 @@ async def main():
     bounded_owners = DummyAdapter()
     first_bounded_draft = 5200
     completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+    completed_result_limit = streaming_mod._MAX_FINAL_DELIVERY_RESULTS
     streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 2
+    streaming_mod._MAX_FINAL_DELIVERY_RESULTS = 2
     try:
         for offset in range(streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT + 1):
             bounded_draft_id = first_bounded_draft + offset
@@ -2574,6 +2892,7 @@ async def main():
         ) not in bounded_streams
     finally:
         streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+        streaming_mod._MAX_FINAL_DELIVERY_RESULTS = completed_result_limit
 
     # Per-chat quotas must not leave the outer chat registry unbounded. The
     # least-recently-used completed chat may expire once the total chat bound
@@ -2587,7 +2906,9 @@ async def main():
         "_MAX_COMPLETED_OWNER_CHATS",
         None,
     )
+    completed_result_limit = streaming_mod._MAX_FINAL_DELIVERY_RESULTS
     streaming_mod._MAX_COMPLETED_OWNER_CHATS = 2
+    streaming_mod._MAX_FINAL_DELIVERY_RESULTS = 2
     try:
         bounded_owner_chats = DummyAdapter()
         for offset in range(3):
@@ -2630,6 +2951,7 @@ async def main():
             streaming_mod._MAX_COMPLETED_OWNER_CHATS = completed_chat_limit
         else:
             del streaming_mod._MAX_COMPLETED_OWNER_CHATS
+        streaming_mod._MAX_FINAL_DELIVERY_RESULTS = completed_result_limit
 
     # Capacity is isolated per private chat. Heavy completion traffic in chat
     # B must not evict chat A's replay protection.
@@ -2875,6 +3197,11 @@ async def main():
     print("qq_c2c_concurrent_final_single_delivery=ok")
     print("qq_c2c_active_fallback_single_flight=ok")
     print("qq_c2c_active_fallback_tombstone_eviction_safe=ok")
+    print("qq_c2c_abandon_final_flight_coordination=ok")
+    print("qq_c2c_abandon_first_terminal_owner=ok")
+    print("qq_c2c_active_final_late_frame_coordination=ok")
+    print("qq_c2c_completed_anchor_changed_draft_guard=ok")
+    print("qq_c2c_unanchored_finals_independent=ok")
     print("qq_c2c_failed_final_claim_retry=ok")
     print("qq_c2c_independent_final_claims_parallel=ok")
     print("qq_c2c_cancelled_final_waiter_cleanup=ok")

@@ -159,7 +159,8 @@ class _QQC2CFinalDeliveryBroker:
     The broker deliberately knows nothing about QQ streams or tombstones.  It
     guarantees that one ``(chat_id, reply anchor)`` runs at most one delivery
     attempt at a time, shares the first successful result with every caller
-    already registered on that flight, and applies backpressure before a new
+    already registered on that flight, coordinates adjacent lifecycle
+    mutations after that attempt, and applies backpressure before a new
     distinct key can enter the bounded registry.
     """
 
@@ -187,6 +188,15 @@ class _QQC2CFinalDeliveryBroker:
         normalized_key = (str(key[0]), str(key[1]))
         claim = self._claims.get(normalized_key)
         return 0 if claim is None else claim.users
+
+    def completed_for(self, key):
+        """Return bounded anchor-scoped completion evidence, if retained."""
+
+        normalized_key = (str(key[0]), str(key[1]))
+        claim = self._claims.get(normalized_key)
+        if claim is not None and claim.successful_result is not None:
+            return claim.successful_result
+        return self._completed_result(normalized_key)
 
     async def _register(
         self,
@@ -352,6 +362,35 @@ class _QQC2CFinalDeliveryBroker:
         finally:
             self._unregister(normalized_key, claim)
 
+    async def coordinate(self, key, operation):
+        """Run a lifecycle mutation after any same-key final attempt settles.
+
+        Unlike ``run()``, coordination never replays a completed delivery or
+        returns the flight's successful result in place of ``operation``.
+        Cancellation cleanup and late draft frames must inspect the resulting
+        stream state, but cannot race the external send owned by the active
+        final flight.
+        """
+
+        normalized_key = (str(key[0]), str(key[1]))
+        claim = await self._register(normalized_key)
+        try:
+            async with claim.lock:
+                task = claim.attempt_task
+                if task is not None:
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        if not task.cancelled():
+                            raise
+                    except Exception:
+                        # Definite final-attempt failure leaves the lifecycle
+                        # state for this cleanup operation to resolve.
+                        pass
+                return await operation()
+        finally:
+            self._unregister(normalized_key, claim)
+
 
 def _stream_maps(adapter):
     streams = getattr(adapter, "_qq_native_c2c_streams", None)
@@ -487,7 +526,10 @@ def _completed_owner_for_final(
             owner.final_delivered
             and owner.chat_id == str(chat_id)
             and owner.reply_to == str(reply_to)
-            and payload in (owner.final_payload, owner.final_content)
+            and (
+                payload in (owner.final_payload, owner.final_content)
+                or _terminal_payload_is_owned(owner.final_content, payload)
+            )
         ):
             owners.pop(chat_key, None)
             owners[chat_key] = bucket
@@ -1531,7 +1573,7 @@ def patch_qq_c2c_streaming(QQAdapter):
     def stream_is_message_for_chat(self, chat_id: str) -> bool:
         return _is_c2c(self, str(chat_id))
 
-    async def send_draft(
+    async def _send_draft_uncoordinated(
         self,
         chat_id: str,
         draft_id: int,
@@ -1579,6 +1621,19 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=True,
                     message_id=anchored_state.stream_msg_id,
                     raw_response={"qq_visible_final_owned": True},
+                )
+            completed_delivery = _final_delivery_broker(self).completed_for(
+                (chat_id, reply_to)
+            )
+            if completed_delivery is not None:
+                return _send_result(
+                    success=True,
+                    message_id=getattr(
+                        completed_delivery,
+                        "message_id",
+                        None,
+                    ),
+                    raw_response={"qq_completed_anchor_owned": True},
                 )
             completed_owner = _completed_owner_for_draft(
                 self,
@@ -1690,6 +1745,53 @@ def patch_qq_c2c_streaming(QQAdapter):
             raw_response=data,
         )
 
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Coordinate every stable-anchor frame with its final lifecycle.
+
+        The final broker owns the interval through external ordinary delivery
+        and terminal-marker publication. Joining that same key prevents a
+        stale frame (including the original draft id) from reopening or
+        replacing a carrier inside that interval. Different reply anchors use
+        distinct claims and remain independent.
+        """
+
+        chat_key = str(chat_id)
+        reply_to = _reply_anchor(metadata)
+        if not reply_to:
+            reply_to = str(
+                getattr(self, "_last_msg_id", {}).get(chat_key) or ""
+            )
+        resolved_metadata = metadata
+        if reply_to and not _reply_anchor(metadata):
+            # Freeze the fallback identity before waiting on a same-anchor
+            # final. `_last_msg_id` can advance to a newer inbound message
+            # while this callback is queued; recomputing it afterward would
+            # coordinate on one key and mutate another turn's stream.
+            resolved_metadata = dict(metadata or {})
+            resolved_metadata["reply_to_message_id"] = reply_to
+
+        async def send_once():
+            return await _send_draft_uncoordinated(
+                self,
+                chat_key,
+                draft_id,
+                content,
+                resolved_metadata,
+            )
+
+        if not reply_to or not _is_c2c(self, chat_key):
+            return await send_once()
+        return await _final_delivery_broker(self).coordinate(
+            (chat_key, reply_to),
+            send_once,
+        )
+
     async def abandon_open_draft(
         self,
         chat_id: str,
@@ -1697,85 +1799,100 @@ def patch_qq_c2c_streaming(QQAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ):
         anchor = _reply_anchor(metadata)
-        streams, anchors = _stream_maps(self)
-        state_key = anchors.get((str(chat_id), anchor))
-        state = streams.get(state_key) if state_key is not None else None
-        if state is None:
-            pending_state = _final_only_pending_for_anchor(
-                self,
-                chat_id=str(chat_id),
-                reply_to=anchor,
-            )
-            if pending_state is not None:
-                _remember_turn_tombstone(
+        chat_key = str(chat_id)
+
+        async def abandon_once():
+            streams, anchors = _stream_maps(self)
+            state_key = anchors.get((chat_key, anchor))
+            state = streams.get(state_key) if state_key is not None else None
+            if state is None:
+                pending_state = _final_only_pending_for_anchor(
                     self,
-                    pending_state,
-                    final_payload=str(content or ""),
-                    final_content=str(content or ""),
-                    final_delivered=False,
+                    chat_id=chat_key,
+                    reply_to=anchor,
                 )
-                _remove_final_only_pending(self, pending_state)
-            return _send_result(success=True)
-        if state.ordinary_owned_suffix:
-            # A completed ordinary fallback already owns every character after
-            # the native stream's last acknowledged frame. Delayed cancellation
-            # cleanup must only close that native frame; the caller commonly
-            # passes the full final payload here, which would otherwise absorb
-            # and duplicate the immutable suffix.
-            closed = await _seal_stream(
-                self,
-                state,
-                state.last_content,
-            )
-            if closed.success:
-                _publish_external_turn_completion(
+                if pending_state is not None:
+                    _remember_turn_tombstone(
+                        self,
+                        pending_state,
+                        final_payload=str(content or ""),
+                        final_content=str(content or ""),
+                        final_delivered=False,
+                    )
+                    _remove_final_only_pending(self, pending_state)
+                return _send_result(success=True)
+            if state.ordinary_owned_suffix:
+                # A completed ordinary fallback already owns every character
+                # after the native stream's last acknowledged frame. Delayed
+                # cancellation cleanup must close only that native frame.
+                closed = await _seal_stream(
                     self,
                     state,
-                    closed,
-                    final_payload=str(content or ""),
-                    final_content=_ordinary_owned_final_content(state),
+                    state.last_content,
                 )
-            return closed
-        active_content = _active_content(
-            state,
-            content or state.last_content,
-            require_committed_prefix=False,
-        )
-        if not state.stream_msg_id and state.committed_prefix and not active_content:
-            completed_id = state.last_completed_stream_id
-            completed = _send_result(success=True, message_id=completed_id)
-            _remember_turn_tombstone(
-                self,
+                if closed.success:
+                    _publish_external_turn_completion(
+                        self,
+                        state,
+                        closed,
+                        final_payload=str(content or ""),
+                        final_content=_ordinary_owned_final_content(state),
+                    )
+                return closed
+            active_content = _active_content(
                 state,
-                final_payload=str(content or ""),
-                final_content=state.committed_prefix,
+                content or state.last_content,
+                require_committed_prefix=False,
             )
-            _remove_stream(self, state)
-            return completed
-        sealed = await _seal_stream(
-            self,
-            state,
-            active_content or state.last_content,
-        )
-        if sealed.success:
-            if state.close_pending_final_content is not None:
-                _publish_external_turn_completion(
-                    self,
-                    state,
-                    sealed,
-                    final_payload=str(
-                        state.close_pending_final_payload or ""
-                    ),
-                    final_content=state.close_pending_final_content,
+            if (
+                not state.stream_msg_id
+                and state.committed_prefix
+                and not active_content
+            ):
+                completed_id = state.last_completed_stream_id
+                completed = _send_result(
+                    success=True,
+                    message_id=completed_id,
                 )
-            else:
                 _remember_turn_tombstone(
                     self,
                     state,
                     final_payload=str(content or ""),
-                    final_content=_visible_stream_content(state),
+                    final_content=state.committed_prefix,
                 )
-        return sealed
+                _remove_stream(self, state)
+                return completed
+            sealed = await _seal_stream(
+                self,
+                state,
+                active_content or state.last_content,
+            )
+            if sealed.success:
+                if state.close_pending_final_content is not None:
+                    _publish_external_turn_completion(
+                        self,
+                        state,
+                        sealed,
+                        final_payload=str(
+                            state.close_pending_final_payload or ""
+                        ),
+                        final_content=state.close_pending_final_content,
+                    )
+                else:
+                    _remember_turn_tombstone(
+                        self,
+                        state,
+                        final_payload=str(content or ""),
+                        final_content=_visible_stream_content(state),
+                    )
+            return sealed
+
+        if not anchor:
+            return await abandon_once()
+        return await _final_delivery_broker(self).coordinate(
+            (chat_key, anchor),
+            abandon_once,
+        )
 
     @functools.wraps(original_send)
     async def send(
@@ -1859,7 +1976,6 @@ def patch_qq_c2c_streaming(QQAdapter):
                 or metadata.get("reply_to_message_id")
                 or ""
             ).strip()
-            broker = _final_delivery_broker(self)
 
             async def complete_once():
                 return await _complete_turn_final(
@@ -1872,7 +1988,15 @@ def patch_qq_c2c_streaming(QQAdapter):
                     anchor=anchor,
                 )
 
-            return await broker.run((str(chat_id), anchor), complete_once)
+            if not anchor:
+                # Without a stable inbound identity, `(chat_id, "")` would
+                # merge unrelated turns and replay the first final for every
+                # later unanchored completion in this private chat.
+                return await complete_once()
+            return await _final_delivery_broker(self).run(
+                (str(chat_id), anchor),
+                complete_once,
+            )
         return await original_send(
             self,
             chat_id,

@@ -423,6 +423,50 @@ async def test_external_completion_uses_same_bounded_replay_registry():
     assert broker.stats().completed == 2
 
 
+async def test_cleanup_coordination_waits_for_active_delivery():
+    broker = streaming._QQC2CFinalDeliveryBroker(limit=1)
+    delivery_entered = anyio.Event()
+    delivery_release = anyio.Event()
+    cleanup_entered = anyio.Event()
+    results = {}
+
+    async def delivery():
+        delivery_entered.set()
+        await delivery_release.wait()
+        return result(True, "delivered")
+
+    async def cleanup():
+        active_completed = broker.completed_for(("chat", "anchor"))
+        results["active_completed"] = active_completed
+        cleanup_entered.set()
+        return result(True, "cleaned")
+
+    async def run_delivery():
+        results["delivery"] = await broker.run(("chat", "anchor"), delivery)
+
+    async def run_cleanup():
+        results["cleanup"] = await broker.coordinate(
+            ("chat", "anchor"),
+            cleanup,
+        )
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run_delivery)
+        await delivery_entered.wait()
+        group.start_soon(run_cleanup)
+        await anyio.sleep(0)
+        assert not cleanup_entered.is_set()
+        delivery_release.set()
+
+    assert results["delivery"].marker == "delivered"
+    assert results["cleanup"].marker == "cleaned"
+    assert results["active_completed"].marker == "delivered"
+    assert cleanup_entered.is_set()
+    assert broker.completed_for(("chat", "anchor")).marker == "delivered"
+    assert broker.completed_for(("chat", "different")) is None
+    assert broker.stats().active == 0
+
+
 async def _immediate_success(marker):
     return result(True, marker)
 
@@ -465,6 +509,7 @@ async def main():
     await test_noncacheable_success_is_shared_but_later_call_retries()
     await test_completed_replay_registry_is_bounded()
     await test_external_completion_uses_same_bounded_replay_registry()
+    await test_cleanup_coordination_waits_for_active_delivery()
     await test_stress_never_exceeds_hard_limit()
     print("qq_c2c_final_broker_same_key_single_flight=ok")
     print("qq_c2c_final_broker_retains_success=ok")
@@ -478,6 +523,7 @@ async def main():
     print("qq_c2c_final_broker_close_pending_retry=ok")
     print("qq_c2c_final_broker_completed_registry_bounded=ok")
     print("qq_c2c_final_broker_external_completion_bounded=ok")
+    print("qq_c2c_final_broker_cleanup_coordination=ok")
     print("qq_c2c_final_broker_stress_bound=ok")
 
 

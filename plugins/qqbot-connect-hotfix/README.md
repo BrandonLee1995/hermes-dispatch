@@ -24,6 +24,46 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.15 closes the completion-boundary gaps left by the initial
+single-flight implementation. Hermes can cancel `GatewayStreamConsumer.run()`
+while the broker-owned ordinary final request is still in flight; patched
+`abandon_open_draft()` now coordinates on the same `(chat_id, reply anchor)`
+flight before it reads or seals stream state, preventing the native final and
+ordinary unseen suffix from both becoming visible owners. This compensates for
+the upstream lifecycle in which `/new`, `/stop`, interruption and timeout
+cleanup may abandon a stream concurrently with shielded final delivery.
+
+Every stable-anchor `send_draft()` callback now joins that same keyed
+transaction too. This closes the interval after final ownership starts but
+before the broker result/tombstone becomes externally visible: neither the
+original draft id nor a stale changed draft id can replace or open a carrier
+while the final's ordinary fallback is in flight. A different reply anchor
+still uses a distinct claim and is not serialized behind that final. In the
+reverse order, if abandonment has already sealed a complete cumulative body,
+a later short final is suppressed only when that payload is an exact
+token-bounded terminal suffix of the recorded visible body; arbitrary partial
+or word-internal overlap remains unowned. If old Hermes omits reply metadata,
+the adapter freezes the current `_last_msg_id` before waiting, so a newer
+inbound message cannot change which anchor the queued frame mutates.
+
+The bounded 1024-key completed-result LRU is also the anchor-scoped completion
+index for late drafts. While that LRU entry is retained, a fully sealed turn
+cannot be reopened merely because a stale Hermes callback uses a different
+draft id. After its anchor entry is evicted, only a still-retained tombstone with
+the original draft id remains a secondary check; it does not extend the
+changed-draft guarantee beyond the documented LRU bound. When no stable inbound
+reply anchor exists, final delivery bypasses single-flight and
+completed replay entirely: separate unanchored finals are delivered
+independently instead of collapsing into `(chat_id, "")`. Dedicated regressions
+cover both final-versus-abandon orderings, same- and changed-draft callbacks
+during an active final flight, same-anchor changed-draft replay, sequential and
+parallel unanchored finals, cleanup coordination, bounded anchor-result
+eviction and different-anchor independence. Enablement and
+rollback remain unchanged: use the streaming settings below, install through
+`scripts/install-plugins.sh`, run both final-delivery and streaming suites, and
+restore only an exact installer-created external backup before restarting the
+affected profile.
+
 Version 1.8.14 replaces path-specific final locks with a bounded keyed
 single-flight broker. Every C2C `notify=True` completion path—including active
 native rollover/fallback, unopened native state, final-only pending,

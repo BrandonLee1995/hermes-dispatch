@@ -1,5 +1,57 @@
 # Development Log
 
+## 2026-08-28 — Coordinate final cleanup and stable anchor completion
+
+### Problem
+
+The 1.8.14 broker serialized concurrent final callbacks, but Hermes cancellation
+cleanup still ran outside the per-anchor flight. An abandon could seal the full
+native final while a shielded ordinary unseen-suffix request was pending, then
+that request could succeed and duplicate the suffix. Completed late-draft
+suppression also required the old draft id, and missing reply identity collapsed
+unrelated finals into the shared `(chat_id, "")` replay key. A late frame could
+also enter while the ordinary final request was active but before completion
+evidence was published; in the reverse order, abandonment could seal the full
+cumulative final before the later short final callback sent that suffix again.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.15.
+- Added broker cleanup coordination. Stable-anchor abandonment waits for the
+  active final attempt to settle, then resolves and closes the resulting state
+  while holding the same keyed transaction.
+- Coordinated every stable-anchor draft callback on that transaction as well.
+  Same- and changed-draft late frames wait through external final delivery and
+  then re-resolve completion; different anchors remain independent. A fallback
+  anchor derived from `_last_msg_id` is frozen before the wait to prevent a
+  newer inbound message from redirecting the queued operation to another turn.
+- Recognized a later short final as already owned by an abandoned cumulative
+  seal only when it is an exact token-bounded terminal suffix. Partial overlap
+  and word-internal matches remain ordinary final deliveries.
+- Reused the bounded completed-result LRU as anchor-scoped late-draft evidence,
+  so a fully sealed anchor cannot reopen under a changed Hermes draft id.
+- Bypassed single-flight and completed replay for finals without a stable
+  inbound reply anchor; sequential and parallel unanchored finals stay
+  independent rather than sharing an empty key.
+- Added public adapter regressions for both gated final/abandon orderings,
+  same- and changed-draft callbacks during an active final flight,
+  changed-draft late frames after full native completion, and unanchored final
+  independence. Broker contract coverage now includes cleanup waiting for an
+  active delivery and the anchor-scoped completed-result lookup.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` and `test_streaming.py` before the full plugin/MCP,
+Hermes 0.20.0 fail-closed, installer and static matrices. The abandon race must
+show no native seal while the ordinary suffix is blocked and exactly one final
+owner after release; an abandon-first full cumulative seal must own a later
+token-bounded short final; same- and changed-draft frames must add no QQ API
+call while final delivery is active; a changed-draft post-completion frame must
+also add no QQ API call; two different unanchored finals must both reach the
+ordinary sender. Roll back only
+from the exact external backup created by `scripts/install-plugins.sh`, then
+restart and verify only the affected profile.
+
 ## 2026-08-28 — Bound and unify concurrent final ownership
 
 ### Problem

@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.14 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.15 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.14 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.15 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -234,6 +234,15 @@ hermes config check
   per-chat completed owner，并把成功 close 写入同一个有界 replay LRU；即使独立 anchor
   淘汰 tombstone，同 anchor final 仍不会重发。普通 partial draft 的取消没有完整 final
   身份，因此不会升级为 anchor-wide replay。
+  Hermes 的 `/new`、`/stop`、interrupt 或 timeout cleanup 可能在 shielded final 请求仍在途时
+  调用 `abandon_open_draft()`；插件会让 stable-anchor abandon 加入相同 single-flight，等待
+  final attempt 结束后再读取/封口，避免 native 完整 final 与 ordinary unseen suffix 双写。
+  同一 stable anchor 的所有 draft callback 也加入该 transaction：无论原 draft id 还是变更后的
+  stale draft id，都必须等待外部 final 投递及 ownership 发布完成后再重新判定，不会在这个窗口
+  替换或新开 carrier；不同 anchor 不受阻塞。反向顺序中，若 abandon 已封口完整累计正文，后到
+  的短 final 只有在构成带 token 边界的严格终端后缀时才视为已投递，任意部分或词内重叠不吞消息。
+  fully sealed anchor 的 1024-key 有界 broker completion 也用于拦截 changed-draft late frame；
+  无稳定 inbound reply anchor 的 final 不使用空字符串 replay key，而是分别走真实投递。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
