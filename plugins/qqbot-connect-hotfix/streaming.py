@@ -17,7 +17,6 @@ import functools
 import logging
 import re
 import unicodedata
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -34,6 +33,8 @@ _MAX_FINAL_ONLY_PENDING = 256
 _MAX_FINAL_ONLY_PENDING_CHATS = 1024
 _MAX_NATIVE_LANE_CHATS = 1024
 _MAX_TYPING_ANCHORS = 1024
+_MAX_FINAL_DELIVERY_CLAIMS = 128
+_MAX_FINAL_DELIVERY_RESULTS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
 
@@ -92,6 +93,12 @@ class _QQC2CStream:
     # It is already user-visible but can never be absorbed into a later native
     # replace/seal without displaying the same suffix twice.
     ordinary_owned_suffix: str = ""
+    # A complete turn-final may already be visible even though QQ rejected
+    # every seal attempt. Preserve its exact identity so a later cancellation
+    # close can publish completion without treating an arbitrary partial draft
+    # as a fully delivered final.
+    close_pending_final_payload: Optional[str] = None
+    close_pending_final_content: Optional[str] = None
     sealed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -111,10 +118,239 @@ class _QQC2CTurnTombstone:
 
 @dataclass
 class _QQC2CFinalDeliveryClaim:
-    """Serialize ordinary final ownership for one chat/reply anchor."""
+    """One keyed single-flight retained until all registered callers exit."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
+    successful_result: Any = None
+    cache_completed: bool = True
+    attempt_task: Optional[asyncio.Task] = None
+
+
+@dataclass(frozen=True)
+class _QQC2CFinalAttemptOutcome:
+    """Broker metadata kept out of the public platform ``SendResult``."""
+
+    result: Any
+    cache_completed: bool = True
+
+
+def _final_attempt_parts(outcome) -> tuple[Any, bool]:
+    if isinstance(outcome, _QQC2CFinalAttemptOutcome):
+        return outcome.result, outcome.cache_completed
+    return outcome, True
+
+
+@dataclass(frozen=True)
+class _QQC2CFinalDeliveryBrokerStats:
+    """Read-only diagnostics for the bounded delivery broker."""
+
+    active: int
+    registered: int
+    waiting: int
+    completed: int
+    peak: int
+    limit: int
+
+
+class _QQC2CFinalDeliveryBroker:
+    """Bounded keyed single-flight for complete final ownership attempts.
+
+    The broker deliberately knows nothing about QQ streams or tombstones.  It
+    guarantees that one ``(chat_id, reply anchor)`` runs at most one delivery
+    attempt at a time, shares the first successful result with every caller
+    already registered on that flight, and applies backpressure before a new
+    distinct key can enter the bounded registry.
+    """
+
+    def __init__(self, *, limit: int, completed_limit: int = 1024):
+        self._limit = max(1, int(limit))
+        self._completed_limit = max(1, int(completed_limit))
+        self._slot_available = asyncio.Event()
+        self._slot_available.set()
+        self._claims: Dict[tuple[str, str], _QQC2CFinalDeliveryClaim] = {}
+        self._completed: Dict[tuple[str, str], Any] = {}
+        self._waiting = 0
+        self._peak = 0
+
+    def stats(self) -> _QQC2CFinalDeliveryBrokerStats:
+        return _QQC2CFinalDeliveryBrokerStats(
+            active=len(self._claims),
+            registered=sum(claim.users for claim in self._claims.values()),
+            waiting=self._waiting,
+            completed=len(self._completed),
+            peak=self._peak,
+            limit=self._limit,
+        )
+
+    def registered_for(self, key) -> int:
+        normalized_key = (str(key[0]), str(key[1]))
+        claim = self._claims.get(normalized_key)
+        return 0 if claim is None else claim.users
+
+    async def _register(
+        self,
+        key: tuple[str, str],
+    ) -> _QQC2CFinalDeliveryClaim:
+        while True:
+            # Registration and capacity checks contain no await, so one event
+            # loop turn atomically joins an existing key or creates one slot.
+            claim = self._claims.get(key)
+            if claim is not None:
+                claim.users += 1
+                return claim
+            if len(self._claims) < self._limit:
+                claim = _QQC2CFinalDeliveryClaim()
+                self._claims[key] = claim
+                self._peak = max(self._peak, len(self._claims))
+                claim.users = 1
+                if len(self._claims) >= self._limit:
+                    self._slot_available.clear()
+                return claim
+
+            # A released slot wakes every queued key. The first distinct key
+            # claims the slot; every caller for that same key then sees and
+            # joins its flight, while other keys return to bounded backpressure.
+            self._waiting += 1
+            try:
+                await self._slot_available.wait()
+            finally:
+                self._waiting -= 1
+
+    def _unregister(
+        self,
+        key: tuple[str, str],
+        claim: _QQC2CFinalDeliveryClaim,
+    ) -> None:
+        claim.users -= 1
+        self._cleanup(key, claim)
+
+    def _cleanup(
+        self,
+        key: tuple[str, str],
+        claim: _QQC2CFinalDeliveryClaim,
+    ) -> None:
+        if (
+            claim.users == 0
+            and claim.attempt_task is None
+            and self._claims.get(key) is claim
+        ):
+            if claim.successful_result is not None and claim.cache_completed:
+                self._remember_completed(key, claim.successful_result)
+            self._claims.pop(key, None)
+            self._slot_available.set()
+
+    def _remember_completed(self, key: tuple[str, str], result: Any) -> None:
+        self._completed.pop(key, None)
+        self._completed[key] = result
+        while len(self._completed) > self._completed_limit:
+            self._completed.pop(next(iter(self._completed)))
+
+    def _completed_result(self, key: tuple[str, str]):
+        result = self._completed.pop(key, None)
+        if result is not None:
+            self._completed[key] = result
+        return result
+
+    def remember_completed(self, key, result: Any) -> None:
+        """Publish completion produced outside a turn-final broker flight.
+
+        Cancellation cleanup can finish sealing a previously delivered final.
+        Recording that transition here keeps later same-anchor callbacks from
+        redelivering after the independently bounded turn tombstone is evicted.
+        """
+
+        if not getattr(result, "success", False):
+            return
+        normalized_key = (str(key[0]), str(key[1]))
+        self._remember_completed(normalized_key, result)
+        claim = self._claims.get(normalized_key)
+        if claim is not None:
+            claim.successful_result = result
+            claim.cache_completed = True
+
+    def _attempt_finished(
+        self,
+        key: tuple[str, str],
+        claim: _QQC2CFinalDeliveryClaim,
+        task: asyncio.Task,
+    ) -> None:
+        if claim.attempt_task is not task:
+            return
+        claim.attempt_task = None
+        if not task.cancelled():
+            try:
+                outcome = task.result()
+            except Exception:
+                outcome = None
+            result, cache_completed = _final_attempt_parts(outcome)
+            if getattr(result, "success", False):
+                claim.successful_result = result
+                claim.cache_completed = cache_completed
+        self._cleanup(key, claim)
+
+    async def run(self, key, operation):
+        normalized_key = (str(key[0]), str(key[1]))
+        completed = self._completed_result(normalized_key)
+        if completed is not None:
+            return completed
+        claim = await self._register(normalized_key)
+        try:
+            async with claim.lock:
+                while True:
+                    completed = self._completed_result(normalized_key)
+                    if completed is not None:
+                        return completed
+                    if claim.successful_result is not None:
+                        return claim.successful_result
+                    task = claim.attempt_task
+                    created = task is None
+                    if created:
+                        task = asyncio.create_task(operation())
+                        claim.attempt_task = task
+                        task.add_done_callback(
+                            lambda done,
+                            broker=self,
+                            flight_key=normalized_key,
+                            flight=claim: broker._attempt_finished(
+                                flight_key,
+                                flight,
+                                done,
+                            )
+                        )
+                    try:
+                        outcome = await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        # The claim-owned task continues. A same-key waiter can
+                        # observe its result; if nobody remains, its completion
+                        # callback performs final cleanup and releases capacity.
+                        raise
+                    except Exception:
+                        if claim.attempt_task is task:
+                            claim.attempt_task = None
+                        if created:
+                            raise
+                        # This caller inherited an in-flight attempt whose
+                        # original caller left. It now owns the definite-failure
+                        # handoff and may start one fresh attempt.
+                        continue
+                    result, cache_completed = _final_attempt_parts(outcome)
+                    if getattr(result, "success", False):
+                        # Store before releasing the per-key lock. Every caller
+                        # already counted in ``users`` can now complete without
+                        # consulting an independently evictable tombstone.
+                        claim.successful_result = result
+                        claim.cache_completed = cache_completed
+                        return result
+                    if claim.attempt_task is task:
+                        claim.attempt_task = None
+                    if created:
+                        return result
+                    # A waiter inherited an in-flight attempt from a cancelled
+                    # caller. Only a definite unsuccessful result may hand off
+                    # to one new external attempt.
+        finally:
+            self._unregister(normalized_key, claim)
 
 
 def _stream_maps(adapter):
@@ -135,39 +371,15 @@ def _stream_key(chat_id: str, draft_id: int) -> tuple[str, int]:
     return str(chat_id), int(draft_id)
 
 
-def _final_delivery_claims(
-    adapter,
-) -> Dict[tuple[str, str], _QQC2CFinalDeliveryClaim]:
-    claims = getattr(adapter, "_qq_native_c2c_final_delivery_claims", None)
-    if claims is None:
-        claims = {}
-        adapter._qq_native_c2c_final_delivery_claims = claims
-    return claims
-
-
-@asynccontextmanager
-async def _claim_final_delivery(
-    adapter,
-    *,
-    chat_id: str,
-    reply_to: str,
-):
-    """Claim one turn before awaiting its external ordinary final send."""
-
-    claims = _final_delivery_claims(adapter)
-    key = (str(chat_id), str(reply_to))
-    claim = claims.get(key)
-    if claim is None:
-        claim = _QQC2CFinalDeliveryClaim()
-        claims[key] = claim
-    claim.users += 1
-    try:
-        async with claim.lock:
-            yield
-    finally:
-        claim.users -= 1
-        if claim.users == 0 and claims.get(key) is claim:
-            claims.pop(key, None)
+def _final_delivery_broker(adapter) -> _QQC2CFinalDeliveryBroker:
+    broker = getattr(adapter, "_qq_native_c2c_final_delivery_broker", None)
+    if broker is None:
+        broker = _QQC2CFinalDeliveryBroker(
+            limit=_MAX_FINAL_DELIVERY_CLAIMS,
+            completed_limit=_MAX_FINAL_DELIVERY_RESULTS,
+        )
+        adapter._qq_native_c2c_final_delivery_broker = broker
+    return broker
 
 
 def _turn_tombstones(
@@ -210,6 +422,36 @@ def _remember_turn_tombstone(
         bucket.pop(next(iter(bucket)))
     while len(owners) > _MAX_COMPLETED_OWNER_CHATS:
         owners.pop(next(iter(owners)))
+
+
+def _ordinary_owned_final_content(state: _QQC2CStream) -> str:
+    """Return the two immutable carriers' complete visible final content."""
+
+    return f"{_visible_stream_content(state)}{state.ordinary_owned_suffix}"
+
+
+def _publish_external_turn_completion(
+    adapter,
+    state: _QQC2CStream,
+    result,
+    *,
+    final_payload: str,
+    final_content: str,
+) -> None:
+    """Persist a delivered completion produced outside ``broker.run``."""
+
+    if not getattr(result, "success", False):
+        return
+    _remember_turn_tombstone(
+        adapter,
+        state,
+        final_payload=final_payload,
+        final_content=final_content,
+    )
+    _final_delivery_broker(adapter).remember_completed(
+        (state.chat_id, state.reply_to),
+        result,
+    )
 
 
 def _completed_owner_for_draft(
@@ -974,6 +1216,278 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
         )
 
 
+async def _complete_turn_final(
+    adapter,
+    original_send,
+    *,
+    chat_id: str,
+    content: str,
+    reply_to: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    anchor: str,
+):
+    """Run one complete QQ final-ownership transaction.
+
+    Every active, pending, cancelled and replay lookup happens inside the
+    caller's keyed broker flight.  A successful return therefore means the
+    native/ordinary delivery and its ownership promotion completed before the
+    result becomes visible to same-key waiters.
+    """
+
+    streams, anchors = _stream_maps(adapter)
+    state_key = anchors.get((str(chat_id), anchor))
+    state = streams.get(state_key) if state_key is not None else None
+    if state is None:
+        completed_owner = _completed_owner_for_final(
+            adapter,
+            chat_id=str(chat_id),
+            reply_to=anchor,
+            content=str(content or ""),
+        )
+        if completed_owner is not None:
+            return _send_result(
+                success=True,
+                message_id=completed_owner.message_id,
+                raw_response={"qq_completed_turn_owned": True},
+            )
+        cancelled_owner = _cancelled_owner_for_anchor(
+            adapter,
+            chat_id=str(chat_id),
+            reply_to=anchor,
+        )
+        if cancelled_owner is not None:
+            normal_result = await original_send(
+                adapter,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if getattr(normal_result, "success", False):
+                _promote_cancelled_owner(
+                    adapter,
+                    cancelled_owner,
+                    final_content=str(content or ""),
+                    message_id=getattr(normal_result, "message_id", None),
+                )
+            return normal_result
+        pending_state = _final_only_pending_for_anchor(
+            adapter,
+            chat_id=str(chat_id),
+            reply_to=anchor,
+        )
+        if pending_state is not None:
+            normal_result = await original_send(
+                adapter,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if getattr(normal_result, "success", False):
+                _remember_turn_tombstone(
+                    adapter,
+                    pending_state,
+                    final_payload=str(content or ""),
+                    final_content=str(content or ""),
+                )
+                _remove_final_only_pending(adapter, pending_state)
+            return normal_result
+
+        # No native lifecycle exists for this turn. It still participates in
+        # the broker so concurrent notify=True callbacks share one result.
+        return await original_send(
+            adapter,
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    if state.ordinary_owned_suffix:
+        # A prior successful final fallback is authoritative and immutable.
+        # Retried final callbacks may only close the still-open native prefix.
+        closed = await _seal_stream(adapter, state, state.last_content)
+        if closed.success:
+            _remember_turn_tombstone(
+                adapter,
+                state,
+                final_payload=str(content or ""),
+                final_content=_ordinary_owned_final_content(state),
+            )
+            return closed
+        return _QQC2CFinalAttemptOutcome(
+            _send_result(
+                success=True,
+                message_id=state.stream_msg_id,
+                raw_response={"qq_stream_close_pending": True},
+            ),
+            cache_completed=False,
+        )
+
+    if not state.stream_msg_id and not state.committed_prefix:
+        # No native frame ever became visible: preserve exactly one ordinary
+        # final rather than opening a new native lifecycle at completion.
+        normal_result = await original_send(
+            adapter,
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if getattr(normal_result, "success", False):
+            _remember_turn_tombstone(
+                adapter,
+                state,
+                final_payload=str(content or ""),
+                final_content=str(content or ""),
+            )
+            _remove_stream(adapter, state)
+        return normal_result
+
+    # Hermes can finish with either the whole cumulative response or a short
+    # final-only answer. Compose against the exact QQ-acknowledged prefix, then
+    # apply one rollover path.
+    target = _compose_final_content(state, content)
+    rollover_error = None
+    try:
+        async with state.lock:
+            state, _data = await _send_cumulative_draft(adapter, state, target)
+    except Exception as exc:
+        rollover_error = exc
+        logger.warning(
+            "qqbot-connect-hotfix: final rollover stopped for chat=%s "
+            "draft=%s: %s",
+            chat_id,
+            state.draft_id,
+            exc,
+        )
+        # Rollover can replace the active state before a later operation fails.
+        latest_streams, _latest_anchors = _stream_maps(adapter)
+        latest_state = latest_streams.get(state_key)
+        if latest_state is not None:
+            state = latest_state
+
+    unseen = _unseen_final_suffix(state, target)
+    if unseen is None:
+        logger.error(
+            "qqbot-connect-hotfix: final ownership invariant lost for "
+            "chat=%s draft=%s; refusing duplicate fallback",
+            chat_id,
+            state.draft_id,
+        )
+        return _send_result(
+            success=False,
+            error="QQ stream final no longer extends visible content",
+        )
+
+    if unseen:
+        # This external send and its ownership promotion remain inside the same
+        # keyed broker flight as the failed native update. A concurrent final
+        # cannot calculate or send the same suffix before promotion completes.
+        normal_result = await original_send(
+            adapter,
+            chat_id,
+            unseen,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        cache_completed = True
+        if getattr(normal_result, "success", False):
+            _remember_turn_tombstone(
+                adapter,
+                state,
+                final_payload=str(content or ""),
+                final_content=target,
+            )
+            if state.stream_msg_id:
+                state.ordinary_owned_suffix = unseen
+                recovery = await _seal_stream(adapter, state, state.last_content)
+                if not recovery.success:
+                    cache_completed = False
+                    logger.warning(
+                        "qqbot-connect-hotfix: suffix fallback sent but "
+                        "visible stream close remains pending for chat=%s "
+                        "draft=%s: %s",
+                        chat_id,
+                        state.draft_id,
+                        recovery.error,
+                    )
+            else:
+                _remove_stream(adapter, state)
+        return _QQC2CFinalAttemptOutcome(
+            normal_result,
+            cache_completed=cache_completed,
+        )
+
+    if not state.stream_msg_id and state.committed_prefix == target:
+        completed_id = state.last_completed_stream_id
+        _remember_turn_tombstone(
+            adapter,
+            state,
+            final_payload=str(content or ""),
+            final_content=target,
+        )
+        _remove_stream(adapter, state)
+        return _send_result(success=True, message_id=completed_id)
+
+    if not state.stream_msg_id:
+        # No visible active stream and no unseen suffix is possible only for an
+        # empty final. Clear the placeholder and retain lifecycle evidence.
+        _remember_turn_tombstone(
+            adapter,
+            state,
+            final_payload=str(content or ""),
+            final_content=target,
+        )
+        _remove_stream(adapter, state)
+        return _send_result(
+            success=True,
+            message_id=state.last_completed_stream_id,
+        )
+
+    sealed = await _seal_stream(adapter, state, state.last_content)
+    if sealed.success:
+        _remember_turn_tombstone(
+            adapter,
+            state,
+            final_payload=str(content or ""),
+            final_content=target,
+        )
+        return sealed
+
+    # The complete target is already visible. Retry closing the same body but
+    # never emit an ordinary duplicate. If both close rounds fail, retain the
+    # state for abandon/retry while reporting visible delivery success.
+    recovery = await _seal_stream(adapter, state, state.last_content)
+    if recovery.success:
+        _remember_turn_tombstone(
+            adapter,
+            state,
+            final_payload=str(content or ""),
+            final_content=target,
+        )
+        return recovery
+    logger.warning(
+        "qqbot-connect-hotfix: final is visible but stream close remains "
+        "pending for chat=%s draft=%s after rollover=%s: %s",
+        chat_id,
+        state.draft_id,
+        bool(rollover_error),
+        recovery.error,
+    )
+    state.close_pending_final_payload = str(content or "")
+    state.close_pending_final_content = target
+    return _QQC2CFinalAttemptOutcome(
+        _send_result(
+            success=True,
+            message_id=state.stream_msg_id,
+            raw_response={"qq_stream_close_pending": True},
+        ),
+        cache_completed=False,
+    )
+
+
 def patch_qq_c2c_streaming(QQAdapter):
     """Add official QQ C2C native streaming to ``QQAdapter``.
 
@@ -1044,6 +1558,28 @@ def patch_qq_c2c_streaming(QQAdapter):
         state_key = _stream_key(chat_id, int(draft_id))
         state = streams.get(state_key)
         if state is None:
+            anchored_key = anchors.get((chat_id, reply_to))
+            anchored_state = (
+                streams.get(anchored_key)
+                if anchored_key is not None
+                else None
+            )
+            if (
+                anchored_state is not None
+                and (
+                    anchored_state.ordinary_owned_suffix
+                    or anchored_state.close_pending_final_content is not None
+                )
+            ):
+                # A completed visible turn is anchored by the inbound QQ
+                # message, not by Hermes' draft counter. A stale consumer may
+                # arrive with a different draft id; do not create a second
+                # stream or overwrite the anchor that can still seal the first.
+                return _send_result(
+                    success=True,
+                    message_id=anchored_state.stream_msg_id,
+                    raw_response={"qq_visible_final_owned": True},
+                )
             completed_owner = _completed_owner_for_draft(
                 self,
                 chat_id=chat_id,
@@ -1112,14 +1648,18 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=False,
                     error="QQ native stream is already sealed",
                 )
-            if state.ordinary_owned_suffix:
-                # The turn already completed through an immutable ordinary
-                # fallback. A late frame from the old consumer cannot safely
-                # move that suffix back into the native replace lifecycle.
+            if (
+                state.ordinary_owned_suffix
+                or state.close_pending_final_content is not None
+            ):
+                # The turn already has a complete visible final, either across
+                # an immutable ordinary suffix or in the still-open native
+                # stream. A late frame from the old consumer cannot safely
+                # move or extend that final inside the replace lifecycle.
                 return _send_result(
                     success=True,
                     message_id=state.stream_msg_id,
-                    raw_response={"qq_ordinary_suffix_owned": True},
+                    raw_response={"qq_visible_final_owned": True},
                 )
             try:
                 state, data = await _send_cumulative_draft(
@@ -1182,11 +1722,20 @@ def patch_qq_c2c_streaming(QQAdapter):
             # cleanup must only close that native frame; the caller commonly
             # passes the full final payload here, which would otherwise absorb
             # and duplicate the immutable suffix.
-            return await _seal_stream(
+            closed = await _seal_stream(
                 self,
                 state,
                 state.last_content,
             )
+            if closed.success:
+                _publish_external_turn_completion(
+                    self,
+                    state,
+                    closed,
+                    final_payload=str(content or ""),
+                    final_content=_ordinary_owned_final_content(state),
+                )
+            return closed
         active_content = _active_content(
             state,
             content or state.last_content,
@@ -1194,6 +1743,7 @@ def patch_qq_c2c_streaming(QQAdapter):
         )
         if not state.stream_msg_id and state.committed_prefix and not active_content:
             completed_id = state.last_completed_stream_id
+            completed = _send_result(success=True, message_id=completed_id)
             _remember_turn_tombstone(
                 self,
                 state,
@@ -1201,19 +1751,30 @@ def patch_qq_c2c_streaming(QQAdapter):
                 final_content=state.committed_prefix,
             )
             _remove_stream(self, state)
-            return _send_result(success=True, message_id=completed_id)
+            return completed
         sealed = await _seal_stream(
             self,
             state,
             active_content or state.last_content,
         )
         if sealed.success:
-            _remember_turn_tombstone(
-                self,
-                state,
-                final_payload=str(content or ""),
-                final_content=_visible_stream_content(state),
-            )
+            if state.close_pending_final_content is not None:
+                _publish_external_turn_completion(
+                    self,
+                    state,
+                    sealed,
+                    final_payload=str(
+                        state.close_pending_final_payload or ""
+                    ),
+                    final_content=state.close_pending_final_content,
+                )
+            else:
+                _remember_turn_tombstone(
+                    self,
+                    state,
+                    final_payload=str(content or ""),
+                    final_content=_visible_stream_content(state),
+                )
         return sealed
 
     @functools.wraps(original_send)
@@ -1298,261 +1859,20 @@ def patch_qq_c2c_streaming(QQAdapter):
                 or metadata.get("reply_to_message_id")
                 or ""
             ).strip()
-            streams, anchors = _stream_maps(self)
-            state_key = anchors.get((str(chat_id), anchor))
-            state = streams.get(state_key) if state_key is not None else None
-            if state is None:
-                async with _claim_final_delivery(
+            broker = _final_delivery_broker(self)
+
+            async def complete_once():
+                return await _complete_turn_final(
                     self,
+                    original_send,
                     chat_id=str(chat_id),
-                    reply_to=anchor,
-                ):
-                    completed_owner = _completed_owner_for_final(
-                        self,
-                        chat_id=str(chat_id),
-                        reply_to=anchor,
-                        content=str(content or ""),
-                    )
-                    if completed_owner is not None:
-                        return _send_result(
-                            success=True,
-                            message_id=completed_owner.message_id,
-                            raw_response={"qq_completed_turn_owned": True},
-                        )
-                    cancelled_owner = _cancelled_owner_for_anchor(
-                        self,
-                        chat_id=str(chat_id),
-                        reply_to=anchor,
-                    )
-                    if cancelled_owner is not None:
-                        normal_result = await original_send(
-                            self,
-                            chat_id,
-                            content,
-                            reply_to=reply_to,
-                            metadata=metadata,
-                        )
-                        if getattr(normal_result, "success", False):
-                            _promote_cancelled_owner(
-                                self,
-                                cancelled_owner,
-                                final_content=str(content or ""),
-                                message_id=getattr(
-                                    normal_result,
-                                    "message_id",
-                                    None,
-                                ),
-                            )
-                        return normal_result
-                    pending_state = _final_only_pending_for_anchor(
-                        self,
-                        chat_id=str(chat_id),
-                        reply_to=anchor,
-                    )
-                    if pending_state is not None:
-                        normal_result = await original_send(
-                            self,
-                            chat_id,
-                            content,
-                            reply_to=reply_to,
-                            metadata=metadata,
-                        )
-                        if getattr(normal_result, "success", False):
-                            _remember_turn_tombstone(
-                                self,
-                                pending_state,
-                                final_payload=str(content or ""),
-                                final_content=str(content or ""),
-                            )
-                            _remove_final_only_pending(self, pending_state)
-                        return normal_result
-            if state is not None:
-                if state.ordinary_owned_suffix:
-                    # A prior successful final fallback is authoritative and
-                    # immutable. Retried final callbacks may only close the
-                    # still-open native prefix; they must not re-compose or
-                    # re-send the suffix through either delivery channel.
-                    closed = await _seal_stream(
-                        self,
-                        state,
-                        state.last_content,
-                    )
-                    if closed.success:
-                        return closed
-                    return _send_result(
-                        success=True,
-                        message_id=state.stream_msg_id,
-                        raw_response={"qq_stream_close_pending": True},
-                    )
-                if not state.stream_msg_id and not state.committed_prefix:
-                    # Preserve the established final-only degradation when no
-                    # native frame ever became visible. Retrying a first frame
-                    # only at turn completion would change a known single-send
-                    # fallback into a new native lifecycle.
-                    normal_result = await original_send(
-                        self,
-                        chat_id,
-                        content,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                    if getattr(normal_result, "success", False):
-                        _remember_turn_tombstone(
-                            self,
-                            state,
-                            final_payload=str(content or ""),
-                            final_content=str(content or ""),
-                        )
-                        _remove_stream(self, state)
-                    return normal_result
-
-                # Hermes can finish with either the whole cumulative response
-                # or a short final-only answer. Compose both forms against the
-                # exact QQ-acknowledged prefix before applying one rollover
-                # path, so no final suffix is capped or silently discarded.
-                target = _compose_final_content(state, content)
-                rollover_error = None
-                try:
-                    async with state.lock:
-                        state, _data = await _send_cumulative_draft(
-                            self,
-                            state,
-                            target,
-                        )
-                except Exception as exc:
-                    rollover_error = exc
-                    logger.warning(
-                        "qqbot-connect-hotfix: final rollover stopped for "
-                        "chat=%s draft=%s: %s",
-                        chat_id,
-                        state.draft_id,
-                        exc,
-                    )
-                    # Rollover can seal heads and replace the map entry before
-                    # a later operation fails. Ownership must be calculated
-                    # from the latest acknowledged state, never the stale
-                    # object captured before rollover.
-                    latest_streams, _latest_anchors = _stream_maps(self)
-                    latest_state = latest_streams.get(state_key)
-                    if latest_state is not None:
-                        state = latest_state
-
-                unseen = _unseen_final_suffix(state, target)
-                if unseen is None:
-                    logger.error(
-                        "qqbot-connect-hotfix: final ownership invariant lost "
-                        "for chat=%s draft=%s; refusing duplicate fallback",
-                        chat_id,
-                        state.draft_id,
-                    )
-                    return _send_result(
-                        success=False,
-                        error="QQ stream final no longer extends visible content",
-                    )
-
-                if unseen:
-                    # Only text that QQ has never acknowledged can enter the
-                    # ordinary fallback. This remains correct whether failure
-                    # happened before the head seal, after committed heads, or
-                    # while opening a new tail.
-                    normal_result = await original_send(
-                        self,
-                        chat_id,
-                        unseen,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                    if getattr(normal_result, "success", False):
-                        _remember_turn_tombstone(
-                            self,
-                            state,
-                            final_payload=str(content or ""),
-                            final_content=target,
-                        )
-                        if state.stream_msg_id:
-                            state.ordinary_owned_suffix = unseen
-                            recovery = await _seal_stream(
-                                self,
-                                state,
-                                state.last_content,
-                            )
-                            if not recovery.success:
-                                logger.warning(
-                                    "qqbot-connect-hotfix: suffix fallback sent "
-                                    "but visible stream close remains pending "
-                                    "for chat=%s draft=%s: %s",
-                                    chat_id,
-                                    state.draft_id,
-                                    recovery.error,
-                                )
-                        else:
-                            _remove_stream(self, state)
-                    return normal_result
-
-                if not state.stream_msg_id and state.committed_prefix == target:
-                    completed_id = state.last_completed_stream_id
-                    _remember_turn_tombstone(
-                        self,
-                        state,
-                        final_payload=str(content or ""),
-                        final_content=target,
-                    )
-                    _remove_stream(self, state)
-                    return _send_result(success=True, message_id=completed_id)
-
-                if not state.stream_msg_id:
-                    # No visible active stream and no unseen suffix is only
-                    # possible for an empty final. Clear the placeholder.
-                    _remember_turn_tombstone(
-                        self,
-                        state,
-                        final_payload=str(content or ""),
-                        final_content=target,
-                    )
-                    _remove_stream(self, state)
-                    return _send_result(
-                        success=True,
-                        message_id=state.last_completed_stream_id,
-                    )
-
-                sealed = await _seal_stream(self, state, state.last_content)
-                if sealed.success:
-                    _remember_turn_tombstone(
-                        self,
-                        state,
-                        final_payload=str(content or ""),
-                        final_content=target,
-                    )
-                    return sealed
-
-                # The whole target is already visible. Retry closing the same
-                # body, but never emit an ordinary duplicate. If both bounded
-                # close rounds fail, retain the state for abandon/retry and
-                # report delivery success because every final character still
-                # has exactly one visible owner.
-                recovery = await _seal_stream(self, state, state.last_content)
-                if recovery.success:
-                    _remember_turn_tombstone(
-                        self,
-                        state,
-                        final_payload=str(content or ""),
-                        final_content=target,
-                    )
-                    return recovery
-                logger.warning(
-                    "qqbot-connect-hotfix: final is visible but stream close "
-                    "remains pending for chat=%s draft=%s after rollover=%s: %s",
-                    chat_id,
-                    state.draft_id,
-                    bool(rollover_error),
-                    recovery.error,
-                )
-                return _send_result(
-                    success=True,
-                    message_id=state.stream_msg_id,
-                    raw_response={"qq_stream_close_pending": True},
+                    content=str(content or ""),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    anchor=anchor,
                 )
 
+            return await broker.run((str(chat_id), anchor), complete_once)
         return await original_send(
             self,
             chat_id,

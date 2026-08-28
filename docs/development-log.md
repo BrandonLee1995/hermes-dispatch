@@ -1,5 +1,59 @@
 # Development Log
 
+## 2026-08-28 — Bound and unify concurrent final ownership
+
+### Problem
+
+The 1.8.13 claim covered cancellation and final-only-pending sends but left an
+active stream's ordinary unseen-suffix fallback outside that transaction.
+Concurrent final callbacks could therefore emit the same suffix twice. Waiting
+callers also recovered success from the independently evictable completed-owner
+tombstone instead of the claim itself, and distinct blocked anchors could grow
+the claim registry without a numerical bound.
+
+### Change
+
+- Bumped `qqbot-connect-hotfix` to 1.8.14.
+- Replaced path-specific claims with a 128-key bounded single-flight broker.
+  All C2C `notify=True` final paths now run lifecycle lookup, external delivery,
+  ownership promotion and cleanup in one per-anchor transaction.
+- Retained the first successful result on the flight until every caller already
+  registered on it exits. Tombstone eviction cannot make those waiters resend.
+- Made the external attempt flight-owned and shielded it from one caller's
+  cancellation. Same-key callers join the in-flight result; a definite failed
+  result or exception can hand off to one fresh attempt.
+- Added a separate 1024-key LRU for successfully closed or fully delivered
+  post-flight replay. It does not consume active admission and prevents a later
+  duplicate if a sole cancelled caller's shielded QQ request completes after
+  that caller exits. A visible-but-unsealed `qq_stream_close_pending` outcome is
+  shared with current waiters but excluded from this LRU, so a later callback
+  retries the seal without repeating an ordinary-owned suffix. Late draft
+  frames on the same inbound reply anchor cannot extend a recorded complete
+  final or open a second stream while its close is pending, including when the
+  stale Hermes draft id changed; different anchors remain independent. When
+  `abandon_open_draft()` subsequently closes a retained stream with a recorded
+  complete turn-final identity, it refreshes the per-chat completed owner and
+  publishes the successful close to the bounded replay LRU, preserving
+  deduplication across tombstone eviction. Ordinary partial-draft cancellation
+  is not promoted into this anchor-wide cache.
+- Added a focused broker contract suite plus active-stream adapter regression.
+  It covers same-key fan-in, independent-key parallelism, tombstone-independent
+  result sharing, failure/exception/cancellation handoff, queued admission
+  cancellation, same-key joining after a full-capacity wakeup, sole-holder
+  replay, close-pending retry, completed-cache eviction, capacity backpressure
+  and a 200-key stress bound.
+
+### Verify and roll back
+
+Run `test_final_delivery.py` before `test_streaming.py`, then run all QQ,
+plugin/MCP, installer, Hermes 0.20.0 fail-closed and static checks. The broker
+suite must report an active-flight peak no higher than 128 (or the test's lower
+configured bound), return to zero, and expose one external send for same-key
+success. The active-stream regression must deliver exactly one ordinary unseen
+suffix to three concurrent final callers after a real independent-anchor
+tombstone eviction. Restore only an exact
+installer-created external backup and restart only the affected profile.
+
 ## 2026-08-28 — Serialize concurrent ordinary final ownership
 
 ### Problem

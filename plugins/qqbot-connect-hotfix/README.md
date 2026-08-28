@@ -24,7 +24,48 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
-Version 1.8.13 serializes ordinary final ownership for each QQ private chat and
+Version 1.8.14 replaces path-specific final locks with a bounded keyed
+single-flight broker. Every C2C `notify=True` completion path—including active
+native rollover/fallback, unopened native state, final-only pending,
+cancellation promotion, and completed replay—re-resolves lifecycle state and
+finishes delivery plus ownership promotion inside one `(chat_id, reply anchor)`
+transaction. The first successful result remains on that flight until every
+already-registered caller exits, so waiter correctness does not depend on the
+separately bounded completed-owner tombstone registry.
+
+The broker admits at most 128 distinct active final keys. Same-key callers join
+an existing flight even at capacity; a new key waits for a released slot, so
+the registry has a hard bound without serializing independent chats or anchors.
+The external delivery attempt belongs to the flight and is shielded from an
+individual caller cancellation: a waiter observes the same in-flight result,
+and only a definite failure can hand off to a new attempt. After the last
+caller exits, successfully closed or fully delivered outcomes enter a separate
+1024-key LRU replay cache that does not consume active-flight admission; this
+covers a sole cancelled caller whose shielded QQ request finishes successfully.
+A visible-but-still-open `qq_stream_close_pending` result is shared only with
+callers registered on the current flight and is deliberately not replay-cached,
+so a later final callback can retry the idempotent seal without redelivering an
+ordinary-owned suffix. While that exact complete final remains visible but
+unsealed, stale draft frames on the same inbound reply anchor are acknowledged
+without extending, replacing, or opening a second stream, even if their Hermes
+draft id changed; another anchor remains independent. If Hermes cancellation
+cleanup later seals a retained
+stream whose complete turn-final identity was already recorded, the adapter
+refreshes the per-chat completed-owner tombstone and publishes the successful
+close into the same bounded broker replay LRU; a later same-anchor final
+therefore remains suppressed even if another anchor evicts the tombstone. An
+arbitrary partial-draft abandonment has no such final identity and is not
+promoted into the anchor-wide replay cache. Dedicated broker
+contract tests cover 100 same-key callers, retained success after external
+tombstone eviction, failure/exception handoff, holder and admission
+cancellation, sole-holder replay, close-pending retry, bounded completed-result eviction,
+different-key parallelism, capacity backpressure, same-key joining after a full
+capacity wakeup, cleanup, and a 200-key stress run. The adapter integration
+test covers three concurrent active-stream failures with exactly one ordinary
+unseen-suffix message even when an independent anchor evicts the real
+per-chat completed-owner tombstone before the waiting callbacks resume.
+
+Version 1.8.13 serialized ordinary final ownership for each QQ private chat and
 inbound reply anchor. The adapter registers a short-lived delivery claim before
 awaiting the external QQ send, so concurrent `notify=True` callbacks cannot
 both deliver the same cancellation or final-only-pending payload. A waiting
@@ -313,6 +354,9 @@ display:
 Verification:
 
 ```bash
+PYTHONPATH=/path/to/hermes-agent \
+  /path/to/hermes-agent/venv/bin/python \
+  plugins/qqbot-connect-hotfix/test_final_delivery.py
 PYTHONPATH=/path/to/hermes-agent \
   /path/to/hermes-agent/venv/bin/python \
   plugins/qqbot-connect-hotfix/test_streaming.py

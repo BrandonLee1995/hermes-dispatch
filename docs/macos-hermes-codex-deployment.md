@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.13 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.14 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.13 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.14 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -218,11 +218,22 @@ hermes config check
   capacity-final-only 被成功 abandon 后会保留 cancellation tombstone：它只拦截 late
   draft，不会吞掉尚未投递的普通 final；普通 final 首次成功后才升级为 completed owner，
   后续重复 final 只确认、不再投递。
-- cancellation 与 final-only-pending 的普通 final 在 `(chat_id, reply anchor)` 范围内先取得
-  短生命周期 delivery claim，再调用 QQ 外部发送。并发 final callback 会在 claim 内重新
-  检查状态：首次成功后等待者只确认 replay；首次失败时保留原状态，由等待者安全重试。
-  claim 在最后一个调用者退出后删除，不会形成 adapter 生命周期的锁表，也不会串行化其他
-  私聊或其他入站锚点。
+- 所有 C2C `notify=True` final（active native fallback、未打开 stream、final-only-pending、
+  cancellation 和 completed replay）都进入 `(chat_id, reply anchor)` 的有界 single-flight。
+  同 key 首次成功后，结果保留到所有已注册调用者退出，不依赖可能被淘汰的 completed-owner；
+  明确失败才允许等待者接棒。外部发送由 flight 持有，单个 caller 取消不会取消已发出的 QQ
+  请求。最多同时保留 128 个不同 final key；容量满时同 key 仍可加入，新 key 等待空位，
+  因而 registry 有硬上限且不同私聊/锚点仍可并行。flight 在最后调用者和在途请求都结束后
+  删除并释放准入容量；已完成封口或完整投递的成功结果另进入不占 active slot 的 1024-key
+  LRU，以覆盖唯一 caller 取消后 shielded QQ 请求才成功的迟到 replay。仍处于
+  `qq_stream_close_pending` 的可见成功只在当前 flight 内共享，不进入 replay LRU；后续 final
+  会继续重试幂等封口，且不会重复发送已由普通消息持有的 suffix；已记录完整 final 后的迟到
+  draft 在同一 inbound reply anchor 下只确认、不再扩展或新建第二条 native stream，即使
+  Hermes draft id 已改变；不同 anchor 仍保持独立。若后续由
+  `abandon_open_draft()` 对已记录完整 turn-final 身份的 stream 完成封口，插件会刷新
+  per-chat completed owner，并把成功 close 写入同一个有界 replay LRU；即使独立 anchor
+  淘汰 tombstone，同 anchor final 仍不会重发。普通 partial draft 的取消没有完整 final
+  身份，因此不会升级为 anchor-wide replay。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
@@ -417,6 +428,7 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_expired_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_media_reply.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_final_delivery.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_streaming.py
 "$HERMES_PY" plugins/message-snapshot-store/test_store.py
 "$HERMES_PY" plugins/message-snapshot-store/test_capture.py

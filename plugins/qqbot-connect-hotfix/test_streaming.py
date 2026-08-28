@@ -178,12 +178,12 @@ async def wait_for_final_claim_users(
     key = (str(chat_id), str(reply_to))
     with anyio.fail_after(1):
         while True:
-            claim = getattr(
+            broker = getattr(
                 adapter,
-                "_qq_native_c2c_final_delivery_claims",
-                {},
-            ).get(key)
-            if claim is not None and claim.users == expected_users:
+                "_qq_native_c2c_final_delivery_broker",
+                None,
+            )
+            if broker is not None and broker.registered_for(key) == expected_users:
                 return
             await anyio.sleep(0)
 
@@ -645,7 +645,63 @@ async def main():
     assert not seal_recover.normal_sends
     recover_streams, _recover_anchors = streaming_mod._stream_maps(seal_recover)
     assert ("user-seal-recover", 3103) in recover_streams
+    assert (
+        recover_streams[("user-seal-recover", 3103)].close_pending_final_content
+        == "处理中\n最终回退"
+    )
     assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
+    calls_before_close_pending_late_frame = len(seal_recover.api_calls)
+    ignored_close_pending_late_frame = await seal_recover.send_draft(
+        "user-seal-recover",
+        3103,
+        "处理中\n最终回退\nLATE",
+        {"reply_to_message_id": "msg-seal-recover"},
+    )
+    assert ignored_close_pending_late_frame.success
+    assert (
+        ignored_close_pending_late_frame.raw_response[
+            "qq_visible_final_owned"
+        ]
+        is True
+    )
+    assert len(seal_recover.api_calls) == calls_before_close_pending_late_frame
+    streams_before_changed_draft = dict(recover_streams)
+    anchors_before_changed_draft = dict(_recover_anchors)
+    ignored_changed_draft = await seal_recover.send_draft(
+        "user-seal-recover",
+        3199,
+        "处理中\n最终回退\nCHANGED-DRAFT-LATE",
+        {"reply_to_message_id": "msg-seal-recover"},
+    )
+    assert ignored_changed_draft.success
+    assert ignored_changed_draft.raw_response["qq_visible_final_owned"] is True
+    assert len(seal_recover.api_calls) == calls_before_close_pending_late_frame
+    assert recover_streams == streams_before_changed_draft
+    assert _recover_anchors == anchors_before_changed_draft
+
+    # The anchor guard is turn-scoped, not a chat-wide serialization rule.
+    # Another inbound anchor in the same private chat can still stream.
+    independent_anchor = "msg-seal-recover-independent"
+    independent_draft = await seal_recover.send_draft(
+        "user-seal-recover",
+        3200,
+        "INDEPENDENT",
+        {"reply_to_message_id": independent_anchor},
+    )
+    assert independent_draft.success
+    assert len(seal_recover.api_calls) == calls_before_close_pending_late_frame + 1
+    assert ("user-seal-recover", 3200) in recover_streams
+    assert _recover_anchors[("user-seal-recover", independent_anchor)] == (
+        "user-seal-recover",
+        3200,
+    )
+    independent_closed = await seal_recover.abandon_open_draft(
+        "user-seal-recover",
+        "INDEPENDENT",
+        {"reply_to_message_id": independent_anchor},
+    )
+    assert independent_closed.success
+    assert ("user-seal-recover", 3200) not in recover_streams
     closed_after_failure = await seal_recover.abandon_open_draft(
         "user-seal-recover",
         "最终回退",
@@ -653,7 +709,76 @@ async def main():
     )
     assert closed_after_failure.success
     assert ("user-seal-recover", 3103) not in recover_streams
-    assert_exact_final_ownership(seal_recover, "处理中\n最终回退")
+    assert [
+        call[2]["content_raw"]
+        for call in seal_recover.successful_api_calls
+        if (
+            call[2]["input_state"] == 10
+            and call[2]["content_raw"] == "处理中\n最终回退"
+        )
+    ] == ["处理中\n最终回退"]
+    # Abandon is an out-of-band completion path. Even if the separate
+    # per-chat tombstone is later evicted, the broker's bounded replay result
+    # must keep a repeated same-anchor final from opening another carrier.
+    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+    streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 1
+    try:
+        streaming_mod._remember_turn_tombstone(
+            seal_recover,
+            streaming_mod._QQC2CStream(
+                chat_id="user-seal-recover",
+                draft_id=9100,
+                reply_to="evict-seal-recover-owner",
+                msg_seq=9100,
+            ),
+            final_payload="independent",
+            final_content="independent",
+        )
+        replayed_after_close = await seal_recover.send(
+            "user-seal-recover",
+            "最终回退",
+            reply_to="msg-seal-recover",
+            metadata={
+                "notify": True,
+                "reply_to_message_id": "msg-seal-recover",
+            },
+        )
+        assert replayed_after_close.success
+    finally:
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+    assert not seal_recover.normal_sends
+    assert ("user-seal-recover", 3103) not in recover_streams
+
+    # A normal abandonment has no complete turn-final identity. It may retain
+    # content-aware tombstone evidence, but must not publish an anchor-wide
+    # broker replay result that would swallow a later, different final.
+    partial_abandon = DummyAdapter()
+    partial_anchor = "msg-partial-abandon"
+    await partial_abandon.send_draft(
+        "user-partial-abandon",
+        3104,
+        "部分结果",
+        {"reply_to_message_id": partial_anchor},
+    )
+    partial_closed = await partial_abandon.abandon_open_draft(
+        "user-partial-abandon",
+        "部分结果",
+        {"reply_to_message_id": partial_anchor},
+    )
+    assert partial_closed.success
+    partial_broker = streaming_mod._final_delivery_broker(partial_abandon)
+    assert partial_broker.stats().completed == 0
+    delivered_after_partial_abandon = await partial_abandon.send(
+        "user-partial-abandon",
+        "真正最终",
+        reply_to=partial_anchor,
+        metadata={
+            "notify": True,
+            "reply_to_message_id": partial_anchor,
+        },
+    )
+    assert delivered_after_partial_abandon.success
+    assert [item[1] for item in partial_abandon.normal_sends] == ["真正最终"]
 
     # Capacity pressure never discards an opened stream. The extra turn stays
     # final-only, while both existing streams remain sealable.
@@ -842,7 +967,7 @@ async def main():
     finally:
         streaming_mod._MAX_OPEN_STREAMS = previous_capacity
 
-    # Concurrent turn-final callbacks share one delivery claim. A cancelled
+    # Concurrent turn-final callbacks share one keyed single-flight. A cancelled
     # capacity turn and a still-pending capacity turn must each expose exactly
     # one successful ordinary QQ message, while both callers complete.
     previous_capacity = streaming_mod._MAX_OPEN_STREAMS
@@ -904,7 +1029,12 @@ async def main():
             assert results["second"].success
             assert results["third"].success
             assert concurrent_final.normal_send_peak == 1
-            assert not concurrent_final._qq_native_c2c_final_delivery_claims
+            assert (
+                concurrent_final._qq_native_c2c_final_delivery_broker
+                .stats()
+                .active
+                == 0
+            )
             assert [item[1] for item in concurrent_final.normal_sends] == [
                 "final"
             ]
@@ -926,6 +1056,85 @@ async def main():
                 "blocker",
                 {"reply_to_message_id": blocker_anchor},
             )
+
+        # Active-stream failure, unseen-suffix delivery and ownership
+        # promotion are one broker transaction. Same-key final callbacks must
+        # not reach the ordinary QQ boundary twice while the first is blocked.
+        active_fallback = DummyAdapter()
+        active_anchor = "msg-active-final-claim"
+        await active_fallback.send_draft(
+            "user-active-final-claim",
+            3254,
+            "progress",
+            {"reply_to_message_id": active_anchor},
+        )
+        active_fallback.fail_next_stream = True
+        active_fallback.normal_send_entered = anyio.Event()
+        active_fallback.normal_send_release = anyio.Event()
+        active_results = []
+        completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+        remember_tombstone = streaming_mod._remember_turn_tombstone
+
+        def remember_then_evict(adapter, state, **kwargs):
+            remember_tombstone(adapter, state, **kwargs)
+            if adapter is active_fallback and state.reply_to == active_anchor:
+                remember_tombstone(
+                    adapter,
+                    streaming_mod._QQC2CStream(
+                        chat_id=state.chat_id,
+                        draft_id=9999,
+                        reply_to="independent-owner-eviction",
+                        msg_seq=99,
+                    ),
+                    final_payload="independent",
+                    final_content="independent",
+                )
+
+        async def send_active_fallback():
+            active_results.append(
+                await active_fallback.send(
+                    "user-active-final-claim",
+                    "FINAL",
+                    reply_to=active_anchor,
+                    metadata={
+                        "notify": True,
+                        "reply_to_message_id": active_anchor,
+                    },
+                )
+            )
+
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 1
+        streaming_mod._remember_turn_tombstone = remember_then_evict
+        try:
+            async with anyio.create_task_group() as task_group:
+                for _ in range(3):
+                    task_group.start_soon(send_active_fallback)
+                await active_fallback.normal_send_entered.wait()
+                await wait_for_final_claim_users(
+                    active_fallback,
+                    "user-active-final-claim",
+                    active_anchor,
+                    3,
+                )
+                active_fallback.normal_send_release.set()
+        finally:
+            streaming_mod._remember_turn_tombstone = remember_tombstone
+            streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+
+        assert all(result.success for result in active_results)
+        assert active_fallback.normal_send_peak == 1
+        assert [item[1] for item in active_fallback.normal_sends] == [
+            "\nFINAL"
+        ]
+        assert list(
+            active_fallback._qq_native_c2c_completed_owners[
+                "user-active-final-claim"
+            ]
+        ) == [("independent-owner-eviction", 9999)]
+        assert (
+            active_fallback._qq_native_c2c_final_delivery_broker.stats().active
+            == 0
+        )
 
         failed_claim = DummyAdapter()
         await failed_claim.send_draft(
@@ -978,7 +1187,10 @@ async def main():
             True,
         ]
         assert failed_claim.normal_send_peak == 1
-        assert not failed_claim._qq_native_c2c_final_delivery_claims
+        assert (
+            failed_claim._qq_native_c2c_final_delivery_broker.stats().active
+            == 0
+        )
         assert [item[1] for item in failed_claim.normal_sends] == ["final"]
         replay_after_retry = await failed_claim.send(
             "user-failed-claim",
@@ -1040,7 +1252,12 @@ async def main():
 
         assert all(result.success for result in independent_results.values())
         assert independent_claims.normal_send_peak == 2
-        assert not independent_claims._qq_native_c2c_final_delivery_claims
+        assert (
+            independent_claims._qq_native_c2c_final_delivery_broker
+            .stats()
+            .active
+            == 0
+        )
         assert sorted(item[1] for item in independent_claims.normal_sends) == [
             "final-3261",
             "final-3262",
@@ -1121,7 +1338,12 @@ async def main():
 
         assert leader_results[0].success
         assert [item[1] for item in cancelled_waiter.normal_sends] == ["final"]
-        assert not cancelled_waiter._qq_native_c2c_final_delivery_claims
+        assert (
+            cancelled_waiter._qq_native_c2c_final_delivery_broker
+            .stats()
+            .active
+            == 0
+        )
         replay_after_waiter_cancel = await cancelled_waiter.send(
             "user-cancelled-waiter",
             "final",
@@ -1158,7 +1380,6 @@ async def main():
             {"reply_to_message_id": "msg-cancelled-holder"},
         )
         cancelled_holder.normal_send_entered = anyio.Event()
-        cancelled_holder.normal_send_second_attempt_entered = anyio.Event()
         cancelled_holder.normal_send_release = anyio.Event()
         holder_scope_ready = anyio.Event()
         holder_cancelled = anyio.Event()
@@ -1206,13 +1427,18 @@ async def main():
             )
             holder_scope_holder["scope"].cancel()
             await holder_cancelled.wait()
-            await cancelled_holder.normal_send_second_attempt_entered.wait()
             cancelled_holder.normal_send_release.set()
 
         assert holder_waiter_results[0].success
         assert cancelled_holder.normal_send_peak == 1
+        assert len(cancelled_holder.normal_send_attempts) == 1
         assert [item[1] for item in cancelled_holder.normal_sends] == ["final"]
-        assert not cancelled_holder._qq_native_c2c_final_delivery_claims
+        assert (
+            cancelled_holder._qq_native_c2c_final_delivery_broker
+            .stats()
+            .active
+            == 0
+        )
         await cancelled_holder.abandon_open_draft(
             "user-cancelled-holder-blocker",
             "blocker",
@@ -1274,7 +1500,10 @@ async def main():
         ) == ["normal send raised", "success"]
         assert raised_claim.normal_send_peak == 1
         assert [item[1] for item in raised_claim.normal_sends] == ["final"]
-        assert not raised_claim._qq_native_c2c_final_delivery_claims
+        assert (
+            raised_claim._qq_native_c2c_final_delivery_broker.stats().active
+            == 0
+        )
         replay_after_raise = await raised_claim.send(
             "user-raised-claim",
             "final",
@@ -1970,13 +2199,56 @@ async def main():
     )
     assert ("user-delayed-close", 5107) in delayed_close_streams
     assert_exact_final_ownership(delayed_close, delayed_close_target)
-    delayed_closed = await delayed_close.abandon_open_draft(
-        "user-delayed-close",
-        delayed_close_target,
-        delayed_close_metadata,
-    )
-    assert delayed_closed.success
-    assert ("user-delayed-close", 5107) not in delayed_close_streams
+    delayed_broker = delayed_close._qq_native_c2c_final_delivery_broker
+    assert delayed_broker.stats().completed == 0
+    completed_owner_limit = streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT
+    streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = 1
+    try:
+        # Prove abandon completion does not depend on the earlier ordinary
+        # fallback tombstone surviving an independent-anchor eviction.
+        for draft_id, anchor in (
+            (9101, "evict-before-abandon"),
+            (9102, "evict-after-abandon"),
+        ):
+            streaming_mod._remember_turn_tombstone(
+                delayed_close,
+                streaming_mod._QQC2CStream(
+                    chat_id="user-delayed-close",
+                    draft_id=draft_id,
+                    reply_to=anchor,
+                    msg_seq=draft_id,
+                ),
+                final_payload=anchor,
+                final_content=anchor,
+            )
+            if anchor == "evict-before-abandon":
+                delayed_closed = await delayed_close.abandon_open_draft(
+                    "user-delayed-close",
+                    delayed_close_target,
+                    delayed_close_metadata,
+                )
+                assert delayed_closed.success
+                assert delayed_broker.stats().completed == 1
+                assert (
+                    "user-delayed-close",
+                    5107,
+                ) not in delayed_close_streams
+
+        assert list(
+            delayed_close._qq_native_c2c_completed_owners[
+                "user-delayed-close"
+            ]
+        ) == [("evict-after-abandon", 9102)]
+        replayed_after_abandon = await delayed_close.send(
+            "user-delayed-close",
+            "FINAL",
+            reply_to="inbound-delayed-close",
+            metadata={"notify": True, **delayed_close_metadata},
+        )
+        assert replayed_after_abandon.success
+    finally:
+        streaming_mod._MAX_COMPLETED_OWNERS_PER_CHAT = completed_owner_limit
+    assert [item[1] for item in delayed_close.normal_sends] == ["\nFINAL"]
     assert_exact_final_ownership(delayed_close, delayed_close_target)
 
     # Once an ordinary fallback owns the suffix, late draft frames from the
@@ -2039,6 +2311,9 @@ async def main():
         metadata={"notify": True, **retried_final_metadata},
     )
     assert first_final.success
+    stream_key = ("user-retried-final", 5114)
+    assert stream_key in retried_final._qq_native_c2c_streams
+    api_calls_before_retry = len(retried_final.api_calls)
     second_final = await retried_final.send(
         "user-retried-final",
         "FINAL",
@@ -2046,6 +2321,9 @@ async def main():
         metadata={"notify": True, **retried_final_metadata},
     )
     assert second_final.success
+    assert len(retried_final.api_calls) > api_calls_before_retry
+    assert retried_final.api_calls[-1][2]["input_state"] == 10
+    assert stream_key not in retried_final._qq_native_c2c_streams
     assert [item[1] for item in retried_final.normal_sends] == ["\nFINAL"]
     assert_exact_final_ownership(retried_final, retried_final_target)
 
@@ -2595,6 +2873,8 @@ async def main():
     print("qq_c2c_stream_capacity_preserves_opened=ok")
     print("qq_c2c_capacity_pending_abandon_replay_dedup=ok")
     print("qq_c2c_concurrent_final_single_delivery=ok")
+    print("qq_c2c_active_fallback_single_flight=ok")
+    print("qq_c2c_active_fallback_tombstone_eviction_safe=ok")
     print("qq_c2c_failed_final_claim_retry=ok")
     print("qq_c2c_independent_final_claims_parallel=ok")
     print("qq_c2c_cancelled_final_waiter_cleanup=ok")
