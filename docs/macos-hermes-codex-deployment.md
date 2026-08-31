@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.19 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.20 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.19 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.20 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -216,9 +216,13 @@ hermes config check
   完成。
   Codex 可能把 final 先作为实时 delta 紧接在 commentary 后发送，再由 Hermes 以同一
   `final_response` 完成 turn；两阶段之间不保证有空白。插件只在真实
-  `GatewayStreamConsumer` turn-final 调用的 task-local adapter/chat/anchor 身份完全匹配时，
-  允许把已显示的精确 final 后缀原地封口，避免再次追加整段 final。普通或直接 send 仍沿用
-  token-boundary 规则，不能凭词内同后缀猜测所有权。
+  `GatewayStreamConsumer` turn-final 调用的 task-local adapter/chat/anchor 身份完全匹配，
+  且 final 等于或扩展真实的未完成 delta 段时，才使用 finish 改写前保存的 ledger；还必须
+  保留 QQ 已确认的完整前缀。1.8.20 在完成 commentary 或工具分段后清空候选段，避免把
+  `status NOTFINAL` 后独立的 `FINAL` 误吞；同 tick 未显示尾部和新增 footer 也只补发一次。
+  仅有 final 回调身份或相同后缀不构成 delta 来源证明。普通或直接 send 仍沿用
+  token-boundary 规则。无需新增设置，按第 7 节安装器备份回滚；验收附件见
+  [PR #4 证据](evidence/pr-4/README.md)。
   ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
   final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
   final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由

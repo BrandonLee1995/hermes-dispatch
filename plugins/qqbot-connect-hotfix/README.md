@@ -60,11 +60,22 @@ to the Gateway rather than falsely claiming delivery.
 The real Gateway consumer can stream the final answer as deltas immediately
 after commentary and then replace its accumulator with the same authoritative
 `final_response` during `finish()`. There may be no whitespace at that phase
-boundary. Version 1.8.19 wraps only the consumer's actual turn-final call with
-a task-local adapter/chat/anchor identity. If the exact authoritative final is
-already the visible terminal suffix in that trusted lifecycle, the QQ adapter
-seals it in place; generic direct sends keep the stricter token-boundary rule,
-so coincidental word-internal suffixes still do not claim ownership.
+boundary. Version 1.8.20 corrects the 1.8.19 shortcut: turn-final identity alone
+does not prove that a matching suffix was emitted as final deltas. The patch
+records the current unfinished, think-filtered delta segment and its complete
+ledger before upstream `finish()` can overwrite it. Completed commentary and
+tool-segment boundaries reset the candidate segment. Only a final that equals
+or prefix-extends that explicit segment can reuse its ledger, and only when
+the result preserves QQ's entire acknowledged prefix. This also covers a tail
+drained in the same tick as `finish()` and a post-stream verifier footer.
+An independent `FINAL` after `status NOTFINAL` is appended, not swallowed.
+Generic/direct sends retain the existing token-boundary rule. Provenance is
+consumer-local, passed through a task-local adapter/chat/anchor context, and
+does not modify QQ wire metadata or other platforms.
+
+Enable: install the persistent plugin and keep the existing native-C2C
+streaming settings; no new config key is needed. Roll back using the installer
+backup as described below; do not edit the Hermes installation.
 
 Verify with `test_streaming.py` and the complete QQ/plugin/install matrices.
 The deterministic regressions cover accepted-frame timeouts, ambiguous seals,
@@ -73,6 +84,11 @@ cancellation, repeated non-terminal failures, coalescing, and a final arriving
 during cooldown, terminal passive-reply-budget retirement after rollover, and
 a combined age-rollover + consecutive-commentary + 9,000-character streamed
 final whose completion payload has exactly one visible owner.
+Real-consumer negatives cover independent suffix finals with and without a
+completed-commentary callback; additional cases cover tool boundaries,
+think-filtered and chunked deltas, same-tick tails, augmented and rewritten
+finals. See the [review evidence bundle](../../docs/evidence/pr-4/README.md)
+for separately versioned live captures, redacted logs, and carrier ownership.
 Before release, also run one real QQ C2C turn longer than 12
 minutes with more than 9,000 final characters and a WebSocket reconnect. Every
 message must remain at or below 4,000 characters, the completion marker must

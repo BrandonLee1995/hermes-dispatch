@@ -104,11 +104,13 @@ class _CompletedCommentaryContext:
 
 @dataclass(frozen=True)
 class _TurnFinalContext:
-    """Task-local identity for one authoritative consumer finalization."""
+    """Task-local identity and actual delta provenance for finalization."""
 
     adapter_identity: int
     chat_id: str
     anchor: str
+    delta_payload: str
+    delta_content: str
 
 
 @dataclass(frozen=True)
@@ -1037,6 +1039,9 @@ def _patch_gateway_commentary_context(QQAdapter) -> str:
             return await original_send_commentary(self, text)
 
         cleaned = str(self._clean_for_display(text) or "")
+        # A completed commentary item is no longer a candidate final segment,
+        # even when its terminal characters happen to match a later final.
+        self._qq_native_final_delta_segment = ""
         anchor = str(getattr(self, "_initial_reply_to_id", "") or "")
         token = _COMPLETED_COMMENTARY_CONTEXT.set(
             _CompletedCommentaryContext(
@@ -1057,17 +1062,23 @@ def _patch_gateway_commentary_context(QQAdapter) -> str:
 
 
 def _patch_gateway_turn_final_context(QQAdapter) -> str:
-    """Identify the authoritative final send of a native-stream consumer.
+    """Bind finalization to the filtered deltas of the unfinished segment.
 
     Hermes can replace its cumulative consumer buffer with ``final_response``
     immediately before finalization. When the same final was already emitted
     as deltas directly after commentary, no textual token boundary separates
-    the two phases. A task-local identity lets the QQ adapter recognize that
-    exact trusted lifecycle without weakening generic suffix ownership.
+    the two phases. Callback identity alone is NOT delta provenance. Record
+    only text appended by the think-filtered delta drain, before finish()
+    replaces the upstream ledger. Completed commentary and tool boundaries
+    end the candidate segment. All state is consumer-local and updated by the
+    drain task, not the cross-thread producer callbacks.
     """
 
     try:
-        from gateway.stream_consumer import GatewayStreamConsumer
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer,
+            ensure_closed_code_fences,
+        )
     except ImportError as exc:
         logger.warning(
             "qqbot-connect-hotfix: could not patch turn-final context: %s",
@@ -1078,6 +1089,27 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
     original_send_or_edit = GatewayStreamConsumer._send_or_edit
     if getattr(original_send_or_edit, _TURN_FINAL_PATCHED, False):
         return "QQ C2C turn-final context already patched"
+
+    original_append = GatewayStreamConsumer._append_accumulated
+
+    def _eligible(self):
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        return bool(
+            getattr(self, "_use_draft_streaming", False)
+            and isinstance(adapter, QQAdapter)
+            and chat_id in _native_lane_chats(adapter)
+            and _is_c2c(adapter, chat_id)
+        )
+
+    @functools.wraps(original_append)
+    def _append_accumulated(self, text: str):
+        original_append(self, text)
+        if text and _eligible(self):
+            self._qq_native_final_delta_segment = (
+                getattr(self, "_qq_native_final_delta_segment", "") + text
+            )
+            self._qq_native_final_delta_content = self._stream_ledger
 
     @functools.wraps(original_send_or_edit)
     async def _send_or_edit(
@@ -1092,12 +1124,11 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
         trusted = bool(
             finalize
             and is_turn_final
-            and getattr(self, "_use_draft_streaming", False)
-            and isinstance(adapter, QQAdapter)
-            and chat_id in _native_lane_chats(adapter)
-            and _is_c2c(adapter, chat_id)
+            and _eligible(self)
         )
         if not trusted:
+            if finalize and not is_turn_final and _eligible(self):
+                self._qq_native_final_delta_segment = ""
             return await original_send_or_edit(
                 self,
                 text,
@@ -1110,6 +1141,12 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
                 adapter_identity=id(adapter),
                 chat_id=chat_id,
                 anchor=str(getattr(self, "_initial_reply_to_id", "") or ""),
+                delta_payload=ensure_closed_code_fences(self._clean_for_display(
+                    getattr(self, "_qq_native_final_delta_segment", "")
+                )),
+                delta_content=ensure_closed_code_fences(self._clean_for_display(
+                    getattr(self, "_qq_native_final_delta_content", "")
+                )),
             )
         )
         try:
@@ -1123,6 +1160,7 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
             _TURN_FINAL_CONTEXT.reset(token)
 
     setattr(_send_or_edit, _TURN_FINAL_PATCHED, True)
+    GatewayStreamConsumer._append_accumulated = _append_accumulated
     GatewayStreamConsumer._send_or_edit = _send_or_edit
     return "QQ C2C turn-final context patched"
 
@@ -1652,18 +1690,21 @@ def _compose_final_content(
     state: _QQC2CStream,
     content: str,
     *,
-    trusted_turn_final: bool = False,
+    proven_delta_content: Optional[str] = None,
 ) -> str:
     """Build the lossless final text from visible drafts and Hermes' final."""
 
     visible = _visible_stream_content(state)
     final = str(content or "")
-    if trusted_turn_final and final and visible.endswith(final):
-        # The real GatewayStreamConsumer is finalizing the same authoritative
-        # payload it just streamed as deltas. It may directly follow a
-        # commentary token with no whitespace, so generic boundary inference
-        # is intentionally bypassed only inside this task-local lifecycle.
-        return visible
+    if (
+        proven_delta_content
+        and proven_delta_content.startswith(visible)
+        and proven_delta_content.endswith(final)
+    ):
+        # The exact unfinished segment owns the final. The saved pre-finish
+        # ledger also covers the tail drained in the same tick as finish(),
+        # which may never have been sent as a draft. Never rewrite QQ's prefix.
+        return proven_delta_content
     if visible and final.startswith(visible):
         # A cumulative final is authoritative and may intentionally omit a
         # deferred draft that never became visible.
@@ -2052,12 +2093,23 @@ async def _complete_turn_final(
         )
 
     final_context = _TURN_FINAL_CONTEXT.get()
-    trusted_turn_final = bool(
+    proven_delta_content = None
+    if (
         isinstance(final_context, _TurnFinalContext)
         and final_context.adapter_identity == id(adapter)
         and final_context.chat_id == str(chat_id)
         and final_context.anchor == anchor
-    )
+        and bool(final_context.delta_payload)
+        and str(content or "").startswith(final_context.delta_payload)
+        and final_context.delta_content.endswith(final_context.delta_payload)
+    ):
+        # A post-stream footer may extend the exact unfinished final segment.
+        # Keep its ledger prefix and replace only that proven segment, never
+        # infer a segment boundary from the visible text's suffix alone.
+        proven_delta_content = (
+            final_context.delta_content[:-len(final_context.delta_payload)]
+            + str(content or "")
+        )
 
     if state.retired:
         if state.ordinary_owned_suffix:
@@ -2084,7 +2136,7 @@ async def _complete_turn_final(
             target=_compose_final_content(
                 state,
                 content,
-                trusted_turn_final=trusted_turn_final,
+                proven_delta_content=proven_delta_content,
             ),
             final_payload=str(content or ""),
             chat_id=str(chat_id),
@@ -2139,7 +2191,7 @@ async def _complete_turn_final(
     target = _compose_final_content(
         state,
         content,
-        trusted_turn_final=trusted_turn_final,
+        proven_delta_content=proven_delta_content,
     )
     rollover_error = None
     try:

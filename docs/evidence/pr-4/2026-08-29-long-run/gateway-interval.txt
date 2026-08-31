@@ -1,0 +1,17 @@
+2026-08-29 00:36:44,077 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-A>
+2026-08-29 00:44:44,564 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C silent age rollover sealed draft=<turn-A> committed=78 age=480.5s
+2026-08-29 00:44:54,885 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-A>
+2026-08-29 00:47:47,730 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] Server requested reconnect (op 7)
+2026-08-29 00:47:47,731 WARNING gateway.platforms.qqbot.adapter: [QQBot:<bot>] WebSocket closed: code=4009 reason=Session timed out
+2026-08-29 00:47:47,735 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] Reconnecting in 2s (attempt 1)...
+2026-08-29 00:47:49,904 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] WebSocket connected to wss://api.sgroup.qq.com/websocket
+2026-08-29 00:47:49,906 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] Reconnected
+2026-08-29 00:47:49,907 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] Resume sent (session_id=<ws-session>, seq=3)
+2026-08-29 00:47:50,136 INFO gateway.platforms.qqbot.adapter: [QQBot:<bot>] Session resumed
+2026-08-29 00:50:47,731 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C overflow chunk sealed draft=<turn-A> committed=4078
+2026-08-29 00:50:48,237 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-A>
+2026-08-29 00:50:59,816 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C overflow chunk sealed draft=<turn-A> committed=8078
+2026-08-29 00:51:00,298 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-A>
+2026-08-29 00:51:06,784 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream sealed draft=<turn-A> frames=15
+2026-08-29 00:51:06,788 INFO gateway.run: Suppressing normal final send for session <hermes-session>: final delivery already confirmed (streamed=True previewed=False content_delivered=True).
+2026-08-29 00:51:06,789 INFO gateway.run: response ready: platform=qqbot chat=<c2c-chat> time=872.5s api_calls=1 response=10234 chars

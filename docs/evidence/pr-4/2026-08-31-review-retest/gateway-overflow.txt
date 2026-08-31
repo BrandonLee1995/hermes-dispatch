@@ -1,0 +1,8 @@
+2026-08-31 09:34:48,154 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-B>
+2026-08-31 09:35:21,280 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C overflow chunk sealed draft=<turn-B> committed=4000
+2026-08-31 09:35:21,821 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-B>
+2026-08-31 09:35:38,368 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C overflow chunk sealed draft=<turn-B> committed=8000
+2026-08-31 09:35:38,896 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream opened draft=<turn-B>
+2026-08-31 09:35:48,411 INFO hermes_plugins.qqbot_connect_hotfix.streaming: qqbot-connect-hotfix: QQ C2C stream sealed draft=<turn-B> frames=24
+2026-08-31 09:35:48,417 INFO gateway.run: Suppressing normal final send for session <hermes-session> final delivery already confirmed (streamed=True previewed=False content_delivered=True).
+2026-08-31 09:35:48,418 INFO gateway.run: response ready: platform=qqbot chat=<c2c-chat> time=62.6s api_calls=1 response=10288 chars

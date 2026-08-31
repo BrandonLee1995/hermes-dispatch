@@ -2979,6 +2979,107 @@ async def main():
         "QQ_AGE_STARTQQ_AGE_STEP_1" + commentary_sequence_final,
     )
 
+    # An authoritative final callback is not proof of delta ownership. This
+    # uses the real consumer (not direct adapter.send) so the final context is
+    # active even though FINAL was never streamed as its own segment.
+    for completed_commentary in (False, True):
+        independent_final = GatewayDummyAdapter()
+        streaming_mod._mark_native_lane(independent_final, "user-independent-final")
+        independent_consumer = GatewayStreamConsumer(
+            independent_final,
+            "user-independent-final",
+            cfg,
+            initial_reply_to_id="inbound-independent-final",
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(independent_consumer.run)
+            independent_consumer.on_delta("status NOTFINAL")
+            await anyio.sleep(0.05)
+            if completed_commentary:
+                independent_consumer.on_commentary("status NOTFINAL")
+                await anyio.sleep(0.05)
+            independent_consumer.finish("FINAL")
+        assert_exact_final_ownership(independent_final, "status NOTFINAL\nFINAL")
+        assert not independent_final.normal_sends
+        assert independent_consumer.final_response_sent is True
+        assert independent_consumer.delivered_final_matches("FINAL") is True
+
+    # finish() may drain the final tail and adopt the authoritative payload in
+    # the same tick, before the last cumulative draft reaches QQ. Provenance
+    # must preserve the visible prefix and add only the undisplayed tail.
+    partial_final = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(partial_final, "user-partial-final")
+    partial_consumer = GatewayStreamConsumer(
+        partial_final, "user-partial-final", cfg,
+        initial_reply_to_id="inbound-partial-final",
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(partial_consumer.run)
+        partial_consumer.on_delta("PROGRESS")
+        partial_consumer.on_commentary("PROGRESS")
+        await anyio.sleep(0.05)
+        partial_consumer.on_delta("FI")
+        await anyio.sleep(0.05)
+        partial_consumer.on_delta("NAL")
+        partial_consumer.finish("FINAL")
+    assert_exact_final_ownership(partial_final, "PROGRESSFINAL")
+    assert not partial_final.normal_sends
+
+    # Hermes may append a verifier/footer after streaming the answer. The
+    # explicit final segment, not a suffix guess, lets that extension keep the
+    # streamed portion exactly once.
+    augmented_final = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(augmented_final, "user-augmented-final")
+    augmented_consumer = GatewayStreamConsumer(
+        augmented_final, "user-augmented-final", cfg,
+        initial_reply_to_id="inbound-augmented-final",
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(augmented_consumer.run)
+        augmented_consumer.on_delta("PROGRESS")
+        augmented_consumer.on_commentary("PROGRESS")
+        await anyio.sleep(0.05)
+        augmented_consumer.on_delta("FINAL")
+        await anyio.sleep(0.05)
+        augmented_consumer.finish("FINAL\nverified")
+    assert_exact_final_ownership(augmented_final, "PROGRESSFINAL\nverified")
+
+    # Boundary resets, filtered deltas, and an authoritative rewrite must not
+    # leak/invent provenance. Drive only public consumer callbacks; the QQ API
+    # sink below is the external visibility boundary.
+    provenance_cases = (
+        ("tool-break", "status NOTFINAL", "break", (), "FINAL", "status NOTFINAL\nFINAL"),
+        ("filtered", "PROGRESS\n", "commentary", ("<think>hidden</think>FI", "NAL"),
+         "FINAL", "PROGRESS\nFINAL"),
+        ("rewritten", "PROGRESS", "commentary", ("DRAFT",),
+         "FINAL", "PROGRESSDRAFT\nFINAL"),
+        ("no-commentary", "", "none", ("FI", "NAL"), "FINAL", "FINAL"),
+    )
+    for label, progress, boundary, deltas, final_text, expected in provenance_cases:
+        case_adapter = GatewayDummyAdapter()
+        chat = "user-provenance-" + label
+        streaming_mod._mark_native_lane(case_adapter, chat)
+        case_consumer = GatewayStreamConsumer(
+            case_adapter, chat, cfg, initial_reply_to_id="inbound-" + label,
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(case_consumer.run)
+            if progress:
+                case_consumer.on_delta(progress)
+                await anyio.sleep(0.05)
+            if boundary == "commentary":
+                case_consumer.on_commentary(progress)
+            elif boundary == "break":
+                case_consumer.on_segment_break()
+            await anyio.sleep(0.05)
+            for delta in deltas:
+                case_consumer.on_delta(delta)
+                await anyio.sleep(0.05)
+            case_consumer.finish(final_text)
+        assert_exact_final_ownership(case_adapter, expected)
+        assert not case_adapter.normal_sends
+        assert case_consumer.final_response_sent is True
+
     # Combine the live failure's boundaries: an age rollover, consecutive
     # commentary without whitespace, a >9,000-character final streamed as
     # deltas, and the same authoritative final passed to finish(). The final
@@ -4035,6 +4136,10 @@ async def main():
     print("qq_c2c_streamed_commentary_single_carrier=ok")
     print("qq_c2c_consecutive_commentary_single_carrier=ok")
     print("qq_c2c_long_final_boundary_single_owner=ok")
+    print("qq_c2c_consumer_independent_suffix_final=ok")
+    print("qq_c2c_consumer_partial_final_same_tick=ok")
+    print("qq_c2c_consumer_augmented_final=ok")
+    print("qq_c2c_consumer_delta_provenance_boundaries=ok")
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_native_lane_registry_bounded=ok")

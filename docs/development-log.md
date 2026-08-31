@@ -1,5 +1,43 @@
 # Development Log
 
+## 2026-08-31 — Require delta provenance before final ownership
+
+PR #4's review reproduced an independent `FINAL` swallowed after streamed
+`status NOTFINAL`. Version 1.8.19's turn-final context proved callback identity,
+but did not prove that the final had actually been streamed. The real consumer
+negative failed before the fix with `status NOTFINAL` instead of
+`status NOTFINAL\nFINAL`.
+
+Version 1.8.20 saves the think-filtered unfinished delta segment and full ledger
+before Hermes replaces its accumulator in `finish()`. Completed commentary and
+tool boundaries clear that candidate. Adapter/chat/anchor identity plus exact
+segment equality (or a final extending it) now authorizes ledger reuse only if
+the entire acknowledged QQ prefix is preserved. No wire fields or settings
+changed. Additional red-to-green cases cover a same-tick final tail and a
+post-stream footer; boundary checks cover tool breaks, filtered/chunked deltas,
+rewritten finals and final-only streaming. Generic direct-send ownership is
+unchanged.
+
+Install the persistent plugin with existing native-C2C settings; first run the
+full QQ, Codex, snapshot, installer and static/compatibility matrices. Then
+canary only the approved profile using real QQ. Restore the exact external
+installer backup and restart only that profile to roll back. Never modify the
+Hermes installation or other profiles as part of this fix.
+
+The [review evidence bundle](evidence/pr-4/README.md) now includes the original
+1.8.19 long-run Gateway interval, complete native QQ carrier AX captures,
+carrier lifecycle table and an independently reproducible content verifier.
+It distinguishes historical evidence from the required new 1.8.20 client
+retest; it contains no credentials or real chat/session/bot identifiers.
+The 1.8.20 procurement retest passed on 2026-08-31: the suffix turn completed
+in 18.2 seconds in one sealed native bubble; the 62.6-second overflow turn
+delivered its 10,288-character final through 4,000 / 4,000 / 2,305-character
+carriers including 17 progress characters. All carriers sealed, both final
+markers appeared once, and ordinary finals were suppressed. Complete AX text
+and lifecycle excerpts are attached, with automated exact-content verification.
+The full unit/plugin/installer/static matrices and actual-runtime streaming
+matrix passed. Only procurement was updated; default/product stayed unchanged.
+
 ## 2026-08-28 — Close QQ C2C lifetime acceptance gaps
 
 ### Problem
