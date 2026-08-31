@@ -343,6 +343,7 @@ python plugins/qqbot-connect-hotfix/test_media_reply.py
 python plugins/qqbot-connect-hotfix/test_group_roundtrip.py
 python plugins/qqbot-connect-hotfix/test_final_delivery.py
 python plugins/qqbot-connect-hotfix/test_streaming.py
+python plugins/qqbot-connect-hotfix/test_steer.py
 python plugins/codex-app-server-phase-hotfix/test_hotfix.py
 python plugins/message-snapshot-store/test_store.py
 python plugins/message-snapshot-store/test_capture.py
