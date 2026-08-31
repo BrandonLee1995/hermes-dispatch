@@ -1,0 +1,10 @@
+{
+  "run": "QQR20_SUFFIX_0934",
+  "plugin_version": "1.8.20",
+  "captured_at": "2026-08-31T01:35:00.040Z",
+  "source": "QQ macOS message-list accessibility capture; sidebar preview excluded",
+  "response_carriers": [
+    "status NOTFINALFINAL"
+  ],
+  "note": "Codex streamed the final here. The authoritative final without final deltas is covered separately by the real-consumer negative regression."
+}

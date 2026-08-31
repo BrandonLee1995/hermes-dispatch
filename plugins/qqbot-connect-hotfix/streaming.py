@@ -13,9 +13,11 @@ different passive-reply contract and do not expose the C2C stream endpoint.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -25,6 +27,8 @@ logger = logging.getLogger(__name__)
 _STREAM_PATCHED = "_qqbot_native_c2c_streaming_patched"
 _RUNNER_PATCHED = "_qqbot_native_c2c_streaming_runner_patched"
 _OVERFLOW_PATCHED = "_qqbot_native_c2c_overflow_patched"
+_COMMENTARY_PATCHED = "_qqbot_native_c2c_commentary_context_patched"
+_TURN_FINAL_PATCHED = "_qqbot_native_c2c_turn_final_context_patched"
 _MIN_HERMES_VERSION = (0, 20, 5)
 _MAX_OPEN_STREAMS = 128
 _MAX_COMPLETED_OWNERS_PER_CHAT = 256
@@ -36,7 +40,17 @@ _MAX_TYPING_ANCHORS = 1024
 _MAX_FINAL_DELIVERY_CLAIMS = 128
 _MAX_FINAL_DELIVERY_RESULTS = 1024
 _NATIVE_STREAM_ACCUMULATION_LIMIT = 2**31 - 1
+_NATIVE_STREAM_MAX_AGE_SECONDS = 480.0
 _SEAL_RETRY_DELAYS = (0.0, 0.2, 0.8)
+_FRAME_RETRY_DELAYS = (0.2, 0.8, 2.0, 5.0)
+_COMPLETED_COMMENTARY_CONTEXT = contextvars.ContextVar(
+    "qqbot_completed_commentary_context",
+    default=None,
+)
+_TURN_FINAL_CONTEXT = contextvars.ContextVar(
+    "qqbot_turn_final_context",
+    default=None,
+)
 
 
 def _hermes_version_tuple() -> tuple[int, ...]:
@@ -78,6 +92,36 @@ def _send_result(*, success: bool, message_id=None, error=None, raw_response=Non
     )
 
 
+@dataclass(frozen=True)
+class _CompletedCommentaryContext:
+    """Task-local identity for one Hermes completed-commentary callback."""
+
+    adapter_identity: int
+    chat_id: str
+    anchor: str
+    cleaned: str
+
+
+@dataclass(frozen=True)
+class _TurnFinalContext:
+    """Task-local identity and actual delta provenance for finalization."""
+
+    adapter_identity: int
+    chat_id: str
+    anchor: str
+    delta_payload: str
+    delta_content: str
+
+
+@dataclass(frozen=True)
+class _QQC2CAmbiguousFrame:
+    """One submitted frame whose QQ response was lost in transport."""
+
+    index: int
+    content: str
+    input_state: int
+
+
 @dataclass
 class _QQC2CStream:
     chat_id: str
@@ -89,6 +133,15 @@ class _QQC2CStream:
     last_content: str = ""
     committed_prefix: str = ""
     last_completed_stream_id: Optional[str] = None
+    opened_monotonic: Optional[float] = None
+    # QQ may accept and display a frame while returning its terminal lifetime
+    # error.  Such a carrier must never receive another index or seal request.
+    retired: bool = False
+    passive_reply_exhausted: bool = False
+    ambiguous_frame: Optional[_QQC2CAmbiguousFrame] = None
+    frame_failure_count: int = 0
+    frame_retry_not_before: float = 0.0
+    deferred_content: Optional[str] = None
     # Text successfully delivered by the immutable ordinary-message fallback.
     # It is already user-visible but can never be absorbed into a later native
     # replace/seal without displaying the same suffix twice.
@@ -101,6 +154,7 @@ class _QQC2CStream:
     close_pending_final_content: Optional[str] = None
     sealed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    expiry_task: Optional[asyncio.Task] = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -703,6 +757,7 @@ def _remove_final_only_pending(adapter, state: _QQC2CStream) -> None:
 
 
 def _remove_stream(adapter, state: _QQC2CStream) -> None:
+    _cancel_stream_expiry(state)
     streams, anchors = _stream_maps(adapter)
     state_key = _stream_key(state.chat_id, state.draft_id)
     streams.pop(state_key, None)
@@ -951,6 +1006,165 @@ def _patch_gateway_overflow_limit(QQAdapter) -> str:
     return "QQ C2C native overflow patched"
 
 
+def _patch_gateway_commentary_context(QQAdapter) -> str:
+    """Identify the completed commentary callback that owns streamed deltas.
+
+    Consecutive Codex commentary items can be concatenated without a textual
+    boundary. A task-local context distinguishes that trusted consumer callback
+    from unrelated interim sends while avoiding any wire metadata change.
+    """
+
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch commentary context: %s",
+            exc,
+        )
+        return "QQ C2C commentary context unavailable"
+
+    original_send_commentary = GatewayStreamConsumer._send_commentary
+    if getattr(original_send_commentary, _COMMENTARY_PATCHED, False):
+        return "QQ C2C commentary context already patched"
+
+    @functools.wraps(original_send_commentary)
+    async def _send_commentary(self, text: str):
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        if (
+            not isinstance(adapter, QQAdapter)
+            or chat_id not in _native_lane_chats(adapter)
+            or not _is_c2c(adapter, chat_id)
+        ):
+            return await original_send_commentary(self, text)
+
+        cleaned = str(self._clean_for_display(text) or "")
+        # A completed commentary item is no longer a candidate final segment,
+        # even when its terminal characters happen to match a later final.
+        self._qq_native_final_delta_segment = ""
+        anchor = str(getattr(self, "_initial_reply_to_id", "") or "")
+        token = _COMPLETED_COMMENTARY_CONTEXT.set(
+            _CompletedCommentaryContext(
+                adapter_identity=id(adapter),
+                chat_id=chat_id,
+                anchor=anchor,
+                cleaned=cleaned,
+            )
+        )
+        try:
+            return await original_send_commentary(self, text)
+        finally:
+            _COMPLETED_COMMENTARY_CONTEXT.reset(token)
+
+    setattr(_send_commentary, _COMMENTARY_PATCHED, True)
+    GatewayStreamConsumer._send_commentary = _send_commentary
+    return "QQ C2C commentary context patched"
+
+
+def _patch_gateway_turn_final_context(QQAdapter) -> str:
+    """Bind finalization to the filtered deltas of the unfinished segment.
+
+    Hermes can replace its cumulative consumer buffer with ``final_response``
+    immediately before finalization. When the same final was already emitted
+    as deltas directly after commentary, no textual token boundary separates
+    the two phases. Callback identity alone is NOT delta provenance. Record
+    only text appended by the think-filtered delta drain, before finish()
+    replaces the upstream ledger. Completed commentary and tool boundaries
+    end the candidate segment. All state is consumer-local and updated by the
+    drain task, not the cross-thread producer callbacks.
+    """
+
+    try:
+        from gateway.stream_consumer import (
+            GatewayStreamConsumer,
+            ensure_closed_code_fences,
+        )
+    except ImportError as exc:
+        logger.warning(
+            "qqbot-connect-hotfix: could not patch turn-final context: %s",
+            exc,
+        )
+        return "QQ C2C turn-final context unavailable"
+
+    original_send_or_edit = GatewayStreamConsumer._send_or_edit
+    if getattr(original_send_or_edit, _TURN_FINAL_PATCHED, False):
+        return "QQ C2C turn-final context already patched"
+
+    original_append = GatewayStreamConsumer._append_accumulated
+
+    def _eligible(self):
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        return bool(
+            getattr(self, "_use_draft_streaming", False)
+            and isinstance(adapter, QQAdapter)
+            and chat_id in _native_lane_chats(adapter)
+            and _is_c2c(adapter, chat_id)
+        )
+
+    @functools.wraps(original_append)
+    def _append_accumulated(self, text: str):
+        original_append(self, text)
+        if text and _eligible(self):
+            self._qq_native_final_delta_segment = (
+                getattr(self, "_qq_native_final_delta_segment", "") + text
+            )
+            self._qq_native_final_delta_content = self._stream_ledger
+
+    @functools.wraps(original_send_or_edit)
+    async def _send_or_edit(
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
+    ):
+        adapter = getattr(self, "adapter", None)
+        chat_id = str(getattr(self, "chat_id", "") or "")
+        trusted = bool(
+            finalize
+            and is_turn_final
+            and _eligible(self)
+        )
+        if not trusted:
+            if finalize and not is_turn_final and _eligible(self):
+                self._qq_native_final_delta_segment = ""
+            return await original_send_or_edit(
+                self,
+                text,
+                finalize=finalize,
+                is_turn_final=is_turn_final,
+            )
+
+        token = _TURN_FINAL_CONTEXT.set(
+            _TurnFinalContext(
+                adapter_identity=id(adapter),
+                chat_id=chat_id,
+                anchor=str(getattr(self, "_initial_reply_to_id", "") or ""),
+                delta_payload=ensure_closed_code_fences(self._clean_for_display(
+                    getattr(self, "_qq_native_final_delta_segment", "")
+                )),
+                delta_content=ensure_closed_code_fences(self._clean_for_display(
+                    getattr(self, "_qq_native_final_delta_content", "")
+                )),
+            )
+        )
+        try:
+            return await original_send_or_edit(
+                self,
+                text,
+                finalize=finalize,
+                is_turn_final=is_turn_final,
+            )
+        finally:
+            _TURN_FINAL_CONTEXT.reset(token)
+
+    setattr(_send_or_edit, _TURN_FINAL_PATCHED, True)
+    GatewayStreamConsumer._append_accumulated = _append_accumulated
+    GatewayStreamConsumer._send_or_edit = _send_or_edit
+    return "QQ C2C turn-final context patched"
+
+
 def _reply_anchor(metadata: Optional[Dict[str, Any]]) -> str:
     if not isinstance(metadata, dict):
         return ""
@@ -993,25 +1207,242 @@ def _stream_body(
     return body
 
 
-async def _post_stream_frame(
+def _native_stream_now(adapter) -> float:
+    """Return an injectable monotonic clock for stream lifetime decisions."""
+
+    clock = getattr(adapter, "_qq_native_stream_clock", time.monotonic)
+    return float(clock())
+
+
+def _native_stream_max_age(adapter) -> float:
+    """Return the proactive QQ stream rollover age in seconds."""
+
+    value = float(
+        getattr(
+            adapter,
+            "_qq_native_stream_max_age_seconds",
+            _NATIVE_STREAM_MAX_AGE_SECONDS,
+        )
+    )
+    if value <= 0:
+        raise RuntimeError("QQ native stream max age must be positive")
+    return value
+
+
+def _stream_frame_retry_delays(adapter) -> tuple[float, ...]:
+    """Return the bounded per-carrier cooldown sequence."""
+
+    values = tuple(
+        float(value)
+        for value in getattr(
+            adapter,
+            "_qq_native_stream_frame_retry_delays",
+            _FRAME_RETRY_DELAYS,
+        )
+    )
+    if not values or any(value < 0 for value in values):
+        raise RuntimeError("QQ stream frame retry delays must be non-negative")
+    return values
+
+
+def _defer_stream_frame(adapter, state: _QQC2CStream, content: str) -> None:
+    """Coalesce one failed cumulative frame behind a bounded cooldown."""
+
+    delays = _stream_frame_retry_delays(adapter)
+    state.frame_failure_count += 1
+    delay = delays[min(state.frame_failure_count - 1, len(delays) - 1)]
+    state.frame_retry_not_before = _native_stream_now(adapter) + delay
+    state.deferred_content = str(content or "")
+
+
+def _clear_stream_frame_cooldown(
+    state: _QQC2CStream,
+    *,
+    keep_deferred: bool = False,
+) -> None:
+    """Reset carrier backoff after a successful request or carrier rollover."""
+
+    state.frame_failure_count = 0
+    state.frame_retry_not_before = 0.0
+    if not keep_deferred:
+        state.deferred_content = None
+
+
+def _cancel_stream_expiry(state: _QQC2CStream) -> None:
+    """Cancel the independent carrier deadline without cancelling itself."""
+
+    task = state.expiry_task
+    state.expiry_task = None
+    if task is None or task.done():
+        return
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if task is not current:
+        task.cancel()
+
+
+async def _expire_stream_at_deadline(adapter, state: _QQC2CStream) -> None:
+    """Seal or retire one carrier even when its turn emits no new delta."""
+
+    sleeper = getattr(adapter, "_qq_native_stream_sleep", asyncio.sleep)
+    try:
+        while True:
+            opened = state.opened_monotonic
+            if opened is None:
+                return
+            remaining = (
+                opened
+                + _native_stream_max_age(adapter)
+                - _native_stream_now(adapter)
+            )
+            if remaining <= 0:
+                break
+            await sleeper(remaining)
+
+        async with state.lock:
+            streams, _anchors = _stream_maps(adapter)
+            if (
+                streams.get(_stream_key(state.chat_id, state.draft_id)) is not state
+                or state.sealed
+                or state.retired
+                or not state.stream_msg_id
+                or state.opened_monotonic is None
+            ):
+                return
+            head = str(state.last_content or "")
+            data, seal_error = await _post_seal_with_retries(
+                adapter,
+                state,
+                head,
+            )
+            if seal_error is not None:
+                if not state.retired:
+                    state.retired = True
+                logger.warning(
+                    "qqbot-connect-hotfix: QQ C2C silent carrier retired "
+                    "at age deadline for chat=%s draft=%s: %s",
+                    state.chat_id,
+                    state.draft_id,
+                    seal_error,
+                )
+                return
+
+            committed = state.committed_prefix + head
+            completed_id = state.stream_msg_id or state.last_completed_stream_id
+            age = _native_stream_now(adapter) - state.opened_monotonic
+            # Reuse the same state and lock so a draft already waiting behind
+            # this timer observes the new unopened carrier atomically.
+            state.msg_seq = int(adapter._next_msg_seq(state.reply_to))
+            state.stream_msg_id = None
+            state.next_index = 0
+            state.last_content = ""
+            state.committed_prefix = committed
+            state.last_completed_stream_id = completed_id
+            state.opened_monotonic = None
+            state.sealed = False
+            _clear_stream_frame_cooldown(state, keep_deferred=True)
+            logger.info(
+                "qqbot-connect-hotfix: QQ C2C silent age rollover sealed "
+                "draft=%s committed=%s age=%.1fs",
+                state.draft_id,
+                len(committed),
+                age,
+            )
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.exception(
+            "qqbot-connect-hotfix: QQ C2C expiry task failed for chat=%s "
+            "draft=%s: %s",
+            state.chat_id,
+            state.draft_id,
+            exc,
+        )
+        async with state.lock:
+            streams, _anchors = _stream_maps(adapter)
+            if streams.get(_stream_key(state.chat_id, state.draft_id)) is state:
+                state.retired = True
+    finally:
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if state.expiry_task is current:
+            state.expiry_task = None
+
+
+def _schedule_stream_expiry(adapter, state: _QQC2CStream) -> None:
+    """Arm the independent lifetime task for a newly opened carrier."""
+
+    _cancel_stream_expiry(state)
+    state.expiry_task = asyncio.create_task(
+        _expire_stream_at_deadline(adapter, state),
+        name=f"qq-c2c-expiry-{state.draft_id}",
+    )
+
+
+def _is_terminal_stream_lifetime_error(exc: Exception) -> bool:
+    """Recognize QQ's observed terminal C2C carrier-lifetime response."""
+
+    return "同一流式消息发送超过时间限制" in str(exc)
+
+
+def _is_terminal_passive_reply_budget_error(exc: Exception) -> bool:
+    """Recognize QQ's terminal response-window or reply-budget rejection."""
+
+    message = str(exc)
+    return (
+        "回复消息失败，被动回复时间或者次数超过限制" in message
+        or "40034128" in message
+    )
+
+
+def _is_stale_stream_index_error(exc: Exception) -> bool:
+    """Return whether QQ confirms that the submitted index was consumed."""
+
+    return "请求参数index需要递增" in str(exc)
+
+
+def _is_ambiguous_stream_transport_error(exc: Exception) -> bool:
+    """Recognize failures where QQ may have consumed the request body."""
+
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError)):
+            return True
+        if type(current).__name__ in {
+            "ConnectError",
+            "NetworkError",
+            "ReadError",
+            "RemoteProtocolError",
+            "TimeoutException",
+            "WriteError",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return "QQ Bot API timeout [" in str(exc)
+
+
+def _record_accepted_stream_frame(
     adapter,
     state: _QQC2CStream,
-    content: str,
-    *,
-    input_state: int,
-):
-    body = _stream_body(adapter, state, content, input_state=input_state)
-    data = await adapter._api_request(
-        "POST",
-        f"/v2/users/{state.chat_id}/stream_messages",
-        body,
-    )
+    body: Dict[str, Any],
+    data: Optional[Dict[str, Any]],
+) -> None:
+    """Advance local ownership after QQ accepted one exact frame."""
+
     response_id = str((data or {}).get("id") or "").strip()
-    if state.next_index == 0 and not response_id:
+    first_frame = state.next_index == 0
+    if first_frame and not response_id:
         raise RuntimeError("QQ stream first frame did not return stream_msg_id")
     if response_id:
         state.stream_msg_id = response_id
-    if state.next_index == 0:
+    if first_frame:
+        state.opened_monotonic = _native_stream_now(adapter)
         logger.info(
             "qqbot-connect-hotfix: QQ C2C stream opened draft=%s",
             state.draft_id,
@@ -1023,9 +1454,133 @@ async def _post_stream_frame(
             state.next_index,
         )
     state.next_index += 1
-    # Track the exact body submitted to QQ, including the platform length cap.
-    # A later replace/seal request must preserve this already-submitted prefix.
     state.last_content = str(body["content_raw"])
+    if first_frame:
+        _schedule_stream_expiry(adapter, state)
+
+
+async def _reconcile_ambiguous_stream_frame(
+    adapter,
+    state: _QQC2CStream,
+) -> None:
+    """Resolve one lost response without repeatedly reusing its index."""
+
+    pending = state.ambiguous_frame
+    if pending is None:
+        return
+    body = _stream_body(
+        adapter,
+        state,
+        pending.content,
+        input_state=pending.input_state,
+    )
+    if int(body["index"]) != pending.index:
+        state.retired = True
+        state.ambiguous_frame = None
+        _cancel_stream_expiry(state)
+        raise RuntimeError("QQ ambiguous stream index changed before reconciliation")
+    try:
+        data = await adapter._api_request(
+            "POST",
+            f"/v2/users/{state.chat_id}/stream_messages",
+            body,
+        )
+    except Exception as exc:
+        if _is_stale_stream_index_error(exc) and state.stream_msg_id:
+            # The only bounded retry proves the first request was accepted.
+            # Promote that submitted body locally and continue at index + 1.
+            _record_accepted_stream_frame(adapter, state, body, None)
+            state.ambiguous_frame = None
+            logger.info(
+                "qqbot-connect-hotfix: reconciled accepted QQ C2C frame "
+                "after lost response for chat=%s draft=%s index=%s",
+                state.chat_id,
+                state.draft_id,
+                pending.index,
+            )
+            return
+        # A second inconclusive result cannot be retried safely. Retire the
+        # carrier and keep last_content at the last acknowledged body so final
+        # fallback preserves every potentially unseen character.
+        state.retired = True
+        state.ambiguous_frame = None
+        _cancel_stream_expiry(state)
+        raise
+    _record_accepted_stream_frame(adapter, state, body, data)
+    state.ambiguous_frame = None
+
+
+async def _post_stream_frame(
+    adapter,
+    state: _QQC2CStream,
+    content: str,
+    *,
+    input_state: int,
+):
+    if state.ambiguous_frame is not None:
+        pending = state.ambiguous_frame
+        await _reconcile_ambiguous_stream_frame(adapter, state)
+        if state.retired:
+            raise RuntimeError("QQ stream retired after ambiguous transport failure")
+        submitted = str(content or "")[: getattr(adapter, "MAX_MESSAGE_LENGTH", 4000)]
+        if pending.input_state == input_state and pending.content == submitted:
+            # Reconciliation already accepted this exact request, including a
+            # seal frame. Returning its carrier id avoids a redundant next
+            # index while preserving the caller's normal success path.
+            return {"id": state.stream_msg_id} if state.stream_msg_id else {}
+    body = _stream_body(adapter, state, content, input_state=input_state)
+    try:
+        data = await adapter._api_request(
+            "POST",
+            f"/v2/users/{state.chat_id}/stream_messages",
+            body,
+        )
+    except Exception as exc:
+        if state.stream_msg_id and _is_terminal_stream_lifetime_error(exc):
+            # Production evidence shows QQ has already consumed this index:
+            # retrying it receives "index needs to increment" and cannot make
+            # the expired carrier writable again.  Record the submitted text
+            # as visible ownership, then permanently retire this carrier.
+            state.last_content = str(body["content_raw"])
+            state.next_index += 1
+            state.retired = True
+            _cancel_stream_expiry(state)
+            logger.warning(
+                "qqbot-connect-hotfix: QQ C2C stream retired after terminal "
+                "lifetime response for chat=%s draft=%s index=%s",
+                state.chat_id,
+                state.draft_id,
+                body["index"],
+            )
+        elif _is_terminal_passive_reply_budget_error(exc):
+            # QQ rejected this request because the inbound message can no
+            # longer authorize passive replies. No stream or ordinary retry
+            # against the same anchor can succeed, so stop issuing frames.
+            state.retired = True
+            state.passive_reply_exhausted = True
+            _cancel_stream_expiry(state)
+            logger.warning(
+                "qqbot-connect-hotfix: QQ C2C stream retired after terminal "
+                "passive-reply budget response for chat=%s draft=%s index=%s",
+                state.chat_id,
+                state.draft_id,
+                body["index"],
+            )
+        elif _is_ambiguous_stream_transport_error(exc):
+            state.ambiguous_frame = _QQC2CAmbiguousFrame(
+                index=int(body["index"]),
+                content=str(body["content_raw"]),
+                input_state=int(body["input_state"]),
+            )
+            logger.warning(
+                "qqbot-connect-hotfix: QQ C2C stream response ambiguous for "
+                "chat=%s draft=%s index=%s; one reconciliation pending",
+                state.chat_id,
+                state.draft_id,
+                body["index"],
+            )
+        raise
+    _record_accepted_stream_frame(adapter, state, body, data)
     return data
 
 
@@ -1131,10 +1686,32 @@ def _append_nonoverlapping(base: str, suffix_source: str) -> str:
     return base + separator + suffix_source
 
 
-def _compose_final_content(state: _QQC2CStream, content: str) -> str:
+def _compose_final_content(
+    state: _QQC2CStream,
+    content: str,
+    *,
+    proven_delta_content: Optional[str] = None,
+) -> str:
     """Build the lossless final text from visible drafts and Hermes' final."""
 
-    return _append_nonoverlapping(_visible_stream_content(state), str(content or ""))
+    visible = _visible_stream_content(state)
+    final = str(content or "")
+    if (
+        proven_delta_content
+        and proven_delta_content.startswith(visible)
+        and proven_delta_content.endswith(final)
+    ):
+        # The exact unfinished segment owns the final. The saved pre-finish
+        # ledger also covers the tail drained in the same tick as finish(),
+        # which may never have been sent as a draft. Never rewrite QQ's prefix.
+        return proven_delta_content
+    if visible and final.startswith(visible):
+        # A cumulative final is authoritative and may intentionally omit a
+        # deferred draft that never became visible.
+        return final
+    deferred = str(state.deferred_content or "")
+    base = deferred if deferred.startswith(visible) else visible
+    return _append_nonoverlapping(base, final)
 
 
 def _unseen_final_suffix(state: _QQC2CStream, target: str) -> Optional[str]:
@@ -1177,12 +1754,17 @@ async def _post_seal_with_retries(
                 state.next_index,
                 exc,
             )
+            if state.retired:
+                break
     return data, last_error
 
 
 def _replace_active_stream(adapter, state: _QQC2CStream) -> None:
     streams, anchors = _stream_maps(adapter)
     state_key = _stream_key(state.chat_id, state.draft_id)
+    previous = streams.get(state_key)
+    if previous is not None and previous is not state:
+        _cancel_stream_expiry(previous)
     streams[state_key] = state
     anchors[(state.chat_id, state.reply_to)] = state_key
 
@@ -1195,17 +1777,51 @@ async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
     as ``committed_prefix``; a new stream then owns only the remaining suffix.
     """
 
-    active = _active_content(
-        state,
-        content,
-        require_committed_prefix=True,
-    )
     max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 4000))
     if max_length <= 0:
         raise RuntimeError("QQ native stream message limit must be positive")
 
     current = state
     data = None
+    if (
+        current.stream_msg_id
+        and current.opened_monotonic is not None
+        and _native_stream_now(adapter) - current.opened_monotonic
+        >= _native_stream_max_age(adapter)
+    ):
+        head = str(current.last_content or "")
+        data, seal_error = await _post_seal_with_retries(
+            adapter,
+            current,
+            head,
+        )
+        if seal_error is not None:
+            raise seal_error
+        current.sealed = True
+        committed = current.committed_prefix + head
+        completed_id = current.stream_msg_id or current.last_completed_stream_id
+        logger.info(
+            "qqbot-connect-hotfix: QQ C2C age rollover sealed "
+            "draft=%s committed=%s age=%.1fs",
+            current.draft_id,
+            len(committed),
+            _native_stream_now(adapter) - current.opened_monotonic,
+        )
+        current = _QQC2CStream(
+            chat_id=current.chat_id,
+            draft_id=current.draft_id,
+            reply_to=current.reply_to,
+            msg_seq=int(adapter._next_msg_seq(current.reply_to)),
+            committed_prefix=committed,
+            last_completed_stream_id=completed_id,
+        )
+        _replace_active_stream(adapter, current)
+
+    active = _active_content(
+        current,
+        content,
+        require_committed_prefix=True,
+    )
     while len(active) > max_length:
         head = active[:max_length]
         if not current.stream_msg_id:
@@ -1277,6 +1893,11 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
                 success=True,
                 message_id=state.stream_msg_id,
             )
+        if state.retired:
+            return _send_result(
+                success=False,
+                error="QQ stream was retired after a terminal QQ response",
+            )
         if not state.stream_msg_id:
             return _send_result(
                 success=False,
@@ -1313,6 +1934,60 @@ async def _seal_stream(adapter, state: _QQC2CStream, content: str):
             message_id=state.stream_msg_id,
             raw_response=data,
         )
+
+
+async def _complete_retired_stream_final(
+    adapter,
+    original_send,
+    state: _QQC2CStream,
+    *,
+    target: str,
+    final_payload: str,
+    chat_id: str,
+    reply_to: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+):
+    """Deliver only text not owned by a deliberately retired QQ carrier."""
+
+    if state.passive_reply_exhausted:
+        # The platform rejected the inbound anchor itself, not just this
+        # carrier. Preserve the state for a later Gateway recovery path, but
+        # do not issue an ordinary send that QQ has already declared invalid.
+        return _send_result(
+            success=False,
+            error="QQ passive-reply window or budget is exhausted",
+        )
+
+    unseen = _unseen_final_suffix(state, target)
+    if unseen is None:
+        return _send_result(
+            success=False,
+            error="QQ retired stream final no longer extends visible content",
+        )
+    if unseen:
+        result = await original_send(
+            adapter,
+            chat_id,
+            unseen,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not getattr(result, "success", False):
+            return result
+    else:
+        result = _send_result(
+            success=True,
+            message_id=state.stream_msg_id,
+            raw_response={"qq_retired_stream_owned": True},
+        )
+    _remember_turn_tombstone(
+        adapter,
+        state,
+        final_payload=final_payload,
+        final_content=target,
+    )
+    _remove_stream(adapter, state)
+    return result
 
 
 async def _complete_turn_final(
@@ -1417,6 +2092,58 @@ async def _complete_turn_final(
             metadata=metadata,
         )
 
+    final_context = _TURN_FINAL_CONTEXT.get()
+    proven_delta_content = None
+    if (
+        isinstance(final_context, _TurnFinalContext)
+        and final_context.adapter_identity == id(adapter)
+        and final_context.chat_id == str(chat_id)
+        and final_context.anchor == anchor
+        and bool(final_context.delta_payload)
+        and str(content or "").startswith(final_context.delta_payload)
+        and final_context.delta_content.endswith(final_context.delta_payload)
+    ):
+        # A post-stream footer may extend the exact unfinished final segment.
+        # Keep its ledger prefix and replace only that proven segment, never
+        # infer a segment boundary from the visible text's suffix alone.
+        proven_delta_content = (
+            final_context.delta_content[:-len(final_context.delta_payload)]
+            + str(content or "")
+        )
+
+    if state.retired:
+        if state.ordinary_owned_suffix:
+            # A fallback suffix was already delivered before a terminal
+            # lifetime response rejected the cleanup seal. Both carriers are
+            # immutable, so publish ownership and remove the dead lifecycle.
+            final_content = _ordinary_owned_final_content(state)
+            _remember_turn_tombstone(
+                adapter,
+                state,
+                final_payload=str(content or ""),
+                final_content=final_content,
+            )
+            _remove_stream(adapter, state)
+            return _send_result(
+                success=True,
+                message_id=state.stream_msg_id,
+                raw_response={"qq_retired_stream_owned": True},
+            )
+        return await _complete_retired_stream_final(
+            adapter,
+            original_send,
+            state,
+            target=_compose_final_content(
+                state,
+                content,
+                proven_delta_content=proven_delta_content,
+            ),
+            final_payload=str(content or ""),
+            chat_id=str(chat_id),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     if state.ordinary_owned_suffix:
         # A prior successful final fallback is authoritative and immutable.
         # Retried final callbacks may only close the still-open native prefix.
@@ -1461,7 +2188,11 @@ async def _complete_turn_final(
     # Hermes can finish with either the whole cumulative response or a short
     # final-only answer. Compose against the exact QQ-acknowledged prefix, then
     # apply one rollover path.
-    target = _compose_final_content(state, content)
+    target = _compose_final_content(
+        state,
+        content,
+        proven_delta_content=proven_delta_content,
+    )
     rollover_error = None
     try:
         async with state.lock:
@@ -1480,6 +2211,18 @@ async def _complete_turn_final(
         latest_state = latest_streams.get(state_key)
         if latest_state is not None:
             state = latest_state
+
+    if state.retired:
+        return await _complete_retired_stream_final(
+            adapter,
+            original_send,
+            state,
+            target=target,
+            final_payload=str(content or ""),
+            chat_id=str(chat_id),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     unseen = _unseen_final_suffix(state, target)
     if unseen is None:
@@ -1516,7 +2259,9 @@ async def _complete_turn_final(
             if state.stream_msg_id:
                 state.ordinary_owned_suffix = unseen
                 recovery = await _seal_stream(adapter, state, state.last_content)
-                if not recovery.success:
+                if state.retired:
+                    _remove_stream(adapter, state)
+                elif not recovery.success:
                     cache_completed = False
                     logger.warning(
                         "qqbot-connect-hotfix: suffix fallback sent but "
@@ -1783,6 +2528,12 @@ def patch_qq_c2c_streaming(QQAdapter):
                     success=False,
                     error="QQ native stream is already sealed",
                 )
+            if state.retired:
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_retired_stream_owned": True},
+                )
             if (
                 state.ordinary_owned_suffix
                 or state.close_pending_final_content is not None
@@ -1796,6 +2547,17 @@ def patch_qq_c2c_streaming(QQAdapter):
                     message_id=state.stream_msg_id,
                     raw_response={"qq_visible_final_owned": True},
                 )
+            if state.frame_retry_not_before > _native_stream_now(self):
+                state.deferred_content = str(content or "")
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_stream_frame_coalesced": True},
+                )
+            # Until this cumulative body is acknowledged, retain it as the
+            # lossless final fallback source. This also preserves the newest
+            # body if an ambiguous reconciliation retires the carrier.
+            state.deferred_content = str(content or "")
             try:
                 state, data = await _send_cumulative_draft(
                     self,
@@ -1803,15 +2565,34 @@ def patch_qq_c2c_streaming(QQAdapter):
                     content,
                 )
             except Exception as exc:
-                logger.warning(
-                    "qqbot-connect-hotfix: QQ C2C stream frame deferred for "
-                    "chat=%s draft=%s index=%s; retaining final-only "
-                    "fallback: %s",
-                    chat_id,
-                    draft_id,
-                    state.next_index,
-                    exc,
-                )
+                # A rollover installs the replacement carrier before its
+                # first frame is submitted. If that submission receives a
+                # terminal response, the local variable still references the
+                # sealed predecessor; resolve the authoritative carrier before
+                # deciding whether this frame may be retried.
+                latest_streams, _latest_anchors = _stream_maps(self)
+                latest_state = latest_streams.get(state_key)
+                if latest_state is not None:
+                    state = latest_state
+                if state.retired:
+                    logger.warning(
+                        "qqbot-connect-hotfix: QQ C2C stream carrier retired "
+                        "for chat=%s draft=%s; awaiting final suffix: %s",
+                        chat_id,
+                        draft_id,
+                        exc,
+                    )
+                else:
+                    _defer_stream_frame(self, state, content)
+                    logger.warning(
+                        "qqbot-connect-hotfix: QQ C2C stream frame deferred for "
+                        "chat=%s draft=%s index=%s; retaining final-only "
+                        "fallback: %s",
+                        chat_id,
+                        draft_id,
+                        state.next_index,
+                        exc,
+                    )
                 # QQ ordinary messages cannot be edited. Reporting failure to
                 # GatewayStreamConsumer would make its generic fallback send a
                 # partial message immediately, then another final. Keep the
@@ -1819,6 +2600,8 @@ def patch_qq_c2c_streaming(QQAdapter):
                 # if no frame ever opens, the final send wrapper falls back to
                 # exactly one ordinary message.
                 return _send_result(success=True)
+
+            _clear_stream_frame_cooldown(state)
 
         return _send_result(
             success=True,
@@ -1901,6 +2684,21 @@ def patch_qq_c2c_streaming(QQAdapter):
                     )
                     _remove_final_only_pending(self, pending_state)
                 return _send_result(success=True)
+            if state.retired:
+                owner = _remember_turn_tombstone(
+                    self,
+                    state,
+                    final_payload=str(content or ""),
+                    final_content=_visible_stream_content(state),
+                    final_delivered=False,
+                )
+                _remember_transient_turn_completion(self, owner)
+                _remove_stream(self, state)
+                return _send_result(
+                    success=True,
+                    message_id=state.stream_msg_id,
+                    raw_response={"qq_retired_stream_abandoned": True},
+                )
             if state.ordinary_owned_suffix:
                 # A completed ordinary fallback already owns every character
                 # after the native stream's last acknowledged frame. Delayed
@@ -1996,9 +2794,17 @@ def patch_qq_c2c_streaming(QQAdapter):
             and metadata.get("_interim_send") is True
             and _is_c2c(self, str(chat_id))
         ):
+            commentary_context = _COMPLETED_COMMENTARY_CONTEXT.get()
+            trusted_commentary = bool(
+                isinstance(commentary_context, _CompletedCommentaryContext)
+                and commentary_context.adapter_identity == id(self)
+                and commentary_context.chat_id == str(chat_id)
+                and commentary_context.cleaned == str(content or "")
+            )
             anchor = str(
                 reply_to
                 or metadata.get("reply_to_message_id")
+                or (commentary_context.anchor if trusted_commentary else "")
                 or ""
             ).strip()
             streams, anchors = _stream_maps(self)
@@ -2029,9 +2835,17 @@ def patch_qq_c2c_streaming(QQAdapter):
                 state is not None
                 and state.stream_msg_id
                 and not state.sealed
-                and _terminal_payload_is_owned(
-                    _visible_stream_content(state),
-                    str(content or ""),
+                and (
+                    _terminal_payload_is_owned(
+                        _visible_stream_content(state),
+                        str(content or ""),
+                    )
+                    or (
+                        trusted_commentary
+                        and _visible_stream_content(state).endswith(
+                            str(content or "")
+                        )
+                    )
                 )
             ):
                 logger.debug(
@@ -2124,6 +2938,10 @@ def patch_qq_c2c_streaming(QQAdapter):
     QQAdapter.send_typing = send_typing
     gate_status = _patch_gateway_stream_gate(QQAdapter)
     overflow_status = _patch_gateway_overflow_limit(QQAdapter)
+    commentary_status = _patch_gateway_commentary_context(QQAdapter)
+    final_context_status = _patch_gateway_turn_final_context(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
     logger.info("qqbot-connect-hotfix: %s", overflow_status)
+    logger.info("qqbot-connect-hotfix: %s", commentary_status)
+    logger.info("qqbot-connect-hotfix: %s", final_context_status)
     return "QQ C2C native streaming patched"

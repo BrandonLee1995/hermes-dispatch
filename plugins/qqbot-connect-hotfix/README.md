@@ -24,6 +24,131 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+Version 1.8.19 closes the remaining Issue #3 lifetime and failure-storm gaps.
+Transport timeouts and disconnect-style errors are ambiguous because QQ may
+have consumed a frame before the response was lost. The plugin now retains the
+exact submitted frame and permits one bounded reconciliation of that index. An
+`index needs to increment` response proves the first request was accepted, so
+local ownership advances once; an exact reconciled seal is not sent again. If
+the reconciliation is still inconclusive, the carrier is retired and the
+latest unacknowledged cumulative body remains assigned to the ordinary final
+fallback instead of being silently discarded.
+
+Opening a carrier also arms an independent, cancellable 480-second monotonic
+deadline. It seals the acknowledged carrier even when the turn emits no new
+draft delta, then atomically leaves the same turn ready to open a fresh carrier
+at index 0. A failed deadline seal deliberately retires the old carrier.
+Completion, abandonment, explicit rollover, and state removal cancel the timer
+so it cannot emit a late seal.
+
+Non-terminal frame failures now use a per-carrier `0.2/0.8/2.0/5.0` second
+bounded cooldown. Deltas received during a cooldown make no QQ request and
+replace one retained cumulative body; the next eligible attempt sends only the
+latest body. A final may bypass the progress cooldown, but its lossless target
+includes the newest coalesced cumulative text. No new configuration key is
+required.
+
+QQ's `40034128` / `回复消息失败，被动回复时间或者次数超过限制`
+response is not a transient frame failure. It means the inbound passive-reply
+anchor can no longer authorize either a replacement carrier or an ordinary
+reply. The plugin immediately retires the active replacement carrier and
+suppresses later draft attempts and direct final fallback requests for that
+turn instead of entering the non-terminal cooldown loop. The rejected body is
+not recorded as visible, and the explicit failed final result leaves recovery
+to the Gateway rather than falsely claiming delivery.
+
+The real Gateway consumer can stream the final answer as deltas immediately
+after commentary and then replace its accumulator with the same authoritative
+`final_response` during `finish()`. There may be no whitespace at that phase
+boundary. Version 1.8.20 corrects the 1.8.19 shortcut: turn-final identity alone
+does not prove that a matching suffix was emitted as final deltas. The patch
+records the current unfinished, think-filtered delta segment and its complete
+ledger before upstream `finish()` can overwrite it. Completed commentary and
+tool-segment boundaries reset the candidate segment. Only a final that equals
+or prefix-extends that explicit segment can reuse its ledger, and only when
+the result preserves QQ's entire acknowledged prefix. This also covers a tail
+drained in the same tick as `finish()` and a post-stream verifier footer.
+An independent `FINAL` after `status NOTFINAL` is appended, not swallowed.
+Generic/direct sends retain the existing token-boundary rule. Provenance is
+consumer-local, passed through a task-local adapter/chat/anchor context, and
+does not modify QQ wire metadata or other platforms.
+
+Enable: install the persistent plugin and keep the existing native-C2C
+streaming settings; no new config key is needed. Roll back using the installer
+backup as described below; do not edit the Hermes installation.
+
+Verify with `test_streaming.py` and the complete QQ/plugin/install matrices.
+The deterministic regressions cover accepted-frame timeouts, ambiguous seals,
+an unknowable index-0 response, silent expiry with no new callback, timer
+cancellation, repeated non-terminal failures, coalescing, and a final arriving
+during cooldown, terminal passive-reply-budget retirement after rollover, and
+a combined age-rollover + consecutive-commentary + 9,000-character streamed
+final whose completion payload has exactly one visible owner.
+Real-consumer negatives cover independent suffix finals with and without a
+completed-commentary callback; additional cases cover tool boundaries,
+think-filtered and chunked deltas, same-tick tails, augmented and rewritten
+finals. See the [review evidence bundle](../../docs/evidence/pr-4/README.md)
+for separately versioned live captures, redacted logs, and carrier ownership.
+Before release, also run one real QQ C2C turn longer than 12
+minutes with more than 9,000 final characters and a WebSocket reconnect. Every
+message must remain at or below 4,000 characters, the completion marker must
+appear once, every carrier must be sealed or deliberately retired, and logs
+must contain no stale-index storm or duplicate final. Roll back from the exact
+external installer backup and restart only the affected profile.
+
+The 1.8.19 procurement acceptance run completed on 2026-08-29: 872.5 seconds,
+one silent 480.5-second age rollover, one natural `4009` reconnect, a 10,234
+character final, and visible carrier lengths of 4,000, 4,000, and 2,318 after
+the 78-character progress carrier. QQ showed one response completion marker;
+Gateway confirmed final suppression with no stale-index, passive-reply-budget,
+ordinary-fallback, or duplicate-final error in the acceptance interval.
+
+Version 1.8.18 fixes a real QQ regression discovered during the 1.8.17 age
+rollover canary. Codex can finish consecutive commentary items whose streamed
+deltas are concatenated without whitespace, for example `STARTSTEP1`. Hermes
+then emits a completed `_interim_send` callback containing only `STEP1`. The
+general token-boundary guard correctly refused to infer ownership from that
+word-internal suffix, but the result was one growing native bubble plus one
+ordinary duplicate bubble for every completed stage.
+
+The plugin now wraps only `GatewayStreamConsumer._send_commentary()` for an
+active QQ C2C native lane and publishes a task-local completed-commentary
+context while the original callback runs. The adapter may accept a boundaryless
+terminal suffix only when adapter, chat, inbound reply anchor, and exact cleaned
+commentary all match that same consumer callback and the native carrier already
+ends with the text. Generic `_interim_send` calls, unrelated statuses, other
+anchors, ambiguous streams, and existing word-internal overlap negatives keep
+their prior behavior. Verify with the consecutive-commentary consumer
+regression and a real QQ private task that emits at least two alphanumeric stage
+markers; only one growing native carrier may be visible before the final.
+
+Version 1.8.17 prevents expired QQ C2C native carriers from entering a stale
+index/seal retry loop. QQ documents monotonically increasing `index` values and
+one stable `stream_msg_id`, but does not publish a carrier lifetime. Production
+evidence showed a carrier expiring after roughly ten minutes and, critically,
+QQ consuming the last frame while returning `同一流式消息发送超过时间限制`;
+retrying that index then returned `请求参数index需要递增`.
+
+The plugin now rolls an open carrier at an internal 480-second monotonic safety
+boundary, sealing its acknowledged body and opening index 0 on a new carrier
+before the observed expiry. If the exact terminal lifetime response still
+occurs, the submitted frame becomes the carrier's final visible owner and that
+carrier is deliberately retired: later drafts, final cleanup, and abandonment
+never send another index or seal to it. A real final uses the existing
+per-anchor single-flight and tombstone machinery to send only the suffix not
+owned by the terminal frame; a terminal frame that already contains the whole
+final sends no ordinary duplicate. Other API/network errors retain the existing
+retry and final-fallback behavior.
+
+No new configuration key is required. Enable the existing QQ streaming
+settings, install with `scripts/install-plugins.sh`, and verify with
+`test_streaming.py` plus the complete plugin and installer matrices. The
+regressions cover age rollover, terminal responses during draft/final/seal,
+late frames, cancellation, suffix-only fallback, and repeated-final
+suppression. Roll back from the exact external installer backup, restart only
+the affected profile, and verify QQ Ready; disabling QQ streaming restores the
+upstream non-streaming private-message path.
+
 Version 1.8.16 retains successful abandon-first completion context on the
 existing bounded per-anchor claim until every caller already registered on that
 claim exits. A final or late draft queued behind the abandonment therefore does

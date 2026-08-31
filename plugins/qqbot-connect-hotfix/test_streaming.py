@@ -57,8 +57,18 @@ class DummyAdapter:
         self.typing_calls = []
         self.stream_counter = 0
         self.fail_next_stream = False
+        self.fail_stream_attempts = 0
         self.fail_seal_attempts = 0
         self.fail_tail_open_attempts = 0
+        self.accept_then_expire_stream = False
+        self.accepted_terminal_calls = []
+        self.accept_then_timeout_stream = False
+        self.accepted_timeout_calls = []
+        self.timeout_reconciliation_complete = False
+        self.timeout_first_stream_attempts = 0
+        self.fail_reply_budget_on_new_stream = False
+        self.native_stream_now = 0.0
+        self._qq_native_stream_clock = lambda: self.native_stream_now
 
     def _guess_chat_type(self, chat_id):
         chat_id = str(chat_id)
@@ -74,9 +84,33 @@ class DummyAdapter:
     async def _api_request(self, method, path, body):
         call = (method, path, dict(body))
         self.api_calls.append(call)
+        if self.accept_then_expire_stream and body["index"] > 0:
+            if not self.accepted_terminal_calls:
+                self.accepted_terminal_calls.append(call)
+                raise RuntimeError("同一流式消息发送超过时间限制")
+            raise RuntimeError("请求参数index需要递增")
+        if self.accept_then_timeout_stream and body["index"] > 0:
+            if not self.accepted_timeout_calls:
+                self.accepted_timeout_calls.append(call)
+                raise TimeoutError("response lost after QQ accepted the frame")
+            if not self.timeout_reconciliation_complete:
+                self.timeout_reconciliation_complete = True
+                raise RuntimeError("请求参数index需要递增")
+        if body["index"] == 0 and self.timeout_first_stream_attempts:
+            self.timeout_first_stream_attempts -= 1
+            raise TimeoutError("first stream response lost")
+        if (
+            self.fail_reply_budget_on_new_stream
+            and body["index"] == 0
+            and self.stream_counter > 0
+        ):
+            raise RuntimeError("回复消息失败，被动回复时间或者次数超过限制")
         if self.fail_next_stream:
             self.fail_next_stream = False
             raise RuntimeError("stream unavailable")
+        if self.fail_stream_attempts and body["input_state"] == 1:
+            self.fail_stream_attempts -= 1
+            raise RuntimeError("stream rate limited")
         if (
             body["index"] == 0
             and len(body["content_raw"]) == 100
@@ -164,7 +198,8 @@ def assert_exact_final_ownership(adapter, target):
         if state.stream_msg_id and not state.sealed
     ]
     ordinary = [item[1] for item in adapter.normal_sends]
-    assert "".join(sealed + visible_open + ordinary) == target
+    actual = "".join(sealed + visible_open + ordinary)
+    assert actual == target, (actual, target)
 
 
 async def wait_for_final_claim_users(
@@ -284,6 +319,550 @@ async def main():
         == "正在读取知识库\n最终答案"
     )
     assert not adapter.normal_sends
+
+    # QQ expires one C2C native carrier after roughly ten minutes even when
+    # its content stays below MAX_MESSAGE_LENGTH.  Rollover must therefore be
+    # driven by stream age as well as size: keep the first carrier before the
+    # safety boundary, then seal it and open index 0 on a new carrier once the
+    # fake monotonic clock crosses the boundary.
+    age_rollover = DummyAdapter()
+    age_rollover._qq_native_stream_max_age_seconds = 480.0
+    age_metadata = {"reply_to_message_id": "inbound-age-rollover"}
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one",
+        age_metadata,
+    )
+    age_rollover.native_stream_now = 479.0
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one plus",
+        age_metadata,
+    )
+    assert [call[2]["input_state"] for call in age_rollover.api_calls] == [1, 1]
+    age_rollover.native_stream_now = 481.0
+    await age_rollover.send_draft(
+        "user-age-rollover",
+        1002,
+        "phase one plus tail",
+        age_metadata,
+    )
+    age_bodies = [call[2] for call in age_rollover.api_calls]
+    assert [body["input_state"] for body in age_bodies] == [1, 1, 10, 1]
+    assert [body["index"] for body in age_bodies] == [0, 1, 2, 0]
+    assert age_bodies[2]["content_raw"] == "phase one plus"
+    assert age_bodies[3]["content_raw"] == " tail"
+    assert "stream_msg_id" not in age_bodies[3]
+
+    # Expiry must not depend on another draft callback. Open one carrier, let
+    # the independently scheduled fake timer reach 480 seconds while the turn
+    # stays silent, and require the old carrier to seal before any new delta.
+    silent_expiry = DummyAdapter()
+    silent_expiry._qq_native_stream_max_age_seconds = 480.0
+    expiry_waiting = anyio.Event()
+    expiry_release = anyio.Event()
+
+    async def release_silent_expiry(delay):
+        assert delay == 480.0
+        expiry_waiting.set()
+        await expiry_release.wait()
+        silent_expiry.native_stream_now += delay
+
+    silent_expiry._qq_native_stream_sleep = release_silent_expiry
+    silent_metadata = {"reply_to_message_id": "inbound-silent-expiry"}
+    await silent_expiry.send_draft(
+        "user-silent-expiry",
+        1003,
+        "silent phase",
+        silent_metadata,
+    )
+    with anyio.fail_after(1):
+        await expiry_waiting.wait()
+    assert len(silent_expiry.api_calls) == 1
+    expiry_release.set()
+    with anyio.fail_after(1):
+        while len(silent_expiry.api_calls) < 2:
+            await anyio.sleep(0)
+    silent_bodies = [call[2] for call in silent_expiry.api_calls]
+    assert [body["input_state"] for body in silent_bodies] == [1, 10]
+    assert [body["index"] for body in silent_bodies] == [0, 1]
+    await silent_expiry.send_draft(
+        "user-silent-expiry",
+        1003,
+        "silent phase resumed",
+        silent_metadata,
+    )
+    silent_bodies = [call[2] for call in silent_expiry.api_calls]
+    assert [body["index"] for body in silent_bodies] == [0, 1, 0]
+    assert silent_bodies[-1]["content_raw"] == " resumed"
+    assert "stream_msg_id" not in silent_bodies[-1]
+
+    # Completing a turn before its deadline must cancel the independent timer;
+    # releasing the old sleeper afterwards cannot emit a late seal.
+    cancelled_expiry = DummyAdapter()
+    cancelled_waiting = anyio.Event()
+    cancelled_release = anyio.Event()
+    cancelled_observed = anyio.Event()
+
+    async def observe_cancelled_expiry(delay):
+        assert delay == 480.0
+        cancelled_waiting.set()
+        try:
+            await cancelled_release.wait()
+        finally:
+            cancelled_observed.set()
+
+    cancelled_expiry._qq_native_stream_sleep = observe_cancelled_expiry
+    cancelled_metadata = {"reply_to_message_id": "inbound-cancelled-expiry"}
+    await cancelled_expiry.send_draft(
+        "user-cancelled-expiry",
+        1012,
+        "progress",
+        cancelled_metadata,
+    )
+    with anyio.fail_after(1):
+        await cancelled_waiting.wait()
+    cancelled_final = await cancelled_expiry.send(
+        "user-cancelled-expiry",
+        "progress\nFINAL",
+        reply_to="inbound-cancelled-expiry",
+        metadata={"notify": True, **cancelled_metadata},
+    )
+    assert cancelled_final.success
+    with anyio.fail_after(1):
+        await cancelled_observed.wait()
+    calls_after_cancelled_final = len(cancelled_expiry.api_calls)
+    cancelled_release.set()
+    await anyio.sleep(0)
+    assert len(cancelled_expiry.api_calls) == calls_after_cancelled_final
+
+    # QQ can consume and display a continuation frame while returning the
+    # terminal stream-lifetime error.  The next request would then receive
+    # "index needs to increment".  Treat that carrier as deliberately retired:
+    # no later draft or seal may touch it, and final delivery owns only the
+    # suffix beyond the accepted terminal frame.
+    lifetime_terminal = DummyAdapter()
+    lifetime_metadata = {"reply_to_message_id": "inbound-lifetime-terminal"}
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        "progress",
+        lifetime_metadata,
+    )
+    lifetime_terminal.accept_then_expire_stream = True
+    accepted_terminal_text = "progress accepted before expiry"
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        accepted_terminal_text,
+        lifetime_metadata,
+    )
+    calls_after_terminal = len(lifetime_terminal.api_calls)
+    await lifetime_terminal.send_draft(
+        "user-lifetime-terminal",
+        1004,
+        accepted_terminal_text + " ignored late draft",
+        lifetime_metadata,
+    )
+    assert len(lifetime_terminal.api_calls) == calls_after_terminal
+    lifetime_final_text = accepted_terminal_text + "\nFINAL"
+    lifetime_final = await lifetime_terminal.send(
+        "user-lifetime-terminal",
+        lifetime_final_text,
+        reply_to="inbound-lifetime-terminal",
+        metadata={"notify": True, **lifetime_metadata},
+    )
+    assert lifetime_final.success
+    assert len(lifetime_terminal.api_calls) == calls_after_terminal
+    assert [item[1] for item in lifetime_terminal.normal_sends] == ["\nFINAL"]
+    assert accepted_terminal_text + lifetime_terminal.normal_sends[0][1] == lifetime_final_text
+    lifetime_repeat = await lifetime_terminal.send(
+        "user-lifetime-terminal",
+        lifetime_final_text,
+        reply_to="inbound-lifetime-terminal",
+        metadata={"notify": True, **lifetime_metadata},
+    )
+    assert lifetime_repeat.success
+    assert len(lifetime_terminal.normal_sends) == 1
+
+    # A transport timeout is ambiguous: QQ may have accepted and displayed the
+    # submitted frame even though the client received no response. Reconcile
+    # that exact index at most once. If QQ says the index must advance, promote
+    # the timed-out body to acknowledged ownership, continue at the next index,
+    # and never enter a stale-index retry loop.
+    ambiguous_timeout = DummyAdapter()
+    ambiguous_metadata = {
+        "reply_to_message_id": "inbound-ambiguous-timeout"
+    }
+    await ambiguous_timeout.send_draft(
+        "user-ambiguous-timeout",
+        1008,
+        "progress",
+        ambiguous_metadata,
+    )
+    ambiguous_timeout.accept_then_timeout_stream = True
+    timed_out_body = "progress accepted before timeout"
+    await ambiguous_timeout.send_draft(
+        "user-ambiguous-timeout",
+        1008,
+        timed_out_body,
+        ambiguous_metadata,
+    )
+    ambiguous_timeout.native_stream_now = 0.2
+    latest_body = timed_out_body + " plus latest"
+    await ambiguous_timeout.send_draft(
+        "user-ambiguous-timeout",
+        1008,
+        latest_body,
+        ambiguous_metadata,
+    )
+    ambiguous_bodies = [call[2] for call in ambiguous_timeout.api_calls]
+    assert [body["index"] for body in ambiguous_bodies] == [0, 1, 1, 2]
+    assert ambiguous_bodies[-1]["content_raw"] == latest_body
+    assert [
+        call[2]["index"] for call in ambiguous_timeout.successful_api_calls
+    ] == [0, 2]
+    ambiguous_final = await ambiguous_timeout.send(
+        "user-ambiguous-timeout",
+        latest_body + "\nFINAL",
+        reply_to="inbound-ambiguous-timeout",
+        metadata={"notify": True, **ambiguous_metadata},
+    )
+    assert ambiguous_final.success
+    assert not ambiguous_timeout.normal_sends
+
+    # If the lost response belongs to a seal, the bounded reconciliation that
+    # receives "index must advance" has already proved that exact seal frame
+    # was consumed. Do not emit a second seal at the next index.
+    ambiguous_seal = DummyAdapter()
+    ambiguous_seal_metadata = {
+        "reply_to_message_id": "inbound-ambiguous-seal"
+    }
+    await ambiguous_seal.send_draft(
+        "user-ambiguous-seal",
+        1010,
+        "progress",
+        ambiguous_seal_metadata,
+    )
+    ambiguous_seal.accept_then_timeout_stream = True
+    ambiguous_seal_result = await ambiguous_seal.abandon_open_draft(
+        "user-ambiguous-seal",
+        "progress",
+        ambiguous_seal_metadata,
+    )
+    assert ambiguous_seal_result.success
+    ambiguous_seal_bodies = [call[2] for call in ambiguous_seal.api_calls]
+    assert [body["index"] for body in ambiguous_seal_bodies] == [0, 1, 1]
+    assert [body["input_state"] for body in ambiguous_seal_bodies] == [1, 10, 10]
+
+    # If even the one reconciliation of an ambiguous index-0 open loses its
+    # response, the carrier id is unknowable. Retire it locally, never retry a
+    # third time, and preserve the newest coalesced body in one ordinary final
+    # instead of assuming the uncertain open was visible.
+    ambiguous_open = DummyAdapter()
+    ambiguous_open.timeout_first_stream_attempts = 2
+    ambiguous_open_metadata = {
+        "reply_to_message_id": "inbound-ambiguous-open"
+    }
+    await ambiguous_open.send_draft(
+        "user-ambiguous-open",
+        1011,
+        "opening progress",
+        ambiguous_open_metadata,
+    )
+    ambiguous_open.native_stream_now = 0.2
+    latest_ambiguous_open = "opening progress plus latest"
+    await ambiguous_open.send_draft(
+        "user-ambiguous-open",
+        1011,
+        latest_ambiguous_open,
+        ambiguous_open_metadata,
+    )
+    calls_after_ambiguous_open = len(ambiguous_open.api_calls)
+    await ambiguous_open.send_draft(
+        "user-ambiguous-open",
+        1011,
+        latest_ambiguous_open + " ignored late draft",
+        ambiguous_open_metadata,
+    )
+    assert calls_after_ambiguous_open == 2
+    assert len(ambiguous_open.api_calls) == calls_after_ambiguous_open
+    ambiguous_open_final = await ambiguous_open.send(
+        "user-ambiguous-open",
+        "FINAL",
+        reply_to="inbound-ambiguous-open",
+        metadata={"notify": True, **ambiguous_open_metadata},
+    )
+    assert ambiguous_open_final.success
+    assert [item[1] for item in ambiguous_open.normal_sends] == [
+        latest_ambiguous_open + "\nFINAL"
+    ]
+
+    # Ordinary non-terminal failures must not turn every following delta into
+    # another request. Each carrier uses bounded cooldowns and coalesces all
+    # cumulative updates in that window into the latest body.
+    cooled_frames = DummyAdapter()
+    cooled_frames._qq_native_stream_frame_retry_delays = (10.0, 20.0)
+    cooled_metadata = {"reply_to_message_id": "inbound-cooled-frames"}
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress",
+        cooled_metadata,
+    )
+    cooled_frames.fail_stream_attempts = 2
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress one",
+        cooled_metadata,
+    )
+    cooled_frames.native_stream_now = 1.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress two",
+        cooled_metadata,
+    )
+    cooled_frames.native_stream_now = 9.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress three",
+        cooled_metadata,
+    )
+    assert len(cooled_frames.api_calls) == 2
+    cooled_frames.native_stream_now = 10.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress three",
+        cooled_metadata,
+    )
+    cooled_frames.native_stream_now = 11.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress four",
+        cooled_metadata,
+    )
+    cooled_frames.native_stream_now = 29.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress five",
+        cooled_metadata,
+    )
+    assert len(cooled_frames.api_calls) == 3
+    cooled_frames.native_stream_now = 30.0
+    await cooled_frames.send_draft(
+        "user-cooled-frames",
+        1009,
+        "progress five",
+        cooled_metadata,
+    )
+    cooled_bodies = [call[2] for call in cooled_frames.api_calls]
+    assert [body["index"] for body in cooled_bodies] == [0, 1, 1, 1]
+    assert [body["content_raw"] for body in cooled_bodies] == [
+        "progress",
+        "progress one",
+        "progress three",
+        "progress five",
+    ]
+
+    # Once QQ declares the inbound passive-reply window exhausted, neither a
+    # new native carrier nor an ordinary retry can make that anchor writable.
+    # Retire the replacement carrier immediately and suppress all later draft
+    # requests instead of applying the ordinary cooldown forever.
+    reply_budget_terminal = DummyAdapter()
+    reply_budget_terminal._qq_native_stream_max_age_seconds = 480.0
+    reply_budget_metadata = {
+        "reply_to_message_id": "inbound-reply-budget-terminal"
+    }
+    await reply_budget_terminal.send_draft(
+        "user-reply-budget-terminal",
+        1014,
+        "progress",
+        reply_budget_metadata,
+    )
+    reply_budget_terminal.native_stream_now = 481.0
+    reply_budget_terminal.fail_reply_budget_on_new_stream = True
+    await reply_budget_terminal.send_draft(
+        "user-reply-budget-terminal",
+        1014,
+        "progress after rollover",
+        reply_budget_metadata,
+    )
+    calls_after_reply_budget = len(reply_budget_terminal.api_calls)
+    reply_budget_terminal.native_stream_now = 600.0
+    await reply_budget_terminal.send_draft(
+        "user-reply-budget-terminal",
+        1014,
+        "progress ignored after terminal budget",
+        reply_budget_metadata,
+    )
+    await reply_budget_terminal.send_draft(
+        "user-reply-budget-terminal",
+        1014,
+        "another ignored delta",
+        reply_budget_metadata,
+    )
+    assert calls_after_reply_budget == 3
+    assert len(reply_budget_terminal.api_calls) == calls_after_reply_budget
+    terminal_final = await reply_budget_terminal.send(
+        "user-reply-budget-terminal",
+        "final cannot use an exhausted inbound anchor",
+        metadata={"notify": True, **reply_budget_metadata},
+    )
+    assert not terminal_final.success
+    assert not reply_budget_terminal.normal_send_attempts
+    assert len(reply_budget_terminal.api_calls) == calls_after_reply_budget
+
+    # A final may arrive while the carrier is still cooling down. The latest
+    # coalesced cumulative body must remain the lossless base for that final.
+    cooled_final = DummyAdapter()
+    cooled_final._qq_native_stream_frame_retry_delays = (10.0,)
+    cooled_final_metadata = {"reply_to_message_id": "inbound-cooled-final"}
+    await cooled_final.send_draft(
+        "user-cooled-final",
+        1013,
+        "progress",
+        cooled_final_metadata,
+    )
+    cooled_final.fail_stream_attempts = 1
+    await cooled_final.send_draft(
+        "user-cooled-final",
+        1013,
+        "progress one",
+        cooled_final_metadata,
+    )
+    cooled_final.native_stream_now = 1.0
+    latest_cooled_final = "progress one plus latest"
+    await cooled_final.send_draft(
+        "user-cooled-final",
+        1013,
+        latest_cooled_final,
+        cooled_final_metadata,
+    )
+    cooled_final_result = await cooled_final.send(
+        "user-cooled-final",
+        "FINAL",
+        reply_to="inbound-cooled-final",
+        metadata={"notify": True, **cooled_final_metadata},
+    )
+    assert cooled_final_result.success
+    assert_exact_final_ownership(
+        cooled_final,
+        latest_cooled_final + "\nFINAL",
+    )
+
+    # The terminal lifetime response can also arrive on the final cumulative
+    # replace itself.  That accepted frame already owns the whole final, so the
+    # completion path must tombstone it without a seal or ordinary duplicate.
+    lifetime_during_final = DummyAdapter()
+    lifetime_final_metadata = {
+        "reply_to_message_id": "inbound-lifetime-during-final"
+    }
+    await lifetime_during_final.send_draft(
+        "user-lifetime-during-final",
+        1005,
+        "progress",
+        lifetime_final_metadata,
+    )
+    lifetime_during_final.accept_then_expire_stream = True
+    accepted_whole_final = "progress\nFINAL"
+    lifetime_during_final_result = await lifetime_during_final.send(
+        "user-lifetime-during-final",
+        accepted_whole_final,
+        reply_to="inbound-lifetime-during-final",
+        metadata={"notify": True, **lifetime_final_metadata},
+    )
+    assert lifetime_during_final_result.success
+    assert len(lifetime_during_final.api_calls) == 2
+    assert not lifetime_during_final.normal_sends
+    lifetime_during_final_repeat = await lifetime_during_final.send(
+        "user-lifetime-during-final",
+        accepted_whole_final,
+        reply_to="inbound-lifetime-during-final",
+        metadata={"notify": True, **lifetime_final_metadata},
+    )
+    assert lifetime_during_final_repeat.success
+    assert len(lifetime_during_final.api_calls) == 2
+
+    # The same terminal response may arrive while proactive age rollover seals
+    # the old carrier.  One seal attempt retires it; no stale seal/index retry
+    # is allowed, and the eventual final owns only the unseen suffix.
+    lifetime_during_rollover = DummyAdapter()
+    lifetime_during_rollover._qq_native_stream_max_age_seconds = 480.0
+    lifetime_rollover_metadata = {
+        "reply_to_message_id": "inbound-lifetime-during-rollover"
+    }
+    await lifetime_during_rollover.send_draft(
+        "user-lifetime-during-rollover",
+        1006,
+        "phase one",
+        lifetime_rollover_metadata,
+    )
+    lifetime_during_rollover.accept_then_expire_stream = True
+    lifetime_during_rollover.native_stream_now = 481.0
+    await lifetime_during_rollover.send_draft(
+        "user-lifetime-during-rollover",
+        1006,
+        "phase one late draft",
+        lifetime_rollover_metadata,
+    )
+    assert len(lifetime_during_rollover.api_calls) == 2
+    assert lifetime_during_rollover.api_calls[-1][2]["input_state"] == 10
+    lifetime_rollover_final = await lifetime_during_rollover.send(
+        "user-lifetime-during-rollover",
+        "phase one\nFINAL",
+        reply_to="inbound-lifetime-during-rollover",
+        metadata={"notify": True, **lifetime_rollover_metadata},
+    )
+    assert lifetime_rollover_final.success
+    assert len(lifetime_during_rollover.api_calls) == 2
+    assert [item[1] for item in lifetime_during_rollover.normal_sends] == [
+        "\nFINAL"
+    ]
+
+    # Cancellation also terminalizes retired state locally without touching the
+    # expired carrier.  A later real final remains eligible for one full normal
+    # delivery because cancellation did not claim it as delivered.
+    lifetime_cancelled = DummyAdapter()
+    lifetime_cancelled_metadata = {
+        "reply_to_message_id": "inbound-lifetime-cancelled"
+    }
+    await lifetime_cancelled.send_draft(
+        "user-lifetime-cancelled",
+        1007,
+        "progress",
+        lifetime_cancelled_metadata,
+    )
+    lifetime_cancelled.accept_then_expire_stream = True
+    await lifetime_cancelled.send_draft(
+        "user-lifetime-cancelled",
+        1007,
+        "progress accepted",
+        lifetime_cancelled_metadata,
+    )
+    lifetime_cancelled_call_count = len(lifetime_cancelled.api_calls)
+    lifetime_cancelled_close = await lifetime_cancelled.abandon_open_draft(
+        "user-lifetime-cancelled",
+        "progress accepted",
+        lifetime_cancelled_metadata,
+    )
+    assert lifetime_cancelled_close.success
+    assert len(lifetime_cancelled.api_calls) == lifetime_cancelled_call_count
+    lifetime_cancelled_final = await lifetime_cancelled.send(
+        "user-lifetime-cancelled",
+        "FULL FINAL",
+        reply_to="inbound-lifetime-cancelled",
+        metadata={"notify": True, **lifetime_cancelled_metadata},
+    )
+    assert lifetime_cancelled_final.success
+    assert [item[1] for item in lifetime_cancelled.normal_sends] == ["FULL FINAL"]
 
     # Hermes can stream user-visible commentary before it produces the short
     # turn-final answer. QQ replace mode forbids removing an already-delivered
@@ -2358,6 +2937,198 @@ async def main():
         "PR187_TERMINAL_ONCE"
     ) is True
 
+    # Consecutive Codex commentary items can be concatenated by the consumer
+    # without a textual token boundary. The completed-item callback is still
+    # the same consumer-owned segment and must not create one ordinary bubble
+    # per minute beside the growing native carrier.
+    commentary_sequence = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(
+        commentary_sequence,
+        "user-commentary-sequence",
+    )
+    commentary_sequence_consumer = GatewayStreamConsumer(
+        commentary_sequence,
+        "user-commentary-sequence",
+        cfg,
+        initial_reply_to_id="inbound-commentary-sequence",
+    )
+    commentary_sequence_final = "QQ_AGE_FINAL"
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(commentary_sequence_consumer.run)
+        commentary_sequence_consumer.on_delta("QQ_AGE_START")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_commentary("QQ_AGE_START")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_delta("QQ_AGE_STEP_1")
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.on_commentary("QQ_AGE_STEP_1")
+        await anyio.sleep(0.05)
+        # Codex streams the final answer as agentMessage deltas before Hermes
+        # supplies the same authoritative final_response to finish(). There is
+        # no guaranteed whitespace between the last commentary and final.
+        commentary_sequence_consumer.on_delta(commentary_sequence_final)
+        await anyio.sleep(0.05)
+        commentary_sequence_consumer.finish(commentary_sequence_final)
+
+    assert not commentary_sequence.normal_sends, (
+        commentary_sequence.api_calls,
+        commentary_sequence.normal_sends,
+    )
+    assert_exact_final_ownership(
+        commentary_sequence,
+        "QQ_AGE_STARTQQ_AGE_STEP_1" + commentary_sequence_final,
+    )
+
+    # An authoritative final callback is not proof of delta ownership. This
+    # uses the real consumer (not direct adapter.send) so the final context is
+    # active even though FINAL was never streamed as its own segment.
+    for completed_commentary in (False, True):
+        independent_final = GatewayDummyAdapter()
+        streaming_mod._mark_native_lane(independent_final, "user-independent-final")
+        independent_consumer = GatewayStreamConsumer(
+            independent_final,
+            "user-independent-final",
+            cfg,
+            initial_reply_to_id="inbound-independent-final",
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(independent_consumer.run)
+            independent_consumer.on_delta("status NOTFINAL")
+            await anyio.sleep(0.05)
+            if completed_commentary:
+                independent_consumer.on_commentary("status NOTFINAL")
+                await anyio.sleep(0.05)
+            independent_consumer.finish("FINAL")
+        assert_exact_final_ownership(independent_final, "status NOTFINAL\nFINAL")
+        assert not independent_final.normal_sends
+        assert independent_consumer.final_response_sent is True
+        assert independent_consumer.delivered_final_matches("FINAL") is True
+
+    # finish() may drain the final tail and adopt the authoritative payload in
+    # the same tick, before the last cumulative draft reaches QQ. Provenance
+    # must preserve the visible prefix and add only the undisplayed tail.
+    partial_final = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(partial_final, "user-partial-final")
+    partial_consumer = GatewayStreamConsumer(
+        partial_final, "user-partial-final", cfg,
+        initial_reply_to_id="inbound-partial-final",
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(partial_consumer.run)
+        partial_consumer.on_delta("PROGRESS")
+        partial_consumer.on_commentary("PROGRESS")
+        await anyio.sleep(0.05)
+        partial_consumer.on_delta("FI")
+        await anyio.sleep(0.05)
+        partial_consumer.on_delta("NAL")
+        partial_consumer.finish("FINAL")
+    assert_exact_final_ownership(partial_final, "PROGRESSFINAL")
+    assert not partial_final.normal_sends
+
+    # Hermes may append a verifier/footer after streaming the answer. The
+    # explicit final segment, not a suffix guess, lets that extension keep the
+    # streamed portion exactly once.
+    augmented_final = GatewayDummyAdapter()
+    streaming_mod._mark_native_lane(augmented_final, "user-augmented-final")
+    augmented_consumer = GatewayStreamConsumer(
+        augmented_final, "user-augmented-final", cfg,
+        initial_reply_to_id="inbound-augmented-final",
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(augmented_consumer.run)
+        augmented_consumer.on_delta("PROGRESS")
+        augmented_consumer.on_commentary("PROGRESS")
+        await anyio.sleep(0.05)
+        augmented_consumer.on_delta("FINAL")
+        await anyio.sleep(0.05)
+        augmented_consumer.finish("FINAL\nverified")
+    assert_exact_final_ownership(augmented_final, "PROGRESSFINAL\nverified")
+
+    # Boundary resets, filtered deltas, and an authoritative rewrite must not
+    # leak/invent provenance. Drive only public consumer callbacks; the QQ API
+    # sink below is the external visibility boundary.
+    provenance_cases = (
+        ("tool-break", "status NOTFINAL", "break", (), "FINAL", "status NOTFINAL\nFINAL"),
+        ("filtered", "PROGRESS\n", "commentary", ("<think>hidden</think>FI", "NAL"),
+         "FINAL", "PROGRESS\nFINAL"),
+        ("rewritten", "PROGRESS", "commentary", ("DRAFT",),
+         "FINAL", "PROGRESSDRAFT\nFINAL"),
+        ("no-commentary", "", "none", ("FI", "NAL"), "FINAL", "FINAL"),
+    )
+    for label, progress, boundary, deltas, final_text, expected in provenance_cases:
+        case_adapter = GatewayDummyAdapter()
+        chat = "user-provenance-" + label
+        streaming_mod._mark_native_lane(case_adapter, chat)
+        case_consumer = GatewayStreamConsumer(
+            case_adapter, chat, cfg, initial_reply_to_id="inbound-" + label,
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(case_consumer.run)
+            if progress:
+                case_consumer.on_delta(progress)
+                await anyio.sleep(0.05)
+            if boundary == "commentary":
+                case_consumer.on_commentary(progress)
+            elif boundary == "break":
+                case_consumer.on_segment_break()
+            await anyio.sleep(0.05)
+            for delta in deltas:
+                case_consumer.on_delta(delta)
+                await anyio.sleep(0.05)
+            case_consumer.finish(final_text)
+        assert_exact_final_ownership(case_adapter, expected)
+        assert not case_adapter.normal_sends
+        assert case_consumer.final_response_sent is True
+
+    # Combine the live failure's boundaries: an age rollover, consecutive
+    # commentary without whitespace, a >9,000-character final streamed as
+    # deltas, and the same authoritative final passed to finish(). The final
+    # must remain one logical owner and fit inside four QQ carriers rather
+    # than being appended a second time until the passive-reply budget fails.
+    long_final_boundary = GatewayDummyAdapter()
+    long_final_boundary._qq_native_stream_max_age_seconds = 480.0
+    streaming_mod._mark_native_lane(
+        long_final_boundary,
+        "user-long-final-boundary",
+    )
+    long_final_consumer = GatewayStreamConsumer(
+        long_final_boundary,
+        "user-long-final-boundary",
+        cfg,
+        initial_reply_to_id="inbound-long-final-boundary",
+    )
+    long_final_text = "QQ_LONG_FINAL_BEGIN" + ("X" * 9200) + "QQ_LONG_FINAL_OK"
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(long_final_consumer.run)
+        long_final_consumer.on_delta("QQ_LONG_PROGRESS_1")
+        await anyio.sleep(0.05)
+        long_final_consumer.on_commentary("QQ_LONG_PROGRESS_1")
+        await anyio.sleep(0.05)
+        long_final_boundary.native_stream_now = 481.0
+        long_final_consumer.on_delta("QQ_LONG_PROGRESS_2")
+        await anyio.sleep(0.05)
+        long_final_consumer.on_commentary("QQ_LONG_PROGRESS_2")
+        await anyio.sleep(0.05)
+        long_final_consumer.on_delta(long_final_text)
+        await anyio.sleep(0.05)
+        long_final_consumer.finish(long_final_text)
+
+    long_final_target = (
+        "QQ_LONG_PROGRESS_1QQ_LONG_PROGRESS_2" + long_final_text
+    )
+    assert_exact_final_ownership(long_final_boundary, long_final_target)
+    long_final_bodies = [call[2] for call in long_final_boundary.api_calls]
+    assert sum(body["index"] == 0 for body in long_final_bodies) == 4
+    assert all(len(body["content_raw"]) <= 4000 for body in long_final_bodies)
+    assert "".join(
+        body["content_raw"]
+        for body in long_final_bodies
+        if body["input_state"] == 10
+    ).count("QQ_LONG_FINAL_OK") == 1
+    assert not long_final_boundary.normal_sends
+    assert long_final_consumer.final_response_sent is True
+    assert long_final_consumer.delivered_final_matches(long_final_text) is True
+
     # A response beyond one QQ message must roll over as complete native
     # stream chunks. Generic Hermes overflow would emit an ordinary head and
     # then reuse the draft id with a shorter tail, violating replace-prefix.
@@ -3316,6 +4087,16 @@ async def main():
     assert ("user-cancel", 5001) not in cancelled_streams
 
     print("qq_c2c_stream_open_continue_seal=ok")
+    print("qq_c2c_stream_age_rollover=ok")
+    print("qq_c2c_stream_silent_expiry_rollover=ok")
+    print("qq_c2c_stream_expiry_task_cancelled=ok")
+    print("qq_c2c_stream_lifetime_terminal_retirement=ok")
+    print("qq_c2c_stream_ambiguous_timeout_reconciled=ok")
+    print("qq_c2c_stream_ambiguous_seal_single_frame=ok")
+    print("qq_c2c_stream_ambiguous_open_lossless_fallback=ok")
+    print("qq_c2c_stream_frame_cooldown_coalescing=ok")
+    print("qq_c2c_stream_reply_budget_terminal_retirement=ok")
+    print("qq_c2c_stream_cooled_final_lossless=ok")
     print("qq_c2c_stream_seal_preserves_prefix=ok")
     print("qq_c2c_stream_parallel_dm_isolation=ok")
     print("qq_c2c_same_draft_id_cross_chat_isolation=ok")
@@ -3353,6 +4134,12 @@ async def main():
     print("qq_c2c_gateway_stream_gate=ok")
     print("qq_c2c_gateway_stream_consumer=ok")
     print("qq_c2c_streamed_commentary_single_carrier=ok")
+    print("qq_c2c_consecutive_commentary_single_carrier=ok")
+    print("qq_c2c_long_final_boundary_single_owner=ok")
+    print("qq_c2c_consumer_independent_suffix_final=ok")
+    print("qq_c2c_consumer_partial_final_same_tick=ok")
+    print("qq_c2c_consumer_augmented_final=ok")
+    print("qq_c2c_consumer_delta_provenance_boundaries=ok")
     print("qq_c2c_guild_dm_rejected=ok")
     print("qq_c2c_runtime_disable_revokes_lane=ok")
     print("qq_c2c_native_lane_registry_bounded=ok")
