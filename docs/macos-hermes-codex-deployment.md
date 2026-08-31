@@ -153,7 +153,7 @@ hermes --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
-Gateway。`qqbot-connect-hotfix` 1.8.20 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
+Gateway。`qqbot-connect-hotfix` 1.8.21 在旧版、预发布版或无法识别版本的 Hermes 上会 fail-closed，
 不会替换 `send`、`send_typing` 或 Gateway streaming gate。
 
 ## 5. 用命令配置 `config.yaml`
@@ -194,7 +194,7 @@ hermes config check
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.20 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
+- `qqbot-connect-hotfix` 1.8.21 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
   `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
   和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
   当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
@@ -277,6 +277,16 @@ hermes config check
   fully sealed anchor 的 1024-key 有界 broker completion 也用于拦截 changed-draft late frame；
   无稳定 inbound reply anchor 的 final 不使用空字符串 replay key，而是分别走真实投递。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
+- 1.8.21 修复 Hermes 在接受 steer 后仍更新旧 C2C 气泡的问题：仅暂停当前会话的输出，
+  等旧队列刷新后请求 steer；接受后先封口旧气泡、发送原有确认，再用新消息锚点打开新气泡。
+  不创建新的 Hermes session / Codex thread，不把分段封口当成任务完成。确认消息的禁用或
+  debounce 不影响分段；拒绝/未授权的 steer 不切换气泡。刷新屏障超过 5 秒时排队到下一轮，
+  不声称重定向成功；封口重试耗尽则记录警告并在本地退休旧气泡，未显示尾部仍保留。
+  原任务的 final fallback 跟随新锚点，旧锚点的迟到回调不重开气泡。群聊和频道私信仍走
+  原有非 C2C 接口。无需新增配置，按第 7 节的精确外部备份恢复并只重启目标 profile 即可回滚。
+  仅在活动 QQ/Codex 上将 `/steer`（或 busy steer 模式）的本地队列改为现有原生
+  `redirect()` → `turn/steer`：Codex 不执行 Hermes 的工具批次，因此不会消费原本的
+  pending-steer 队列。验收必须检查 Codex 收到更正并返回新要求的 final，不能只看确认消息。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
 - `agent.gateway_timeout=7200` 将 Gateway 的无活动保护延长到 2 小时；`/stop` 和消息
@@ -472,6 +482,7 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_group_roundtrip.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_final_delivery.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_streaming.py
+"$HERMES_PY" plugins/qqbot-connect-hotfix/test_steer.py
 "$HERMES_PY" plugins/message-snapshot-store/test_store.py
 "$HERMES_PY" plugins/message-snapshot-store/test_capture.py
 "$HERMES_PY" plugins/message-snapshot-store/test_materialize.py
@@ -636,6 +647,8 @@ hermes profile use default
 8. 如配置项目别名，由管理员要求“将当前会话关联到 finance 项目”，下一轮 cwd 切换
     且 thread 历史连续；非管理员执行同一操作必须被拒绝。
 9. 重启 Mac 并登录该部门账号：Gateway 自动恢复，日志无重复实例和端口冲突。
+10. 私聊任务输出中途发送修正及 `/steer`：旧气泡封口 → 确认消息 → 新气泡；最终回复仅一次，
+    thread 不变，日志没有 `40034128` 或重复普通 final。关闭/限频确认消息时仍应切换气泡。
 
 常用检查：
 

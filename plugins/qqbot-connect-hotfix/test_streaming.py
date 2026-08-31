@@ -4169,4 +4169,5 @@ async def main():
     print("qq_c2c_abandoned_completed_owner_replay_dedup=ok")
 
 
-anyio.run(main)
+if __name__ == "__main__":
+    anyio.run(main)

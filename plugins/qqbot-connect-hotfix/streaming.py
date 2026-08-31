@@ -132,6 +132,9 @@ class _QQC2CStream:
     next_index: int = 0
     last_content: str = ""
     committed_prefix: str = ""
+    # Text in bubbles closed by steering is not ownership evidence for a
+    # later, independently completed answer with the same words.
+    display_prefix: str = ""
     last_completed_stream_id: Optional[str] = None
     opened_monotonic: Optional[float] = None
     # QQ may accept and display a frame while returning its terminal lifetime
@@ -1705,12 +1708,15 @@ def _compose_final_content(
         # ledger also covers the tail drained in the same tick as finish(),
         # which may never have been sent as a draft. Never rewrite QQ's prefix.
         return proven_delta_content
-    if visible and final.startswith(visible):
+    current_visible = visible[len(state.display_prefix):]
+    if current_visible and final.startswith(visible):
         # A cumulative final is authoritative and may intentionally omit a
         # deferred draft that never became visible.
         return final
     deferred = str(state.deferred_content or "")
     base = deferred if deferred.startswith(visible) else visible
+    if state.display_prefix:
+        return state.display_prefix + _append_nonoverlapping(base[len(state.display_prefix):], final)
     return _append_nonoverlapping(base, final)
 
 
@@ -1813,6 +1819,7 @@ async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
             reply_to=current.reply_to,
             msg_seq=int(adapter._next_msg_seq(current.reply_to)),
             committed_prefix=committed,
+            display_prefix=current.display_prefix,
             last_completed_stream_id=completed_id,
         )
         _replace_active_stream(adapter, current)
@@ -1854,6 +1861,7 @@ async def _send_cumulative_draft(adapter, state: _QQC2CStream, content: str):
             reply_to=current.reply_to,
             msg_seq=int(adapter._next_msg_seq(current.reply_to)),
             committed_prefix=committed,
+            display_prefix=current.display_prefix,
             last_completed_stream_id=completed_id,
         )
         _replace_active_stream(adapter, current)
@@ -2940,8 +2948,11 @@ def patch_qq_c2c_streaming(QQAdapter):
     overflow_status = _patch_gateway_overflow_limit(QQAdapter)
     commentary_status = _patch_gateway_commentary_context(QQAdapter)
     final_context_status = _patch_gateway_turn_final_context(QQAdapter)
+    from .steering import patch_qq_steering
+    steer_status = patch_qq_steering(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
     logger.info("qqbot-connect-hotfix: %s", overflow_status)
     logger.info("qqbot-connect-hotfix: %s", commentary_status)
     logger.info("qqbot-connect-hotfix: %s", final_context_status)
+    logger.info("qqbot-connect-hotfix: %s", steer_status)
     return "QQ C2C native streaming patched"

@@ -77,7 +77,50 @@ Enable: install the persistent plugin and keep the existing native-C2C
 streaming settings; no new config key is needed. Roll back using the installer
 backup as described below; do not edit the Hermes installation.
 
-Verify with `test_streaming.py` and the complete QQ/plugin/install matrices.
+Version 1.8.21 gives accepted busy-message redirects and `/steer` a new **display
+segment**, without changing the Hermes session, Codex thread or agent turn.
+Upstream Hermes preserves the cumulative native draft across tool boundaries;
+without this compatibility hook, post-steer output appears above the user's
+correction inside the old bubble. A task-local route and per-session lock now
+pause the consumer at its existing FIFO flush barrier, observe the agent's
+actual acceptance, seal the old carrier, send the existing acknowledgement,
+then let the next delta open a new draft using the correction's reply anchor.
+For this active QQ/Codex context only, `steer()` uses Hermes' existing native
+`redirect()` → Codex `turn/steer` implementation: upstream `steer()` otherwise
+queues for Hermes-owned tool batches, which Codex app-server never drains.
+An accepted local queue is not treated as proof of Codex acceptance. Other
+platforms, standalone agent calls and non-Codex runtimes keep upstream behavior.
+The full ledger is retained, but previously visible text is a committed prefix
+and is never copied into the new bubble. Previous display segments cannot own
+an independently completed answer just because its text matches theirs.
+
+Acknowledgement cooldown/disable settings do not suppress segmentation. Empty
+segments make no QQ request. Rejected or unauthorized steering keeps upstream
+behavior. A five-second flush timeout queues the correction for the next turn
+without calling the agent or claiming successful redirection. Seal failures use
+the existing bounded retries, then retire the old carrier locally and retain
+unacknowledged text for the next bubble; a warning explicitly records that QQ
+did not confirm closure. Input-task cancellation after acceptance still commits
+the display transition; `/stop`/`/new` keep the consumer's stale-run guard. The
+old anchor rejects late drafts/finals, while the original background task's
+final fallback is rebased to the latest anchor. None of this marks the agent
+turn complete. Groups and guild DMs keep their existing non-C2C transport.
+
+Enable/rollback: install/restore the persistent plugin with the existing C2C
+settings, then restart only the target profile; no new setting or upstream
+source edit is required. First run `test_steer.py` (real Gateway busy callbacks,
+consumer and adapter with a fake QQ wire) and the complete existing matrix.
+Then canary a real private chat: old bubble sealed → redirect acknowledgement →
+new bubble, one final, unchanged thread, and no ordinary duplicate or `40034128`.
+Repeat for `/steer`; check a group @mention stays on the existing group path.
+Verify the explicit command's correction is present in the Codex transcript
+and its requested final is returned, not merely an acknowledgement/new bubble.
+The [1.8.21 procurement acceptance record](../../docs/evidence/qq-steer-1.8.21/README.md)
+contains the final-build private/group results, lifecycle timings and excluded
+first attempts. Steering acceptance does not imply instant cancellation of an
+already running native tool.
+
+Verify with `test_streaming.py`, `test_steer.py` and the complete QQ/plugin/install matrices.
 The deterministic regressions cover accepted-frame timeouts, ambiguous seals,
 an unknowable index-0 response, silent expiry with no new callback, timer
 cancellation, repeated non-terminal failures, coalescing, and a final arriving
@@ -548,12 +591,16 @@ PYTHONPATH=/path/to/hermes-agent \
 PYTHONPATH=/path/to/hermes-agent \
   /path/to/hermes-agent/venv/bin/python \
   plugins/qqbot-connect-hotfix/test_streaming.py
+PYTHONPATH=/path/to/hermes-agent \
+  /path/to/hermes-agent/venv/bin/python \
+  plugins/qqbot-connect-hotfix/test_steer.py
 ```
 
 In a real QQ private chat, start a tool-using task and verify that one message
 updates in place, a completed commentary is not repeated in an ordinary bubble,
-the last frame is sealed rather than duplicated, `/steer` does not seal the
-stream, and logs contain neither error `40034128` nor a second final send. Roll
+the last frame is sealed rather than duplicated, and accepted `/steer` seals
+only the old display segment before its acknowledgement and new bubble. Logs
+must contain neither error `40034128` nor a second final send. Roll
 back by setting
 `display.platforms.qqbot.streaming: false` and restarting only the affected
 profile's Gateway. The restart creates a fresh adapter, so the native-lane

@@ -1,5 +1,53 @@
 # Development Log
 
+## 2026-08-31 — Move accepted QQ steering to a new display segment
+
+Version 1.8.21 compensates for Hermes 0.20.5 preserving one cumulative native
+draft after an accepted redirect. A real QQ reproduction showed new output in
+the old bubble above the correction and acknowledgement. The Gateway consumer
+regression reproduced `BEFOREAFTERDONE` in one sealed carrier before the fix.
+
+The persistent QQ plugin now uses the upstream FIFO flush marker as a display
+barrier, observes actual agent acceptance, seals/retires the old carrier and
+rebases the live consumer plus its background-task final fallback. Existing
+carrier retry, lifetime, prefix and final-ownership helpers are reused. A
+per-session lock serializes steering; task-local identity prevents other
+profiles/chats inheriting it. ACK text is never parsed, ACK throttling does not
+govern segmentation, and no task/thread/session is recreated. The old reply
+identity is closed to late callbacks without marking the agent turn complete.
+An independent same-text final belongs to the new display segment.
+
+The first canary passed ordinary redirect but exposed a second upstream gap:
+explicit `/steer` acknowledged its local queue while Codex completed the old
+instruction. Its correction was absent from the Codex transcript. The new
+regression failed with `/steer never reached Codex turn/steer`. Only inside the
+active QQ/Codex steering context, the plugin now routes `steer()` through the
+existing native `redirect()` / `turn/steer` and relies on real acceptance.
+There is no second Hermes pending-steer queue and no new Codex turn.
+
+Tests cover ordinary/explicit steering, disabled/debounced and failed ACKs,
+repeated steering, same-tick final, fallback rebasing, late callbacks, seal
+retry/exhaustion/cancellation, deferred text, overflow, unauthorized/rejected
+input, empty initial output, barrier timeout queueing, stop during ACK and
+parallel routes. Group transport remains unchanged. Real QQ acceptance is
+recorded separately after the complete plugin/installer/static matrices pass.
+
+Enable by installing the persistent plugin with existing native-C2C settings;
+no config migration. Canary only the approved profile. Roll back with
+`scripts/install-plugins.sh --restore` using the exact external installer
+backup, then restart only that profile. Do not copy credentials or edit Hermes
+source. The final 1.8.21 procurement canary passed on 2026-08-31: explicit
+`/steer` and ordinary redirect each sealed the old private carrier, displayed
+the ACK, and completed in one new carrier without a duplicate final. A real
+group @mention correction reached the same Codex task and produced separate
+ordinary group replies; group transport was not changed to C2C streaming.
+The [acceptance record](evidence/qq-steer-1.8.21/README.md) separates these
+passes from the first failed explicit-steer attempt and timing-invalid runs.
+The 27 steering checks, full plugin/installer matrix and legacy fail-closed
+checks passed. Default/product processes and plugin hashes, and procurement
+config/.env hashes, remained unchanged. This change is submitted for review;
+the canary result is not approval to deploy default/product or merge it.
+
 ## 2026-08-31 — Require delta provenance before final ownership
 
 PR #4's review reproduced an independent `FINAL` swallowed after streamed
