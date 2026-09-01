@@ -1,9 +1,9 @@
 # macOS Hermes + Codex 快速部署手册
 
-本文用于在一台新的 Mac mini 上，从零部署 Hermes、Codex CLI、Codex App、
-QQ 渠道和持久化兼容插件。WhatsApp 当前不使用，部署时保持关闭。每个部门使用
-独立的 macOS 登录账号；部门内
-还可用 Hermes profile 建立多个小组专用 Agent。
+本文用于在 macOS 上新装或增量更新 Hermes、Codex CLI、Codex App、QQ 渠道和
+持久化兼容插件。每个部门使用独立的 macOS 登录账号；部门内还可用 Hermes profile
+建立多个小组专用 Agent。WhatsApp 是否启用是 **per-profile** 设置：新建且不使用
+WhatsApp 的 profile 默认关闭，已有 profile 必须保留其当前状态。
 
 本文不是旧 Mac 迁移或备份恢复手册。命令不固定 Hermes、Codex 或插件版本，
 始终安装执行时的最新稳定版。
@@ -13,6 +13,8 @@ QQ 渠道和持久化兼容插件。WhatsApp 当前不使用，部署时保持�
 - 每个 macOS 部门账号独立保存 `~/.codex`、`~/.hermes`、Keychain、会话和消息快照。
 - Codex App 可全机安装一次，但每个部门账号必须分别登录并授予 macOS 权限。
 - 不同 Gateway 不得同时使用同一套 QQ Bot 身份，否则会抢事件或重复回复。
+- 所有配置、插件安装、测试和重启命令都必须明确目标 profile；不要依赖
+  `hermes profile use` 的残留状态。
 - 不要提交 `.env`、真实手机号、QQ 标识、Bot 密钥或授权凭据。
 - Hermes 更新后重新安装最新 hotfix 并执行回归测试；不要修改安装目录作为永久修复。
 
@@ -74,12 +76,16 @@ codex --version
 登录该部门自己的 ChatGPT/Codex 账号，并安装或打开 Codex App：
 
 ```bash
-codex login
-codex login status
-codex app
+env -u CODEX_HOME codex login
+env -u CODEX_HOME codex login status
+env -u CODEX_HOME codex app
 ```
 
-编辑 `~/.codex/config.toml`，保留已有内容并加入默认权限策略：
+Codex 的本地状态位于 `CODEX_HOME`，未设置时默认为 `~/.codex`；其中包括
+`config.toml`、文件凭据 `auth.json`、历史、日志和缓存。参见
+[Codex 官方配置与状态位置说明](https://learn.chatgpt.com/docs/config-file/config-advanced#config-and-state-locations)。
+
+编辑默认 `CODEX_HOME` 的 `~/.codex/config.toml`，保留已有内容并加入默认权限策略：
 
 ```toml
 approval_policy = "on-request"
@@ -95,6 +101,10 @@ QQ，最终权限边界由 Codex 配置和每次审批决定。
 变量控制，不需要也不应向 `~/.codex/config.toml` 添加私有的 timeout、project 或
 thread 配置键。
 
+同一 macOS 账号内的命名 Hermes profile 如需隔离用户相关 MCP，必须使用独立
+`CODEX_HOME`；具体设置见第 9、11 节。Codex App 的 macOS 权限属于当前登录账号，
+不因 `CODEX_HOME` 改变；Codex 配置、MCP、历史和文件凭据则按 `CODEX_HOME` 隔离。
+
 在“系统设置 → 隐私与安全性”中，按实际启用能力分别为 Codex App/终端批准：
 
 - 辅助功能；
@@ -105,24 +115,24 @@ thread 配置键。
 ## 4. 安装并初始化 Hermes
 
 ```bash
+unset HERMES_HOME CODEX_HOME
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 source "$HOME/.zprofile"
 command -v hermes
-hermes --version
-hermes setup
-hermes gateway setup
-hermes gateway stop
+hermes -p default --version
+hermes -p default setup
+hermes -p default gateway setup
+hermes -p default gateway stop
 ```
 
 先运行向导，让当前 Hermes 生成完整配置结构，再用命令调整。不要直接复制旧版本的
 整份 `config.yaml`。
 
-QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。0.20.0 的
-`GatewayStreamConsumer.finish()` 和 draft capability probe 契约不完整，不能启用本文的
-QQ streaming 设置。先检查实际运行源码版本：
+QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。更早版本不满足该插件的
+streaming 兼容契约，不能启用本文的 QQ streaming 设置。先检查实际运行源码版本：
 
 ```bash
-hermes --version
+hermes -p default --version
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" - <<'PY'
 import re
@@ -144,12 +154,12 @@ PY
 旧环境先查看更新范围和所有 profile 的重启计划，再执行带备份的官方更新：
 
 ```bash
-hermes update --check
-if hermes update --help | rg -q -- '--plan'; then
-  hermes update --plan
+hermes -p default update --check
+if hermes -p default update --help | rg -q -- '--plan'; then
+  hermes -p default update --plan
 fi
-hermes update --backup
-hermes --version
+hermes -p default update --backup
+hermes -p default --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
@@ -158,135 +168,65 @@ Gateway。`qqbot-connect-hotfix` 1.8.21 在旧版、预发布版或无法识别�
 
 ## 5. 用命令配置 `config.yaml`
 
-以下命令均写入当前部门账号的 `~/.hermes/config.yaml`：
+以下命令明确写入默认 profile 的 `~/.hermes/config.yaml`。`-p default` 是必要条件：
+仅设置 `HERMES_HOME="$HOME/.hermes"` 或清除 `HERMES_HOME` 仍可能被
+`~/.hermes/active_profile` 重定向。
 
 ```bash
-hermes config migrate
+unset CODEX_HOME
 
-hermes config set model.provider openai-codex
-hermes config set model.base_url https://chatgpt.com/backend-api/codex
-hermes config set model.openai_runtime codex_app_server
-hermes config set agent.max_turns 150
-hermes config set agent.reasoning_effort medium
-hermes config set compression.codex_app_server_auto native
+hermes -p default config migrate
 
-hermes config set display.interim_assistant_messages true
-hermes config set display.streaming true
-hermes config set display.platforms.qqbot.interim_assistant_messages true
-hermes config set display.platforms.qqbot.streaming true
-hermes config set display.platforms.qqbot.tool_progress new
+hermes -p default config set model.provider openai-codex
+hermes -p default config set model.base_url https://chatgpt.com/backend-api/codex
+hermes -p default config set model.openai_runtime codex_app_server
+hermes -p default config set agent.max_turns 150
+hermes -p default config set agent.reasoning_effort medium
+hermes -p default config set compression.codex_app_server_auto native
 
-hermes config set group_sessions_per_user false
-hermes config set session_reset.mode none
-hermes config set approvals.mode smart
-hermes config set approvals.mcp_reload_confirm false
-hermes config set agent.gateway_timeout 7200
-hermes config set agent.gateway_timeout_warning 900
-hermes config set agent.restart_drain_timeout 300
+hermes -p default config set display.interim_assistant_messages true
+hermes -p default config set display.streaming true
+hermes -p default config set streaming.enabled true
+hermes -p default config set streaming.transport auto
+hermes -p default config set display.platforms.qqbot.interim_assistant_messages true
+hermes -p default config set display.platforms.qqbot.streaming true
+hermes -p default config set display.platforms.qqbot.tool_progress new
 
-hermes config set platforms.qqbot.enabled true
-hermes config set platforms.qqbot.extra.group_policy open
+hermes -p default config set group_sessions_per_user false
+hermes -p default config set session_reset.mode none
+hermes -p default config set approvals.mode smart
+hermes -p default config set approvals.mcp_reload_confirm false
+hermes -p default config set agent.gateway_timeout 7200
+hermes -p default config set agent.gateway_timeout_warning 900
+hermes -p default config set agent.restart_drain_timeout 300
 
-hermes config set platforms.whatsapp.enabled false
+hermes -p default config set platforms.qqbot.enabled true
+hermes -p default config set platforms.qqbot.extra.group_policy open
 
-hermes config check
+hermes -p default config check
 ```
+
+仅对**新建且不使用 WhatsApp** 的 profile 追加：
+
+```bash
+hermes -p default config set platforms.whatsapp.enabled false
+```
+
+更新已有 profile 时先执行
+`hermes -p default config get platforms.whatsapp.enabled`，保留原值；
+不得为了部署 QQ hotfix 而统一关闭 WhatsApp。
 
 关键点：
 
-- `qqbot-connect-hotfix` 1.8.21 在稳定版 Hermes 0.20.5 或更高版本上让 QQ C2C 私聊通过官方
-  `/v2/users/{openid}/stream_messages` 协议更新同一条消息，并在 turn final 时封口；群聊
-  和 QQ 频道私信不使用该 C2C 端点，仍走原有回复路径。超出单条消息限制时，插件先封口
-  当前 stream，再为剩余后缀打开新 stream；final 首次越过限制时也执行相同 rollover。
-  如果新尾 stream 无法打开，普通 fallback 只补发尚未提交的后缀，避免重复已封口头部。
-  因 QQ 未公开 carrier 寿命而实测约十分钟后会过期，插件会在单个 carrier 打开时建立独立、
-  可取消的 480 秒 deadline；即使期间没有新 draft，也会主动封口并让同一 turn 准备从新
-  carrier 的 index 0 继续。若 deadline 封口失败，旧 carrier 会被明确退休。若 QQ 已接收
-  最后一帧却返回
-  `同一流式消息发送超过时间限制`，该 carrier 会被永久退休；后续 draft、final seal 和取消
-  清理都不再重试旧 index，只由普通 fallback 补发尚未显示的最终后缀。传输超时、断连或
-  丢响应只允许对原 index 做一次协调：`index 需要递增` 会确认原帧已被接收；仍不确定时会
-  退休 carrier，并把最新未确认累计正文留给 final fallback，避免丢失内容。其他非终止帧
-  错误按每 carrier 的 0.2/0.8/2.0/5.0 秒有界 cooldown 重试；cooldown 内只保留最新累计
-  正文且不请求 QQ，避免 delta 驱动的请求风暴。QQ 返回 `40034128` 或
-  `回复消息失败，被动回复时间或者次数超过限制` 时，表示入站消息的被动回复窗口或次数已经
-  终止；插件立即退休当前 replacement carrier，后续 draft 和直接 final fallback 都不再向
-  同一锚点请求。被拒绝的正文不会被误记为已显示，final 明确返回失败并保留 Gateway 恢复
-  语义；该终止态无法靠同锚点普通 fallback 恢复，因此真实验收应在平台的被动回复窗口内
-  完成。
-  Codex 可能把 final 先作为实时 delta 紧接在 commentary 后发送，再由 Hermes 以同一
-  `final_response` 完成 turn；两阶段之间不保证有空白。插件只在真实
-  `GatewayStreamConsumer` turn-final 调用的 task-local adapter/chat/anchor 身份完全匹配，
-  且 final 等于或扩展真实的未完成 delta 段时，才使用 finish 改写前保存的 ledger；还必须
-  保留 QQ 已确认的完整前缀。1.8.20 在完成 commentary 或工具分段后清空候选段，避免把
-  `status NOTFINAL` 后独立的 `FINAL` 误吞；同 tick 未显示尾部和新增 footer 也只补发一次。
-  仅有 final 回调身份或相同后缀不构成 delta 来源证明。普通或直接 send 仍沿用
-  token-boundary 规则。无需新增设置，按第 7 节安装器备份回滚；验收附件见
+- `qqbot-connect-hotfix` 在兼容的稳定版 Hermes 上让 QQ C2C 私聊使用官方流式消息接口；
+  群聊和 QQ 频道私信仍走原有回复路径。它提供可见中间状态并保证 final 不重复；QQ 的
+  被动回复窗口或次数耗尽后无法继续向同一条入站消息回复，因此真实验收应及时完成。
+  协议、并发和失败恢复边界详见
+  [插件 README](../plugins/qqbot-connect-hotfix/README.md)，真实回归证据见
   [PR #4 证据](evidence/pr-4/README.md)。
-  ordinary fallback 成功后会在保留的 stream state 中记录该不可变后缀；延迟取消封口、重复
-  final 回调和迟到 draft frame 只能关闭 native 前缀，不能再次吸收或发送同一后缀。累计
-  final 必须显式扩展完整可见正文；独立 final 只在终端位置且存在 token 边界时才视为已由
-  stream 拥有，正文中较早出现的同值文本、任意部分重叠或词内后缀都不会吞掉最终回复。
-  Codex commentary 的实时 delta 已由同一私聊 stream 展示后，Hermes 随后的 `_interim_send`
-  不会再创建内容相同的普通 QQ 气泡：有入站锚点时精确匹配；Hermes 未携带锚点时只恢复同一
-  私聊中唯一且终端正文完全匹配的打开 stream，多候选并发保持普通发送，不猜测归属。
-  连续 commentary 即使在累计正文中无空白拼接，也只在同一 consumer 的任务级
-  adapter/chat/anchor/正文身份完全匹配时确认边界内 suffix ownership；一般 `_interim_send`
-  与词内重叠仍保持普通发送，避免误吞独立消息。
-  只有 Gateway 已为该私聊选择 native lane
-  或 stream 已实际打开时，插件才把同一入站消息的 `input_notify` 限制为一次；关闭
-  streaming 后，即使 `interim_assistant_messages=true` 触发 consumer 创建，也不会标记
-  native lane；同一 Gateway 进程的下一轮配置解析还会撤销旧 lane，并保留 Hermes 原始
-  typing 和 final-only 行为。已打开的 stream 仍保留到封口、取消或平台寿命终止。
-- 活动 stream 以 `(chat_id, draft_id)` 为身份，两个私聊可安全复用相同 draft id。
-  completed-owner 与 final-only-pending 各保留每 chat 256 条，并按最近使用顺序限制为
-  1024 个 chat；native-lane membership 也按最近使用顺序限制为 1024 个 chat，打开的
-  stream 在封口或取消前不会被淘汰，动态关闭 streaming 仍立即撤销 lane。
-  capacity-final-only 被成功 abandon 后会保留 cancellation tombstone：它只拦截 late
-  draft，不会吞掉尚未投递的普通 final；普通 final 首次成功后才升级为 completed owner，
-  后续重复 final 只确认、不再投递。
-- 所有 C2C `notify=True` final（active native fallback、未打开 stream、final-only-pending、
-  cancellation 和 completed replay）都进入 `(chat_id, reply anchor)` 的有界 single-flight。
-  同 key 首次成功后，结果保留到所有已注册调用者退出，不依赖可能被淘汰的 completed-owner；
-  明确失败才允许等待者接棒。外部发送由 flight 持有，单个 caller 取消不会取消已发出的 QQ
-  请求。最多同时保留 128 个不同 final key；容量满时同 key 仍可加入，新 key 等待空位，
-  因而 registry 有硬上限且不同私聊/锚点仍可并行。flight 在最后调用者和在途请求都结束后
-  删除并释放准入容量；已完成封口或完整投递的成功结果另进入不占 active slot 的 1024-key
-  LRU，以覆盖唯一 caller 取消后 shielded QQ 请求才成功的迟到 replay。仍处于
-  `qq_stream_close_pending` 的可见成功只在当前 flight 内共享，不进入 replay LRU；后续 final
-  会继续重试幂等封口，且不会重复发送已由普通消息持有的 suffix；已记录完整 final 后的迟到
-  draft 在同一 inbound reply anchor 下只确认、不再扩展或新建第二条 native stream，即使
-  Hermes draft id 已改变；不同 anchor 仍保持独立。若后续由
-  `abandon_open_draft()` 对已记录完整 turn-final 身份的 stream 完成封口，插件会刷新
-  per-chat completed owner，并把成功 close 写入同一个有界 replay LRU；即使独立 anchor
-  淘汰 tombstone，同 anchor final 仍不会重发。普通 partial draft 的取消没有完整 final
-  身份，因此不会升级为 anchor-wide replay。
-  Hermes 的 `/new`、`/stop`、interrupt 或 timeout cleanup 可能在 shielded final 请求仍在途时
-  调用 `abandon_open_draft()`；插件会让 stable-anchor abandon 加入相同 single-flight，等待
-  final attempt 结束后再读取/封口，避免 native 完整 final 与 ordinary unseen suffix 双写。
-  同一 stable anchor 的所有 draft callback 也加入该 transaction：无论原 draft id 还是变更后的
-  stale draft id，都必须等待外部 final 投递及 ownership 发布完成后再重新判定，不会在这个窗口
-  替换或新开 carrier；不同 anchor 不受阻塞。反向顺序中，若 abandon 已封口完整累计正文，后到
-  的短 final 只有在构成带 token 边界的严格终端后缀时才视为已投递，任意部分或词内重叠不吞消息。
-  abandon-first 成功完成还会在当前有界 claim 内保留短生命周期 ownership，直到所有已注册的
-  final/draft waiter 退出；即使另一个 anchor 淘汰 per-chat tombstone，也不会重复 final 或重开
-  carrier。该上下文随 claim 清除，不把任意 partial abandon 升级为长期 anchor replay。若 final
-  payload 自带前导空白或非 connector Unicode 标点（例如 `\nFINAL`、`,FINAL`、`，FINAL`），
-  该字符本身作为 token boundary，完整终端 suffix 不会再走 ordinary fallback；`_FINAL`、
-  词内和任意部分重叠仍保持未认领。
-  fully sealed anchor 的 1024-key 有界 broker completion 也用于拦截 changed-draft late frame；
-  无稳定 inbound reply anchor 的 final 不使用空字符串 replay key，而是分别走真实投递。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
-- 1.8.21 修复 Hermes 在接受 steer 后仍更新旧 C2C 气泡的问题：仅暂停当前会话的输出，
-  等旧队列刷新后请求 steer；接受后先封口旧气泡、发送原有确认，再用新消息锚点打开新气泡。
-  不创建新的 Hermes session / Codex thread，不把分段封口当成任务完成。确认消息的禁用或
-  debounce 不影响分段；拒绝/未授权的 steer 不切换气泡。刷新屏障超过 5 秒时排队到下一轮，
-  不声称重定向成功；封口重试耗尽则记录警告并在本地退休旧气泡，未显示尾部仍保留。
-  原任务的 final fallback 跟随新锚点，旧锚点的迟到回调不重开气泡。群聊和频道私信仍走
-  原有非 C2C 接口。无需新增配置，按第 7 节的精确外部备份恢复并只重启目标 profile 即可回滚。
-  仅在活动 QQ/Codex 上将 `/steer`（或 busy steer 模式）的本地队列改为现有原生
-  `redirect()` → `turn/steer`：Codex 不执行 Hermes 的工具批次，因此不会消费原本的
-  pending-steer 队列。验收必须检查 Codex 收到更正并返回新要求的 final，不能只看确认消息。
+- steer 被接受后，QQ 应结束旧气泡并在新气泡继续同一 Hermes session/Codex thread；
+  验收必须检查 Codex 实际采用更正并返回新要求的 final，不能只看确认消息。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
 - `agent.gateway_timeout=7200` 将 Gateway 的无活动保护延长到 2 小时；`/stop` 和消息
@@ -301,13 +241,13 @@ hermes config check
 审批历史积累后，可生成命令 allowlist 建议。默认只展示建议，不写入配置：
 
 ```bash
-hermes approvals suggest
+hermes -p default approvals suggest
 ```
 
 人工审核编号后，再选择性应用，例如：
 
 ```bash
-hermes approvals suggest --apply 1,2
+hermes -p default approvals suggest --apply 1,2
 ```
 
 `suggest` 是 `hermes approvals` 的子命令，不是 `approvals.mode` 的取值；破坏性命令
@@ -315,14 +255,15 @@ hermes approvals suggest --apply 1,2
 
 ## 6. 配置 `.env`
 
-打开 Hermes 当前使用的环境文件：
+新装默认 profile 时，明确打开它的环境文件：
 
 ```bash
-hermes config env-path
-nano "$(hermes config env-path)"
+DEFAULT_ENV="$(hermes -p default config env-path)"
+nano "$DEFAULT_ENV"
 ```
 
-加入以下模板并替换占位值：
+加入以下模板并替换占位值。已有 profile 只补充或修改明确列出的非凭据键，不要覆盖
+QQ 凭据、部门账号设置或其他现有内容；每个键只保留一条有效赋值：
 
 ```dotenv
 # QQ
@@ -337,9 +278,6 @@ QQBOT_GROUP_CONTEXT_MESSAGES=20
 QQBOT_GROUP_CONTEXT_BUFFER_MESSAGES=100
 QQBOT_GROUP_CONTEXT_CHARS=4000
 QQBOT_GROUP_CONTEXT_SUMMARY_CHARS=1200
-
-# WhatsApp 当前不使用；必须与 config.yaml 一起保持 false，避免环境变量反向覆盖
-WHATSAPP_ENABLED=false
 
 # QQ 长期消息快照
 MESSAGE_SNAPSHOT_MEDIA_STORAGE=link
@@ -365,10 +303,20 @@ HERMES_CODEX_PROJECT_ALIASES={"finance":"/绝对路径/finance"}
 HERMES_CODEX_PROJECT_ALLOWED_ROOTS=/绝对路径/部门项目根目录
 ```
 
+仅对新建且不使用 WhatsApp 的 profile 加入：
+
+```dotenv
+WHATSAPP_ENABLED=false
+```
+
+已有 profile 必须保留 `WHATSAPP_ENABLED` 当前值，并与
+`platforms.whatsapp.enabled` 一致；不要因 QQ/Codex 更新改写它。命名 profile 还要按
+第 9、11 节设置自己的 `CODEX_HOME`。
+
 保存后收紧权限：
 
 ```bash
-chmod 600 "$(hermes config env-path)"
+chmod 600 "$DEFAULT_ENV"
 ```
 
 说明：
@@ -380,8 +328,8 @@ chmod 600 "$(hermes config env-path)"
   被任何 hotfix 或数据库捕获。
 - `QQBOT_GROUP_MESSAGE_CREATE_MODE=mention` 表示未 mention 消息只进入上下文和快照，
   不触发 Agent。
-- `WHATSAPP_ENABLED=false` 必须保留；仅设置 `config.yaml` 为 false 不足以抵消旧 `.env`
-  中的 `WHATSAPP_ENABLED=true`。
+- WhatsApp 的 config 和 `.env` 必须表达同一状态；新建且关闭时两处都为 false，已有
+  profile 则原样保留。只改一处可能被另一处反向覆盖。
 - `MESSAGE_SNAPSHOT_MEDIA_STORAGE=link` 对 QQ 保存链接和元数据。
 - Hermes 0.20.0 原生 Codex app-server 固定在 600 秒截止；上面的变量由
   `codex-app-server-phase-hotfix` 1.8.3 读取。多个聊天各自持有独立 Codex session，
@@ -405,11 +353,17 @@ chmod 600 "$(hermes config env-path)"
 
 ## 7. 安装最新持久化插件
 
-拉取 `hermes-dispatch` 最新 `main`：
+拉取 `hermes-dispatch` 最新 `main`。若已有仓库 `git status --short` 非空，先停止并处理
+本机改动，不得 reset 或让 pull 覆盖：
 
 ```bash
 mkdir -p "$HOME/src"
 if [[ -d "$HOME/src/hermes-dispatch/.git" ]]; then
+  test -z "$(git -C "$HOME/src/hermes-dispatch" status --porcelain)" || {
+    echo "hermes-dispatch 工作树非干净，停止更新" >&2
+    exit 1
+  }
+  git -C "$HOME/src/hermes-dispatch" switch main
   git -C "$HOME/src/hermes-dispatch" pull --ff-only origin main
 else
   git clone --branch main --single-branch \
@@ -427,6 +381,9 @@ scripts/install-plugins.sh "$HOME/.hermes" \
   qqbot-connect-hotfix \
   message-snapshot-store
 ```
+
+安装命令必须显式列出插件名；省略插件列表会使用安装器默认集合并额外安装
+`whatsapp-bridge-policy-hotfix`，不符合本手册范围。
 
 更新已有插件时，安装器会先将当前目录完整备份到对应 profile 的
 `plugin-backups/<插件>-<版本>-<时间戳>`；该目录位于 `plugins` 发现路径之外，
@@ -451,16 +408,18 @@ canonical 路径是 canonical `plugins` 根的直接子目录；`.` 和 `..` 不
 启用插件和消息检索工具集：
 
 ```bash
-hermes plugins enable openai-codex
-hermes plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
-hermes plugins enable qqbot-connect-hotfix --no-allow-tool-override
-hermes plugins enable message-snapshot-store --no-allow-tool-override
-hermes plugins disable whatsapp-bridge-policy-hotfix
+hermes -p default plugins enable openai-codex
+hermes -p default plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
+hermes -p default plugins enable qqbot-connect-hotfix --no-allow-tool-override
+hermes -p default plugins enable message-snapshot-store --no-allow-tool-override
 
-hermes tools enable --platform qqbot message_snapshot
-hermes tools enable --platform qqbot codex_session_project
-hermes tools list --platform qqbot
+hermes -p default tools enable --platform qqbot message_snapshot
+hermes -p default tools enable --platform qqbot codex_session_project
+hermes -p default tools list --platform qqbot
 ```
+
+精确安装三项插件不会新增、升级、删除、启用或禁用 `whatsapp-bridge-policy-hotfix`。
+更新已有 profile 时，记录并保留该插件原有的安装和启用状态。
 
 三项插件共同提供：
 
@@ -473,7 +432,12 @@ hermes tools list --platform qqbot
 
 ```bash
 cd "$HOME/src/hermes-dispatch"
+(
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+TEST_HERMES_HOME="$(mktemp -d /private/tmp/hermes-plugin-tests.XXXXXX)"
+export HERMES_HOME="$TEST_HERMES_HOME"
+export PYTHONPATH="$HOME/.hermes/hermes-agent"
+export PYTHONDONTWRITEBYTECODE=1
 
 "$HERMES_PY" plugins/codex-app-server-phase-hotfix/test_hotfix.py
 "$HERMES_PY" plugins/qqbot-connect-hotfix/test_hotfix.py
@@ -487,19 +451,24 @@ HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" plugins/message-snapshot-store/test_capture.py
 "$HERMES_PY" plugins/message-snapshot-store/test_materialize.py
 "$HERMES_PY" plugins/message-snapshot-store/test_quoted_attachment.py
+"$HERMES_PY" plugins/message-snapshot-store/test_whatsapp_capture.py
 scripts/test_install_plugins.sh
+git diff --check
+)
 ```
 
-任一测试失败都先停止部署，不启动生产 Gateway。
+`test_whatsapp_capture.py` 只验证已安装快照插件的兼容边界，不会启动 WhatsApp 或发送消息。
+临时 `HERMES_HOME` 防止测试加载生产 profile 中已安装的旧插件或写入其数据库；不要删掉
+这项隔离后直接运行 `test_steer.py`。
+任一测试或 `git diff --check` 失败都先停止部署，不改写插件目录、不重启生产 Gateway。
 
 ## 9. 让 Codex app-server 接收 Hermes MCP
 
 仅设置 `model.openai_runtime=codex_app_server` 不会自动保证 Codex 已注册 Hermes MCP。
-从默认 profile 执行：
+默认 Hermes profile 复用默认 `CODEX_HOME=~/.codex`：
 
 ```bash
-hermes profile use default
-env -u HERMES_HOME hermes --cli
+env -u CODEX_HOME hermes -p default --cli
 ```
 
 在 Hermes CLI 中输入：
@@ -512,33 +481,87 @@ env -u HERMES_HOME hermes --cli
 验证 Codex 侧注册结果：
 
 ```bash
-codex mcp get hermes-tools --json
-codex mcp list
+env -u CODEX_HOME codex mcp get hermes-tools --json
+env -u CODEX_HOME codex mcp list
 ```
 
 必须能看到 `hermes-tools`。然后新建一次 Codex 会话，实际调用 Hermes 提供的工具验证，
 不要只检查配置文件。
 
-多个 Hermes profile 共用当前 macOS 用户的 `~/.codex/config.toml`。因此只在默认 profile
-完成一次上述迁移；不要从命名 profile 重复迁移并把 `hermes-tools` 的 `HERMES_HOME`
-固定到某一个小组。Gateway 启动 Codex 时会把当前 profile 的环境传给 MCP 子进程。
+命名 profile 若存在用户相关 MCP，必须使用独立 `CODEX_HOME`，例如：
+
+```bash
+mkdir -p "$HOME/.codex-hermes/sales"
+chmod 700 "$HOME/.codex-hermes/sales"
+nano "$HOME/.codex-hermes/sales/config.toml"
+```
+
+为该目录写入第 3 节的权限策略，但不要复制默认 `config.toml` 中的 MCP 表。然后在
+`$HOME/.hermes/profiles/sales/.env` 中只保留一条：
+
+```dotenv
+CODEX_HOME=/Users/<当前macOS账号>/.codex-hermes/sales
+```
+
+独立 `CODEX_HOME` 不会自动继承默认目录的 Keychain 登录。凭据必须选择以下一种方式，
+并在继续 MCP 迁移前验证。
+
+使用 `keyring` 时，为这个 `CODEX_HOME` 单独登录：
+
+```bash
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login status
+```
+
+若明确要求多个 profile 复用默认文件凭据，则将默认和命名目录的
+`cli_auth_credentials_store` 都设为 `"file"`，先确认默认 `auth.json` 有效，再在命名目录
+不存在任何 `auth.json` 的前提下创建链接：
+
+```bash
+env -u CODEX_HOME codex login
+env -u CODEX_HOME codex login status
+test -f "$HOME/.codex/auth.json"
+test ! -e "$HOME/.codex-hermes/sales/auth.json"
+ln -s "$HOME/.codex/auth.json" "$HOME/.codex-hermes/sales/auth.json"
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login status
+```
+
+两条路径的最后一条 `login status` 都必须显示已登录。不要覆盖命名目录中已有的凭据；
+若状态仍是 `Not logged in`，先修复认证，不启动 Gateway。随后为每个命名 profile 分别
+执行迁移：
+
+```bash
+CODEX_HOME="$HOME/.codex-hermes/sales" hermes -p sales --cli
+```
+
+在 CLI 中执行同样的 `/codex-runtime on` 和 `/exit`，再验证该目录：
+
+```bash
+CODEX_HOME="$HOME/.codex-hermes/sales" codex mcp get hermes-tools --json
+CODEX_HOME="$HOME/.codex-hermes/sales" codex mcp list
+```
+
+`codex mcp list` 只能证明配置存在。若同名 MCP 在各 profile 使用不同用户认证，应在每个
+`CODEX_HOME` 各建一个 Codex 会话，调用一个无写入副作用、能区分权限范围的真实工具；必须
+只返回该 profile 用户可访问的数据。任何跨 profile 结果都视为隔离失败。
 
 ## 10. 启动 Gateway
 
 安装并启动用户级服务：
 
 ```bash
-hermes gateway install --force --no-start-now --start-on-login
-hermes gateway start
-hermes gateway status
-hermes status
-hermes logs -f
+env -u CODEX_HOME hermes -p default gateway install --force --no-start-now --start-on-login
+env -u CODEX_HOME hermes -p default gateway start
+env -u CODEX_HOME hermes -p default gateway status
+env -u CODEX_HOME hermes -p default status
+env -u CODEX_HOME hermes -p default logs -f
 ```
 
 启动日志应显示：
 
 - QQ adapter 已连接并到达 `Ready`；
-- 没有 `Connecting to whatsapp` 或 WhatsApp reconnect 日志；
+- WhatsApp 关闭的 profile 没有 `Connecting to whatsapp` 或 reconnect 日志；启用的 profile
+  则必须正常连接，不能把启动日志误判为故障；
 - `message-snapshot-store` 已加载；
 - Codex app-server 已启动且 `hermes-tools` 可用；
 - 无重复 Bot 凭据、端口冲突或数据库权限错误。
@@ -546,21 +569,21 @@ hermes logs -f
 ## 11. 部门内创建多个小组 profile
 
 Hermes profile 是同一 macOS 部门账号内的小组级隔离层。每个 profile 有独立的
-`config.yaml`、`.env`、SOUL、会话、记忆、插件目录、日志和消息快照；它们仍共享该
-macOS 用户的 Codex 登录和 `~/.codex/config.toml`。
+`config.yaml`、`.env`、SOUL、会话、记忆、插件目录、日志和消息快照。默认 profile
+使用 `~/.codex`；命名 profile 使用独立 `CODEX_HOME`，可按第 9 节有条件地复用同一
+macOS 账号的 Codex 登录凭据，但不得共享 `config.toml` 或用户相关 MCP 配置。
 
-先停止默认 Gateway，再从已配置的 default 克隆模板：
+从已配置的 default 克隆模板，不需要停止正在服务的默认 Gateway：
 
 ```bash
-hermes gateway stop
-hermes profile create sales --clone --description "销售小组专用 Agent"
-hermes profile create finance --clone --description "财务小组专用 Agent"
-hermes profile list
-hermes profile show sales
+env -u CODEX_HOME hermes -p default profile create sales --clone --description "销售小组专用 Agent"
+env -u CODEX_HOME hermes -p default profile create finance --clone --description "财务小组专用 Agent"
+hermes -p default profile list
+hermes -p default profile show sales
 ```
 
-`--clone` 会复制配置和 `.env`。在启动任何小组 Gateway 前，必须分别替换 Bot 凭据、
-允许列表和端口：
+`--clone` 会复制配置和 `.env`，其中可能包含 default 的 Bot 凭据。**在启动任何小组
+Gateway 前**，必须分别替换 QQ 凭据、允许列表和端口；不得让两个 Gateway 使用同一 Bot：
 
 ```bash
 nano "$HOME/.hermes/profiles/sales/.env"
@@ -572,37 +595,58 @@ nano "$HOME/.hermes/profiles/finance/.env"
 ```dotenv
 # sales
 API_SERVER_PORT=8643
+CODEX_HOME=/Users/<当前macOS账号>/.codex-hermes/sales
 ```
 
 ```dotenv
 # finance
 API_SERVER_PORT=8644
+CODEX_HOME=/Users/<当前macOS账号>/.codex-hermes/finance
 ```
+
+按第 9 节创建两个 `CODEX_HOME`、设置权限/凭据方式，并分别完成 MCP 迁移与真实隔离测试。
+Gateway 会在启动时从该 profile 的 `.env` 加载 `CODEX_HOME`；不要手改 LaunchAgent plist，
+因为下一次 `gateway install --force` 会重新生成它。
 
 把最新版兼容插件安装到每个 profile：
 
 ```bash
 cd "$HOME/src/hermes-dispatch"
-scripts/install-plugins.sh "$HOME/.hermes/profiles/sales"
-scripts/install-plugins.sh "$HOME/.hermes/profiles/finance"
+scripts/install-plugins.sh "$HOME/.hermes/profiles/sales" \
+  codex-app-server-phase-hotfix \
+  qqbot-connect-hotfix \
+  message-snapshot-store
+scripts/install-plugins.sh "$HOME/.hermes/profiles/finance" \
+  codex-app-server-phase-hotfix \
+  qqbot-connect-hotfix \
+  message-snapshot-store
 ```
 
 用 `-p` 对指定 profile 执行配置和插件命令：
 
 ```bash
 hermes -p sales config set platforms.qqbot.enabled true
-hermes -p sales config set platforms.whatsapp.enabled false
+hermes -p sales config set streaming.enabled true
+hermes -p sales config set streaming.transport auto
 hermes -p sales config set agent.gateway_timeout 7200
 hermes -p sales config set agent.gateway_timeout_warning 900
 hermes -p sales config set agent.restart_drain_timeout 300
 hermes -p sales plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
 hermes -p sales plugins enable qqbot-connect-hotfix --no-allow-tool-override
 hermes -p sales plugins enable message-snapshot-store --no-allow-tool-override
-hermes -p sales plugins disable whatsapp-bridge-policy-hotfix
 hermes -p sales tools enable --platform qqbot message_snapshot
 hermes -p sales tools enable --platform qqbot codex_session_project
 hermes -p sales config check
 ```
+
+仅当这个**新** profile 不使用 WhatsApp 时设置：
+
+```bash
+hermes -p sales config set platforms.whatsapp.enabled false
+# 并确认 sales/.env 只有一条 WHATSAPP_ENABLED=false
+```
+
+如果是更新已存在的 profile，保留其 WhatsApp config 和 `.env` 当前状态。
 
 为每个小组安装并启动独立 LaunchAgent：
 
@@ -619,11 +663,10 @@ hermes -p finance gateway status
 日常管理命令：
 
 ```bash
-hermes profile list
-hermes profile use sales
+hermes -p default profile list
 hermes -p sales logs -f
 hermes -p sales gateway restart
-hermes profile use default
+env -u CODEX_HOME hermes -p default gateway status
 ```
 
 如果各小组不需要独立机器人连接，不要启动多套 Gateway；可只保留 default Gateway，
@@ -631,92 +674,177 @@ hermes profile use default
 
 ## 12. 最小验收
 
-按顺序完成以下实测：
+验收分层记录，不能用较低层结果代替真实 QQ 或完整运行验证。
 
-1. QQ 群 mention Bot：Agent 响应一次，能看到必要的中间进度，final 不重复。
-2. QQ 群不 mention：Agent 不响应；随后 mention 询问上一条消息，能从快照上下文恢复。
-3. QQ 发送图片、文件并引用：`/message-snapshot stats` 有记录，按 ID 可检索或恢复。
-4. 从 QQ 触发联网、文件写入或 Computer Use：审批卡能回传并由发起人审批。
-5. Codex 会话实际调用一次 `hermes-tools` 工具。
-6. QQ 私聊运行一次超过 30 分钟的前台任务：10 分钟处不出现 600 秒 deadline，最终
-   只回传一次；任务运行时从另一个群发起短任务，两个 session 分别完成且不串线。
-7. QQ 私聊运行 `/codex-project status`：项目名等于完整 Hermes `session_key`，且
-   `codex_app_registration.status` 为 `registered`；Codex App 侧边栏出现该项目。
-   Gateway 重启后继续对话，thread ID 不变；执行 `/new` 后项目不变且出现以新
-   `session_id` 命名的新 thread。
-8. 如配置项目别名，由管理员要求“将当前会话关联到 finance 项目”，下一轮 cwd 切换
-    且 thread 历史连续；非管理员执行同一操作必须被拒绝。
-9. 重启 Mac 并登录该部门账号：Gateway 自动恢复，日志无重复实例和端口冲突。
-10. 私聊任务输出中途发送修正及 `/steer`：旧气泡封口 → 确认消息 → 新气泡；最终回复仅一次，
-    thread 不变，日志没有 `40034128` 或重复普通 final。关闭/限频确认消息时仍应切换气泡。
+### A. 配置与单测通过
 
-常用检查：
+对每个目标 profile 分别确认：
 
-```bash
-hermes config check
-hermes plugins list
-hermes tools --summary
-hermes gateway status
-codex mcp list
-hermes logs errors
-hermes config get agent.gateway_timeout
-hermes config get agent.gateway_timeout_warning
-hermes config get agent.restart_drain_timeout
-rg -n '^(WHATSAPP_ENABLED|HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS|HERMES_CODEX_SESSION_PROJECTS_ENABLED|HERMES_CODEX_SESSION_PROJECTS_BACKFILL|HERMES_CODEX_APP_REGISTER_PROJECTS)=' "$(hermes config env-path)"
-```
+- 第 8 节全部测试和 `git diff --check` 通过；
+- `config check` 通过，三项插件版本与仓库一致且已启用；WhatsApp hotfix 的安装及
+  enabled/disabled 状态与更新前记录一致；
+- `approvals.mode=smart`、三个 timeout、streaming 和 session-project 环境键符合预期；
+- `.env` 中每个受管键只有一条有效赋值，QQ 凭据内容不打印到报告；
+- 命名 profile 的 `CODEX_HOME` 不同，`codex mcp list` 与真实只读 MCP 调用都通过隔离测试。
+
+默认 profile 使用 `env -u CODEX_HOME hermes -p default ...`；命名 profile 使用
+`hermes -p <name> ...`，并以其 `.env` 中的 `CODEX_HOME` 执行 `codex mcp ...`。
+
+### B. Gateway 与渠道就绪
+
+只重启本次变更的目标 profile，确认：
+
+- Gateway 为单实例且状态正常；
+- QQ 完成 token refresh、WebSocket connected 和 `Ready`；
+- WhatsApp 日志与该 profile 的预期状态一致；
+- 没有端口冲突、数据库权限错误、插件重复加载或 Codex active writer 错误。
+
+### C. 真实 QQ 与 Codex 项目通过
+
+在 QQ 客户端按平台回复次数限制做最小实测：
+
+1. 群聊先 mention 对应 Bot：只响应一次，必要中间进度可见，final 不重复；不 mention
+   的消息不触发 Agent，但可被下一次 mention 从快照上下文引用。
+2. 私聊执行短工具任务：中间状态在同一流式气泡更新，final 只返回一次。
+3. 私聊中途 steer：旧气泡封口、出现 redirect/确认、新气泡继续；Codex 实际采用更正，
+   thread 不变，final 只返回一次。
+4. `/codex-project status` 的项目名等于完整 Hermes `session_key`，注册状态为
+   `registered`；Codex App 侧边栏出现该项目。Gateway 重启后恢复同一 thread，`/new`
+   后项目不变并创建以新 `session_id` 命名的 thread。
+5. 如启用审批、媒体或项目别名，再分别验证发起人审批、引用附件和管理员权限边界。
+
+### D. 完整运行验收（按发布风险执行）
+
+- 30 分钟以上长任务无 600 秒 deadline，最终只回传一次；同时从另一 session 发起短任务，
+  两者完成且不串线。
+- 重启 Mac 并登录账号后，各 LaunchAgent 自动恢复且无重复实例或端口冲突。
+
+小型文档或单插件补丁可不重复 D 层，但最终报告必须分别写明 A/B/C/D 的
+`通过`、`失败` 或 `未执行`；只有实际完成的层级才能声明通过。
 
 ## 13. 更新与回滚
 
-更新到当前最新版：
+### 13.1 更新前检查
+
+先记录版本、目标 profile、Gateway 状态和仓库改动。仓库非干净时停止，不 reset：
+
+```bash
+REPO="$HOME/src/hermes-dispatch"
+git -C "$REPO" status --short --branch
+test -z "$(git -C "$REPO" status --porcelain)" || {
+  echo "工作树非干净，停止更新" >&2
+  exit 1
+}
+git -C "$REPO" rev-parse --abbrev-ref HEAD
+git -C "$REPO" rev-parse HEAD
+env -u CODEX_HOME hermes -p default --version
+codex --version
+env -u CODEX_HOME hermes -p default gateway status
+hermes -p sales gateway status  # 示例命名 profile
+```
+
+确认工作树干净后再快进到已审核的 `origin/main`：
+
+```bash
+git -C "$REPO" switch main
+git -C "$REPO" fetch origin main
+git -C "$REPO" merge --ff-only origin/main
+git -C "$REPO" diff --check
+git -C "$REPO" rev-parse HEAD
+```
+
+先按第 8 节运行全部测试，再用临时目录验证安装器；任一失败都不得改写生产插件或重启：
+
+```bash
+VERIFY_HOME="$(mktemp -d /private/tmp/hermes-dispatch-verify.XXXXXX)"
+"$REPO/scripts/install-plugins.sh" "$VERIFY_HOME" \
+  codex-app-server-phase-hotfix \
+  qqbot-connect-hotfix \
+  message-snapshot-store
+```
+
+### 13.2 二进制更新与插件更新分开
+
+只有明确需要升级 Codex 或 Hermes 时才执行二进制更新；单独发布 hotfix 时跳过本段，避免
+扩大变量。Hermes 更新会影响共享安装，先规划所有 profile 的重启窗口：
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
-hermes update --check
-if hermes update --help | rg -q -- '--plan'; then
-  hermes update --plan
+hermes -p default update --check
+if hermes -p default update --help | rg -q -- '--plan'; then
+  hermes -p default update --plan
 fi
-hermes update --backup
-hermes --version  # QQ native streaming 要求 >= 0.20.5
-git -C "$HOME/src/hermes-dispatch" pull --ff-only origin main
-cd "$HOME/src/hermes-dispatch"
-scripts/install-plugins.sh "$HOME/.hermes"
+hermes -p default update --backup
+hermes -p default --version
+codex --version
 ```
 
-命名 profile 也要分别重新安装插件，然后重复第 8、9、12 节并重启对应 Gateway。
+测试通过后才将所需插件显式安装到每个目标 profile。只更新 QQ hotfix 时只列该插件；
+更新完整三项兼容层时使用：
+
+```bash
+cd "$REPO"
+scripts/install-plugins.sh "$HOME/.hermes" \
+  codex-app-server-phase-hotfix \
+  qqbot-connect-hotfix \
+  message-snapshot-store
+scripts/install-plugins.sh "$HOME/.hermes/profiles/sales" \
+  codex-app-server-phase-hotfix \
+  qqbot-connect-hotfix \
+  message-snapshot-store
+```
+
+安装器输出的每个外部备份路径都要记录。再次运行第 8 节测试和目标 profile 的
+`config check`；仍全部通过后，只重启目标 Gateway：
+
+```bash
+hermes -p sales gateway restart
+hermes -p sales gateway status
+hermes -p sales logs -f
+```
+
+不要用默认 `hermes gateway restart` 代替命名 profile 命令。按第 12 节分层验收，并记录：
+
+```bash
+git -C "$REPO" rev-parse HEAD
+awk '$1 == "version:" {print FILENAME, $2}' \
+  "$HOME/.hermes/profiles/sales/plugins/"*/plugin.yaml
+```
+
+### 13.3 回滚
 
 只回滚 Codex 长任务机制：
 
 ```bash
-hermes config unset agent.gateway_timeout
-hermes config unset agent.gateway_timeout_warning
-hermes config unset agent.restart_drain_timeout
-nano "$(hermes config env-path)"  # 将 HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS 改为 600
-hermes gateway restart
+hermes -p sales config unset agent.gateway_timeout
+hermes -p sales config unset agent.gateway_timeout_warning
+hermes -p sales config unset agent.restart_drain_timeout
+nano "$HOME/.hermes/profiles/sales/.env"  # 将 HERMES_CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS 改为 600
+hermes -p sales gateway restart
 ```
 
-这样只恢复 Codex 600 秒墙钟和 Hermes 默认 Gateway 超时，不移除阶段消息、图片、审批
+这样只恢复 Codex 600 秒墙钟和该 profile 的 Hermes 默认 Gateway 超时，不移除阶段消息、图片、审批
 与 session-project 能力。
 
 只停止新的 session-project 映射和 Desktop 注册：
 
 ```bash
-nano "$(hermes config env-path)"
+nano "$HOME/.hermes/profiles/sales/.env"
 # 设置 HERMES_CODEX_SESSION_PROJECTS_ENABLED=false
 # 设置 HERMES_CODEX_APP_REGISTER_PROJECTS=false
-hermes gateway restart
+hermes -p sales gateway restart
 ```
 
 禁用插件不会删除 `$HERMES_HOME/state/codex-session-projects.sqlite3`、
 `$HERMES_HOME/codex-projects` 或 `PROJECT_MEMORY.md`；重新启用后可以继续恢复映射。
 
-只回滚兼容层而保留消息数据：
+优先用第 7 节安装器输出的精确备份目录恢复单个插件。若只需停用兼容层而保留消息数据：
 
 ```bash
-hermes plugins disable codex-app-server-phase-hotfix
-hermes plugins disable qqbot-connect-hotfix
-hermes plugins disable message-snapshot-store
-hermes plugins disable whatsapp-bridge-policy-hotfix
-hermes gateway restart
+hermes -p sales plugins disable codex-app-server-phase-hotfix
+hermes -p sales plugins disable qqbot-connect-hotfix
+hermes -p sales plugins disable message-snapshot-store
+hermes -p sales gateway restart
 ```
 
 禁用 `message-snapshot-store` 不会删除数据库。只有明确决定销毁历史快照时，才单独删除
