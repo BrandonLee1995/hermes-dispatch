@@ -76,9 +76,9 @@ codex --version
 登录该部门自己的 ChatGPT/Codex 账号，并安装或打开 Codex App：
 
 ```bash
-codex login
-codex login status
-codex app
+env -u CODEX_HOME codex login
+env -u CODEX_HOME codex login status
+env -u CODEX_HOME codex app
 ```
 
 Codex 的本地状态位于 `CODEX_HOME`，未设置时默认为 `~/.codex`；其中包括
@@ -119,10 +119,10 @@ unset HERMES_HOME CODEX_HOME
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 source "$HOME/.zprofile"
 command -v hermes
-hermes --version
-hermes setup
-hermes gateway setup
-hermes gateway stop
+hermes -p default --version
+hermes -p default setup
+hermes -p default gateway setup
+hermes -p default gateway stop
 ```
 
 先运行向导，让当前 Hermes 生成完整配置结构，再用命令调整。不要直接复制旧版本的
@@ -133,7 +133,7 @@ QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。0.20.0 的
 QQ streaming 设置。先检查实际运行源码版本：
 
 ```bash
-hermes --version
+hermes -p default --version
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" - <<'PY'
 import re
@@ -155,12 +155,12 @@ PY
 旧环境先查看更新范围和所有 profile 的重启计划，再执行带备份的官方更新：
 
 ```bash
-hermes update --check
-if hermes update --help | rg -q -- '--plan'; then
-  hermes update --plan
+hermes -p default update --check
+if hermes -p default update --help | rg -q -- '--plan'; then
+  hermes -p default update --plan
 fi
-hermes update --backup
-hermes --version
+hermes -p default update --backup
+hermes -p default --version
 ```
 
 版本检查未通过时不要设置 `display.platforms.qqbot.streaming=true`，也不要重启生产
@@ -169,53 +169,52 @@ Gateway。`qqbot-connect-hotfix` 1.8.21 在旧版、预发布版或无法识别�
 
 ## 5. 用命令配置 `config.yaml`
 
-以下命令明确写入默认 profile 的 `~/.hermes/config.yaml`。执行前先清除可能残留的
-profile 环境；本节结束后再取消导出：
+以下命令明确写入默认 profile 的 `~/.hermes/config.yaml`。`-p default` 是必要条件：
+仅设置 `HERMES_HOME="$HOME/.hermes"` 或清除 `HERMES_HOME` 仍可能被
+`~/.hermes/active_profile` 重定向。
 
 ```bash
-export HERMES_HOME="$HOME/.hermes"
 unset CODEX_HOME
 
-hermes config migrate
+hermes -p default config migrate
 
-hermes config set model.provider openai-codex
-hermes config set model.base_url https://chatgpt.com/backend-api/codex
-hermes config set model.openai_runtime codex_app_server
-hermes config set agent.max_turns 150
-hermes config set agent.reasoning_effort medium
-hermes config set compression.codex_app_server_auto native
+hermes -p default config set model.provider openai-codex
+hermes -p default config set model.base_url https://chatgpt.com/backend-api/codex
+hermes -p default config set model.openai_runtime codex_app_server
+hermes -p default config set agent.max_turns 150
+hermes -p default config set agent.reasoning_effort medium
+hermes -p default config set compression.codex_app_server_auto native
 
-hermes config set display.interim_assistant_messages true
-hermes config set display.streaming true
-hermes config set streaming.enabled true
-hermes config set streaming.transport auto
-hermes config set display.platforms.qqbot.interim_assistant_messages true
-hermes config set display.platforms.qqbot.streaming true
-hermes config set display.platforms.qqbot.tool_progress new
+hermes -p default config set display.interim_assistant_messages true
+hermes -p default config set display.streaming true
+hermes -p default config set streaming.enabled true
+hermes -p default config set streaming.transport auto
+hermes -p default config set display.platforms.qqbot.interim_assistant_messages true
+hermes -p default config set display.platforms.qqbot.streaming true
+hermes -p default config set display.platforms.qqbot.tool_progress new
 
-hermes config set group_sessions_per_user false
-hermes config set session_reset.mode none
-hermes config set approvals.mode smart
-hermes config set approvals.mcp_reload_confirm false
-hermes config set agent.gateway_timeout 7200
-hermes config set agent.gateway_timeout_warning 900
-hermes config set agent.restart_drain_timeout 300
+hermes -p default config set group_sessions_per_user false
+hermes -p default config set session_reset.mode none
+hermes -p default config set approvals.mode smart
+hermes -p default config set approvals.mcp_reload_confirm false
+hermes -p default config set agent.gateway_timeout 7200
+hermes -p default config set agent.gateway_timeout_warning 900
+hermes -p default config set agent.restart_drain_timeout 300
 
-hermes config set platforms.qqbot.enabled true
-hermes config set platforms.qqbot.extra.group_policy open
+hermes -p default config set platforms.qqbot.enabled true
+hermes -p default config set platforms.qqbot.extra.group_policy open
 
-hermes config check
-unset HERMES_HOME
+hermes -p default config check
 ```
 
 仅对**新建且不使用 WhatsApp** 的 profile 追加：
 
 ```bash
-HERMES_HOME="$HOME/.hermes" hermes config set platforms.whatsapp.enabled false
+hermes -p default config set platforms.whatsapp.enabled false
 ```
 
 更新已有 profile 时先执行
-`HERMES_HOME="$HOME/.hermes" hermes config get platforms.whatsapp.enabled`，保留原值；
+`hermes -p default config get platforms.whatsapp.enabled`，保留原值；
 不得为了部署 QQ hotfix 而统一关闭 WhatsApp。
 
 关键点：
@@ -246,13 +245,13 @@ HERMES_HOME="$HOME/.hermes" hermes config set platforms.whatsapp.enabled false
 审批历史积累后，可生成命令 allowlist 建议。默认只展示建议，不写入配置：
 
 ```bash
-HERMES_HOME="$HOME/.hermes" hermes approvals suggest
+hermes -p default approvals suggest
 ```
 
 人工审核编号后，再选择性应用，例如：
 
 ```bash
-HERMES_HOME="$HOME/.hermes" hermes approvals suggest --apply 1,2
+hermes -p default approvals suggest --apply 1,2
 ```
 
 `suggest` 是 `hermes approvals` 的子命令，不是 `approvals.mode` 的取值；破坏性命令
@@ -263,7 +262,7 @@ HERMES_HOME="$HOME/.hermes" hermes approvals suggest --apply 1,2
 新装默认 profile 时，明确打开它的环境文件：
 
 ```bash
-DEFAULT_ENV="$(HERMES_HOME="$HOME/.hermes" hermes config env-path)"
+DEFAULT_ENV="$(hermes -p default config env-path)"
 nano "$DEFAULT_ENV"
 ```
 
@@ -413,16 +412,21 @@ canonical 路径是 canonical `plugins` 根的直接子目录；`.` 和 `..` 不
 启用插件和消息检索工具集：
 
 ```bash
-HERMES_HOME="$HOME/.hermes" hermes plugins enable openai-codex
-HERMES_HOME="$HOME/.hermes" hermes plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
-HERMES_HOME="$HOME/.hermes" hermes plugins enable qqbot-connect-hotfix --no-allow-tool-override
-HERMES_HOME="$HOME/.hermes" hermes plugins enable message-snapshot-store --no-allow-tool-override
-HERMES_HOME="$HOME/.hermes" hermes plugins disable whatsapp-bridge-policy-hotfix
+hermes -p default plugins enable openai-codex
+hermes -p default plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
+hermes -p default plugins enable qqbot-connect-hotfix --no-allow-tool-override
+hermes -p default plugins enable message-snapshot-store --no-allow-tool-override
+if hermes -p default plugins list | rg -q 'whatsapp-bridge-policy-hotfix'; then
+  hermes -p default plugins disable whatsapp-bridge-policy-hotfix
+fi
 
-HERMES_HOME="$HOME/.hermes" hermes tools enable --platform qqbot message_snapshot
-HERMES_HOME="$HOME/.hermes" hermes tools enable --platform qqbot codex_session_project
-HERMES_HOME="$HOME/.hermes" hermes tools list --platform qqbot
+hermes -p default tools enable --platform qqbot message_snapshot
+hermes -p default tools enable --platform qqbot codex_session_project
+hermes -p default tools list --platform qqbot
 ```
+
+精确安装三项插件的新 profile 中不存在 WhatsApp hotfix；直接 disable 会以“未安装”返回
+非零状态。上面的 installed-state guard 只在旧环境确实残留该插件时禁用它。
 
 三项插件共同提供：
 
@@ -471,7 +475,7 @@ git diff --check
 默认 Hermes profile 复用默认 `CODEX_HOME=~/.codex`：
 
 ```bash
-env -u HERMES_HOME -u CODEX_HOME hermes --cli
+env -u CODEX_HOME hermes -p default --cli
 ```
 
 在 Hermes CLI 中输入：
@@ -506,18 +510,32 @@ nano "$HOME/.codex-hermes/sales/config.toml"
 CODEX_HOME=/Users/<当前macOS账号>/.codex-hermes/sales
 ```
 
-凭据复用取决于 `cli_auth_credentials_store`：
+独立 `CODEX_HOME` 不会自动继承默认目录的 Keychain 登录。凭据必须选择以下一种方式，
+并在继续 MCP 迁移前验证。
 
-- 使用 `keyring` 时，凭据由当前 macOS 账号的 Keychain 管理，不创建 `auth.json` 链接；
-- 使用 `file` 时，只有在命名目录中不存在真实 `auth.json` 的前提下，才可将其链接到
-  默认凭据文件：
+使用 `keyring` 时，为这个 `CODEX_HOME` 单独登录：
 
 ```bash
-test ! -e "$HOME/.codex-hermes/sales/auth.json"
-ln -s "$HOME/.codex/auth.json" "$HOME/.codex-hermes/sales/auth.json"
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login status
 ```
 
-不要覆盖命名目录中已有的凭据。随后为每个命名 profile 分别执行迁移：
+若明确要求多个 profile 复用默认文件凭据，则将默认和命名目录的
+`cli_auth_credentials_store` 都设为 `"file"`，先确认默认 `auth.json` 有效，再在命名目录
+不存在任何 `auth.json` 的前提下创建链接：
+
+```bash
+env -u CODEX_HOME codex login
+env -u CODEX_HOME codex login status
+test -f "$HOME/.codex/auth.json"
+test ! -e "$HOME/.codex-hermes/sales/auth.json"
+ln -s "$HOME/.codex/auth.json" "$HOME/.codex-hermes/sales/auth.json"
+CODEX_HOME="$HOME/.codex-hermes/sales" codex login status
+```
+
+两条路径的最后一条 `login status` 都必须显示已登录。不要覆盖命名目录中已有的凭据；
+若状态仍是 `Not logged in`，先修复认证，不启动 Gateway。随后为每个命名 profile 分别
+执行迁移：
 
 ```bash
 CODEX_HOME="$HOME/.codex-hermes/sales" hermes -p sales --cli
@@ -539,11 +557,11 @@ CODEX_HOME="$HOME/.codex-hermes/sales" codex mcp list
 安装并启动用户级服务：
 
 ```bash
-env -u HERMES_HOME -u CODEX_HOME hermes gateway install --force --no-start-now --start-on-login
-env -u HERMES_HOME -u CODEX_HOME hermes gateway start
-env -u HERMES_HOME -u CODEX_HOME hermes gateway status
-env -u HERMES_HOME -u CODEX_HOME hermes status
-env -u HERMES_HOME -u CODEX_HOME hermes logs -f
+env -u CODEX_HOME hermes -p default gateway install --force --no-start-now --start-on-login
+env -u CODEX_HOME hermes -p default gateway start
+env -u CODEX_HOME hermes -p default gateway status
+env -u CODEX_HOME hermes -p default status
+env -u CODEX_HOME hermes -p default logs -f
 ```
 
 启动日志应显示：
@@ -565,10 +583,10 @@ macOS 账号的 Codex 登录凭据，但不得共享 `config.toml` 或用户相�
 从已配置的 default 克隆模板，不需要停止正在服务的默认 Gateway：
 
 ```bash
-env -u HERMES_HOME -u CODEX_HOME hermes profile create sales --clone --description "销售小组专用 Agent"
-env -u HERMES_HOME -u CODEX_HOME hermes profile create finance --clone --description "财务小组专用 Agent"
-hermes profile list
-hermes profile show sales
+env -u CODEX_HOME hermes -p default profile create sales --clone --description "销售小组专用 Agent"
+env -u CODEX_HOME hermes -p default profile create finance --clone --description "财务小组专用 Agent"
+hermes -p default profile list
+hermes -p default profile show sales
 ```
 
 `--clone` 会复制配置和 `.env`，其中可能包含 default 的 Bot 凭据。**在启动任何小组
@@ -623,7 +641,9 @@ hermes -p sales config set agent.restart_drain_timeout 300
 hermes -p sales plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
 hermes -p sales plugins enable qqbot-connect-hotfix --no-allow-tool-override
 hermes -p sales plugins enable message-snapshot-store --no-allow-tool-override
-hermes -p sales plugins disable whatsapp-bridge-policy-hotfix
+if hermes -p sales plugins list | rg -q 'whatsapp-bridge-policy-hotfix'; then
+  hermes -p sales plugins disable whatsapp-bridge-policy-hotfix
+fi
 hermes -p sales tools enable --platform qqbot message_snapshot
 hermes -p sales tools enable --platform qqbot codex_session_project
 hermes -p sales config check
@@ -653,10 +673,10 @@ hermes -p finance gateway status
 日常管理命令：
 
 ```bash
-hermes profile list
+hermes -p default profile list
 hermes -p sales logs -f
 hermes -p sales gateway restart
-env -u HERMES_HOME -u CODEX_HOME hermes gateway status
+env -u CODEX_HOME hermes -p default gateway status
 ```
 
 如果各小组不需要独立机器人连接，不要启动多套 Gateway；可只保留 default Gateway，
@@ -676,7 +696,7 @@ env -u HERMES_HOME -u CODEX_HOME hermes gateway status
 - `.env` 中每个受管键只有一条有效赋值，QQ 凭据内容不打印到报告；
 - 命名 profile 的 `CODEX_HOME` 不同，`codex mcp list` 与真实只读 MCP 调用都通过隔离测试。
 
-默认 profile 使用 `env -u HERMES_HOME -u CODEX_HOME hermes ...`；命名 profile 使用
+默认 profile 使用 `env -u CODEX_HOME hermes -p default ...`；命名 profile 使用
 `hermes -p <name> ...`，并以其 `.env` 中的 `CODEX_HOME` 执行 `codex mcp ...`。
 
 ### B. Gateway 与渠道就绪
@@ -726,9 +746,9 @@ test -z "$(git -C "$REPO" status --porcelain)" || {
 }
 git -C "$REPO" rev-parse --abbrev-ref HEAD
 git -C "$REPO" rev-parse HEAD
-env -u HERMES_HOME -u CODEX_HOME hermes --version
+env -u CODEX_HOME hermes -p default --version
 codex --version
-env -u HERMES_HOME -u CODEX_HOME hermes gateway status
+env -u CODEX_HOME hermes -p default gateway status
 hermes -p sales gateway status  # 示例命名 profile
 ```
 
@@ -759,12 +779,12 @@ VERIFY_HOME="$(mktemp -d /private/tmp/hermes-dispatch-verify.XXXXXX)"
 
 ```bash
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
-hermes update --check
-if hermes update --help | rg -q -- '--plan'; then
-  hermes update --plan
+hermes -p default update --check
+if hermes -p default update --help | rg -q -- '--plan'; then
+  hermes -p default update --plan
 fi
-hermes update --backup
-hermes --version
+hermes -p default update --backup
+hermes -p default --version
 codex --version
 ```
 
