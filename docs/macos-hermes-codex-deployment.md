@@ -128,9 +128,8 @@ hermes -p default gateway stop
 先运行向导，让当前 Hermes 生成完整配置结构，再用命令调整。不要直接复制旧版本的
 整份 `config.yaml`。
 
-QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。0.20.0 的
-`GatewayStreamConsumer.finish()` 和 draft capability probe 契约不完整，不能启用本文的
-QQ streaming 设置。先检查实际运行源码版本：
+QQ 官方 C2C 流式消息要求 Hermes **0.20.5 或更高版本**。更早版本不满足该插件的
+streaming 兼容契约，不能启用本文的 QQ streaming 设置。先检查实际运行源码版本：
 
 ```bash
 hermes -p default --version
@@ -220,17 +219,14 @@ hermes -p default config set platforms.whatsapp.enabled false
 关键点：
 
 - `qqbot-connect-hotfix` 在兼容的稳定版 Hermes 上让 QQ C2C 私聊使用官方流式消息接口；
-  群聊和 QQ 频道私信仍走原有回复路径。插件处理 carrier 过期、超长 rollover、限频、取消、
-  并发 final 和迟到回调，并保证已确认内容不重复发送。协议与边界条件详见
+  群聊和 QQ 频道私信仍走原有回复路径。它提供可见中间状态并保证 final 不重复；QQ 的
+  被动回复窗口或次数耗尽后无法继续向同一条入站消息回复，因此真实验收应及时完成。
+  协议、并发和失败恢复边界详见
   [插件 README](../plugins/qqbot-connect-hotfix/README.md)，真实回归证据见
   [PR #4 证据](evidence/pr-4/README.md)。
-- 活动 stream 按 chat、draft 和入站回复锚点隔离；不同私聊可并行，相同 final 通过有界
-  single-flight 和完成 tombstone 去重。QQ 返回被动回复窗口/次数终止错误时，同一锚点无法
-  通过普通 fallback 恢复，真实验收必须在平台窗口内完成。
 - `group_sessions_per_user=false` 让同一群共用上下文；审批 hotfix 仍会校验发起人。
-- steer 被接受后，插件先封口旧 C2C 气泡，再用新回复锚点继续同一 Hermes session/Codex
-  thread；拒绝、未授权或超时不会伪造 redirect 成功。验收必须检查 Codex 实际采用更正并
-  返回新要求的 final，不能只看确认消息。
+- steer 被接受后，QQ 应结束旧气泡并在新气泡继续同一 Hermes session/Codex thread；
+  验收必须检查 Codex 实际采用更正并返回新要求的 final，不能只看确认消息。
 - `approvals.mode=smart` 让 Hermes 自动判断危险命令：低风险命令可自动放行，不确定的
   请求才发送人工审批；它不替代 Codex app-server 自身的审批策略。
 - `agent.gateway_timeout=7200` 将 Gateway 的无活动保护延长到 2 小时；`/stop` 和消息
@@ -416,17 +412,14 @@ hermes -p default plugins enable openai-codex
 hermes -p default plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
 hermes -p default plugins enable qqbot-connect-hotfix --no-allow-tool-override
 hermes -p default plugins enable message-snapshot-store --no-allow-tool-override
-if hermes -p default plugins list | rg -q 'whatsapp-bridge-policy-hotfix'; then
-  hermes -p default plugins disable whatsapp-bridge-policy-hotfix
-fi
 
 hermes -p default tools enable --platform qqbot message_snapshot
 hermes -p default tools enable --platform qqbot codex_session_project
 hermes -p default tools list --platform qqbot
 ```
 
-精确安装三项插件的新 profile 中不存在 WhatsApp hotfix；直接 disable 会以“未安装”返回
-非零状态。上面的 installed-state guard 只在旧环境确实残留该插件时禁用它。
+精确安装三项插件不会新增、升级、删除、启用或禁用 `whatsapp-bridge-policy-hotfix`。
+更新已有 profile 时，记录并保留该插件原有的安装和启用状态。
 
 三项插件共同提供：
 
@@ -641,9 +634,6 @@ hermes -p sales config set agent.restart_drain_timeout 300
 hermes -p sales plugins enable codex-app-server-phase-hotfix --no-allow-tool-override
 hermes -p sales plugins enable qqbot-connect-hotfix --no-allow-tool-override
 hermes -p sales plugins enable message-snapshot-store --no-allow-tool-override
-if hermes -p sales plugins list | rg -q 'whatsapp-bridge-policy-hotfix'; then
-  hermes -p sales plugins disable whatsapp-bridge-policy-hotfix
-fi
 hermes -p sales tools enable --platform qqbot message_snapshot
 hermes -p sales tools enable --platform qqbot codex_session_project
 hermes -p sales config check
@@ -691,7 +681,8 @@ env -u CODEX_HOME hermes -p default gateway status
 对每个目标 profile 分别确认：
 
 - 第 8 节全部测试和 `git diff --check` 通过；
-- `config check` 通过，三项插件版本与仓库一致且已启用，WhatsApp hotfix 未启用；
+- `config check` 通过，三项插件版本与仓库一致且已启用；WhatsApp hotfix 的安装及
+  enabled/disabled 状态与更新前记录一致；
 - `approvals.mode=smart`、三个 timeout、streaming 和 session-project 环境键符合预期；
 - `.env` 中每个受管键只有一条有效赋值，QQ 凭据内容不打印到报告；
 - 命名 profile 的 `CODEX_HOME` 不同，`codex mcp list` 与真实只读 MCP 调用都通过隔离测试。
