@@ -327,8 +327,8 @@ def _fence_indented_code(text: str):
     return text
 
 
-def _qq_file_directives(text: str, session_key: str = "") -> str:
-    """Bridge explicit final-answer file links to Hermes' attachment contract."""
+def _qq_output_files(text: str, session_key: str = ""):
+    """Return validated output attachments separately from their display text."""
     from gateway.platforms.base import BasePlatformAdapter
 
     visible = text
@@ -339,7 +339,7 @@ def _qq_file_directives(text: str, session_key: str = "") -> str:
         safe for path, _voice in existing
         if (safe := _validate_output_path(path, session_key))
     }
-    tags = []
+    media = []
     links = []
     # ponytail: explicit output citations and inline download links only;
     # bare paths may be inspected source, not delivery intent.
@@ -371,6 +371,8 @@ def _qq_file_directives(text: str, session_key: str = "") -> str:
         if not safe or any(c in safe for c in '\n\r"'):
             continue
         tag = f'MEDIA:"{safe}"'
+        if "[[audio_as_voice]]" in visible:
+            tag = "[[audio_as_voice]] " + tag
         extracted, _ = BasePlatformAdapter.extract_media(tag)
         if not extracted:
             continue
@@ -379,10 +381,10 @@ def _qq_file_directives(text: str, session_key: str = "") -> str:
         links.append((start, end, Path(safe).name))
         if safe not in seen:
             seen.add(safe)
-            tags.append(tag)
+            media.extend(extracted)
     for start, end, label in reversed(links):
         text = text[:start] + label + text[end:]
-    return text + "\n" + "\n".join(tags) if tags else text
+    return media, text
 
 
 def patch_output_file_delivery(QQAdapter):
@@ -393,7 +395,12 @@ def patch_output_file_delivery(QQAdapter):
 
     @functools.wraps(original)
     def extract_media(content):
-        return _extract_outside_examples(original, _qq_file_directives(_fence_indented_code(content)))
+        outputs, content = _qq_output_files(_fence_indented_code(content))
+        media, cleaned = _extract_outside_examples(original, content)
+        # Generated output attachments are already parsed and validated. Never
+        # insert directives into model text: a trailing quote or open fence can
+        # absorb them when the text is parsed again.
+        return media + outputs, cleaned
 
     extract_media._qqbot_output_files_wrapped = True
     QQAdapter.extract_media = staticmethod(extract_media)

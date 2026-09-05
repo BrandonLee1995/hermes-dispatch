@@ -881,3 +881,24 @@ one byte-matching CSV in each of a private chat and a real group; follow-up
 replies containing the actual files' links solely in code/quote examples sent
 no files. Replaying those same finals through the old bridge would extract
 one attachment each. See the ablation document for hashes, scope and limits.
+
+### Trailing-example correction (1.8.25)
+
+The 1.8.24 mixed-response test placed the real output after the example.
+The reverse order still lost a real output: generated MEDIA text appended at
+the end became a lazy continuation of a trailing blockquote or part of an
+unclosed fence. Adding a blank line cannot terminate an unclosed fence.
+
+Version 1.8.25 keeps validated output attachments as structured extraction
+results, separate from the reply text. It no longer appends generated MEDIA
+directives to the model's text. Native MEDIA handling, path safety, duplicate
+filtering and the existing QQ uploader remain in use, and the original example
+is retained for display. The same official 0.20.5/0.21.0 compatibility applies.
+
+Install 1.8.25 and restart only the selected profile; no hook registration or
+trust update is required. `test_file_delivery.py` covers both orderings with
+Markdown links and output citations, trailing/indented quotes, unclosed tilde
+and backtick fences, closed-fence controls, and streamed/ordinary C2C/group
+delivery. It requires one byte-matching real attachment and zero example
+uploads. Existing native MEDIA and audio markers are also checked. Rollback
+uses the same installer backup command above; 1.8.24 restores this known P2.

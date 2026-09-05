@@ -127,31 +127,30 @@ async def main():
             assert [body['content'] for body in sent if body['msg_type'] == 0] == ['已做好：采购清单.txt']
 
         # Full-path labels must not survive as a second bare-path attachment.
-        result['final_response'] = delivery._qq_file_directives(f'[{output}]({output})', agent._gateway_session_key)
+        result['final_response'] = f'[{output}]({output})'
         ordinary = RecordingQQ()
         ordinary.set_message_handler(respond)
         await ordinary._process_message_background(event, agent._gateway_session_key)
         assert ordinary.uploaded == [output.read_bytes()]
         nested = f'[:codex-file-citation{{path="{output}" purpose="output"}}]({output}) tail-marker'
-        normalized = delivery._qq_file_directives(nested, agent._gateway_session_key)
+        media, normalized = delivery._qq_output_files(nested, agent._gateway_session_key)
         assert 'tail-marker' in normalized and ':codex-file-citation' not in normalized
-        assert normalized.count('MEDIA:') == 1
+        assert media == [(str(output.resolve()), False)]
         null_tag = 'done MEDIA:/tmp/\x00.txt'
-        assert delivery._qq_file_directives(null_tag, agent._gateway_session_key) == null_tag
+        assert delivery._qq_output_files(null_tag, agent._gateway_session_key) == ([], null_tag)
 
         key = agent._gateway_session_key
         spaced = Path(tmp, '测试 report.csv')
         spaced.write_text('a,b\n1,2\n')
         for link in (f'[file](<{spaced}>)', f'[file]({spaced.as_uri()})',
                      f'Created :codex-file-citation{{path="{spaced}" purpose="output"}}'):
-            linked = delivery._qq_file_directives(link, key)
             sent = RecordingQQ()
-            await deliver(linked, sent)
+            await deliver(link, sent)
             assert sent.uploaded == [spaced.read_bytes()]
-        dedup = delivery._qq_file_directives(final + '\n' + final +
+        media, dedup = delivery._qq_output_files(final + '\n' + final +
             f' :codex-file-citation{{path="{output}" purpose="output"}}', key)
-        assert dedup.count('MEDIA:') == 1
-        assert delivery._qq_file_directives(dedup, key) == dedup
+        assert media == [(str(output.resolve()), False)]
+        assert delivery._qq_output_files(dedup, key) == ([], dedup)
         for text in (f'`{final}`', f'```md\n{final}\n```', f'> {final}',
                      f'[source]({output}:12)', f'[source]({output}#L1)',
                      f'[missing]({tmp}/missing.pdf)', '[secret](/etc/passwd)',
@@ -160,11 +159,11 @@ async def main():
                      f':codex-file-citation{{path="{output}" purpose="source"}}',
                      ':codex-file-citation{path="unclosed purpose="output"}',
                      f'`:codex-file-citation{{path="{output}" purpose="output"}}`'):
-            assert delivery._qq_file_directives(text, key) == text, text
+            assert delivery._qq_output_files(text, key) == ([], text), text
         secret_link = Path(tmp, 'secret.txt')
         secret_link.symlink_to('/etc/passwd')
         text = f'[secret]({secret_link})'
-        assert delivery._qq_file_directives(text, key) == text
+        assert delivery._qq_output_files(text, key) == ([], text)
         # The runtime/streamed text is untouched; only QQ's final extraction
         # accepts output references. Base extraction used by history is intact.
         from gateway.platforms.base import BasePlatformAdapter
@@ -174,6 +173,32 @@ async def main():
         # Use ASCII paths too: upstream ordinary delivery scans bare paths.
         sample = Path(tmp, 'example.txt')
         sample.write_text('example only')
+        audio = Path(tmp, 'example.wav')
+        audio.write_bytes(b'RIFF-test-audio')
+        audio_ref = f'[audio]({audio})'
+        assert RecordingQQ.extract_media('[[audio_as_voice]]\n' + audio_ref)[0] == [(str(audio.resolve()), True)]
+        assert RecordingQQ.extract_media('~~~\n[[audio_as_voice]]\n~~~\n\n' + audio_ref)[0] == [(str(audio.resolve()), False)]
+        # A generated attachment must not be reparsed into a trailing quote
+        # (lazy continuation) or an unclosed fence. The ordering matters.
+        for reference in (f'[download]({output})',
+                          f':codex-file-citation{{path="{output}" purpose="output"}}'):
+            for tail in (f'> [example]({sample})', f'  > [example]({sample})',
+                         f'~~~md\n[example]({sample})', f'````md\n[example]({sample})',
+                         f'~~~\n[example]({sample})\n~~~'):
+                response = reference + '\n\n' + tail
+                for chat_type in ('c2c', 'group'):
+                    streamed = RecordingQQ(chat_type)
+                    await deliver(response, streamed)
+                    assert streamed.uploaded == [output.read_bytes()], (chat_type, response)
+                    ordinary_tail = RecordingQQ(chat_type)
+                    async def tail_response(_event):
+                        return response
+                    ordinary_tail.set_message_handler(tail_response)
+                    await ordinary_tail._process_message_background(event, agent._gateway_session_key)
+                    assert ordinary_tail.uploaded == [output.read_bytes()], (chat_type, response)
+                    assert sum(b['msg_type'] == 7 for p, b in ordinary_tail.calls if p.endswith('/messages')) == 1
+                    media, cleaned = ordinary_tail.extract_media(response)
+                    assert len(media) == 1 and tail in cleaned
         for reference in (f'[sample]({sample})',
                           f':codex-file-citation{{path="{sample}" purpose="output"}}'):
             examples = [
@@ -187,7 +212,7 @@ async def main():
                 f'\\` text `{reference}`',
             ]
             for example in examples:
-                assert delivery._qq_file_directives(example) == example, example
+                assert delivery._qq_output_files(example) == ([], example), example
                 for chat_type in ('c2c', 'group'):
                     protected = RecordingQQ(chat_type)
                     assert protected.extract_local_files(example) == ([], example), (example, protected.extract_local_files(example))
