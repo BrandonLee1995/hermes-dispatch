@@ -852,14 +852,16 @@ field reported 0.20.5 but whose validator already supported `session_key`.
 That result is not proof of compatibility with the official 0.20.5 tag.
 
 QQ scans now use CommonMark block source maps from `markdown-it-py`, already
-included by Hermes' required Rich package, and equal-length inline backtick
-delimiters. Fences (including tildes, longer and unclosed fences), indented
+included by Hermes' required Rich package, and its actual inline-code rule
+(including escaped openers and equal-length delimiters). Fences (including tildes, longer and unclosed fences), indented
 code, nested/lazy blockquotes and inline examples are protected during both
-MEDIA extraction and ordinary bare-path scanning. Leading indented code is
-represented as an equivalent fenced block so Hermes' intervening `.strip()`
+MEDIA extraction and ordinary bare-path scanning. Top-level indented code is
+represented as an equivalent fenced block so image removal and Hermes' intervening `.strip()`
 cannot turn its contents into attachment candidates. Example content remains
-text; QQ's normal display formatting still applies. Explicit inline MEDIA
-remains supported. No new dependency installation or global Base adapter patch
+text; QQ's normal display formatting still applies. Upstream-recognized inline
+MEDIA forms, including a backtick-quoted path, remain supported. Duplicate
+detection uses the same protected extraction as delivery, so an example cannot
+suppress a real output of the same path. No new dependency installation or global Base adapter patch
 is introduced.
 
 Enable by installing this QQ plugin version and restarting the selected profile;

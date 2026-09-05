@@ -92,6 +92,10 @@ async def main():
         inline_media = RecordingQQ()
         await deliver(f'`MEDIA:{output}`', inline_media)
         assert inline_media.uploaded == [output.read_bytes()]
+        for directive in (f'MEDIA:`{output}`', f'` MEDIA:{output} `', f'`media:{output}`'):
+            existing = RecordingQQ()
+            await deliver(directive, existing)
+            assert existing.uploaded == [output.read_bytes()], directive
         final = f'已做好：[采购清单]({output})'
         agent = SimpleNamespace(_gateway_session_key='agent:main:qqbot:dm:test-chat')
         result = {'final_response': final}
@@ -180,12 +184,13 @@ async def main():
                 f'`` text ` {reference} ` text ``',
                 f'`line one\n{reference}\nline three`',
                 f'\r\n    {reference}\r\n',
+                f'\\` text `{reference}`',
             ]
             for example in examples:
                 assert delivery._qq_file_directives(example) == example, example
                 for chat_type in ('c2c', 'group'):
                     protected = RecordingQQ(chat_type)
-                    assert protected.extract_local_files(example) == ([], example)
+                    assert protected.extract_local_files(example) == ([], example), (example, protected.extract_local_files(example))
                     await deliver(example, protected)
                     assert protected.uploaded == [], example
                     async def example_response(_event):
@@ -209,10 +214,22 @@ async def main():
             bodies = [b['content'] for p, b in sent.calls if p.endswith('/messages') and b['msg_type'] == 0]
             assert 'sample' in bodies[0]
 
+        same_path = f'~~~\nMEDIA:{sample}\n~~~\n\n[download]({sample})'
+        same_path_sent = RecordingQQ()
+        await deliver(same_path, same_path_sent)
+        assert same_path_sent.uploaded == [sample.read_bytes()]
+        image_then_code = f'![picture](https://example.invalid/a.png)\n\n    [sample]({sample})'
+        image_case = RecordingQQ()
+        async def image_response(_event):
+            return image_then_code
+        image_case.set_message_handler(image_response)
+        await image_case._process_message_background(event, agent._gateway_session_key)
+        assert image_case.uploaded == [], 'removing an image exposed the indented example'
+
         from markdown_it import MarkdownIt
         code = f'    ```\n    {sample}\n    ```\n'
         before = MarkdownIt().parse(code)[0]
-        after = MarkdownIt().parse(delivery._preserve_leading_code(code))[0]
+        after = MarkdownIt().parse(delivery._fence_indented_code(code))[0]
         assert before.type == 'code_block' and after.type == 'fence'
         assert before.content == after.content, 'code content changed during fencing'
         # Ordinary bare paths outside examples keep their existing behavior.

@@ -279,15 +279,30 @@ def _qq_example_spans(text: str):
     # markdown-it-py already ships with Hermes' required Rich dependency.
     # Its source maps cover nested/lazy quotes and all CommonMark code blocks.
     from markdown_it import MarkdownIt
+    from markdown_it.rules_inline import backtick
 
     offsets = [0] + [m.end() for m in re.finditer(r"\r\n?|\n", text)] + [len(text)]
+    parser = MarkdownIt()
+    tokens = parser.parse(text)
     spans = [(offsets[t.map[0]], offsets[t.map[1]])
-             for t in MarkdownIt().parse(text)
+             for t in tokens
              if t.type in {"fence", "code_block", "blockquote_open", "html_block"} and t.map]
-    # Inline code delimiters must have equal backtick-run lengths; spans may
-    # cross newlines and contain shorter runs as literal text.
-    spans.extend(m.span() for m in re.finditer(
-        r"(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)", text))
+    # Ask the existing inline rule for its actual source span. This respects
+    # escaped openers, literal closers, HTML/link syntax and block boundaries.
+    block_start = 0
+    def capture_code(state, silent):
+        start, count = state.pos, len(state.tokens)
+        matched = backtick(state, silent)
+        if not silent and len(state.tokens) > count and state.tokens[-1].type == "code_inline":
+            spans.append((block_start + start, block_start + state.pos))
+        return matched
+    parser.inline.ruler.at("backticks", capture_code)
+    for token in tokens:
+        if token.type == "inline" and token.map:
+            block_start, end = offsets[token.map[0]], offsets[token.map[1]]
+            # Preserve character offsets through the parser's CR normalization.
+            source = text[block_start:end].replace("\r\n", " \n").replace("\r", "\n")
+            parser.parseInline(source)
     merged = []
     for start, end in sorted(spans):
         if merged and start <= merged[-1][1]:
@@ -297,30 +312,29 @@ def _qq_example_spans(text: str):
     return merged
 
 
-def _preserve_leading_code(text: str):
+def _fence_indented_code(text: str):
     from markdown_it import MarkdownIt
 
     tokens = MarkdownIt().parse(text)
-    if not tokens or tokens[0].type != "code_block":
-        return text
-    token = tokens[0]
     offsets = [0] + [m.end() for m in re.finditer(r"\r\n?|\n", text)] + [len(text)]
-    start, end = offsets[token.map[0]], offsets[token.map[1]]
-    # Ordinary Hermes strips the response before scanning bare paths. A
-    # fenced representation preserves this leading code block's semantics
-    # through that strip, without carrying state between extraction calls.
-    fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", token.content)), default=0))
-    return text[:start] + fence + "\n" + token.content + fence + "\n" + text[end:]
+    # An earlier image may disappear before Hermes strips the body. Protect
+    # every top-level indented block, while retaining nested list structure.
+    for token in reversed(tokens):
+        if token.type == "code_block" and token.level == 0:
+            start, end = offsets[token.map[0]], offsets[token.map[1]]
+            fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", token.content)), default=0))
+            text = text[:start] + fence + "\n" + token.content + fence + "\n" + text[end:]
+    return text
 
 
 def _qq_file_directives(text: str, session_key: str = "") -> str:
     """Bridge explicit final-answer file links to Hermes' attachment contract."""
     from gateway.platforms.base import BasePlatformAdapter
 
-    visible = BasePlatformAdapter._mask_protected_spans(text)
+    visible = text
     for start, end in _qq_example_spans(text):
         visible = visible[:start] + " " * (end - start) + visible[end:]
-    existing, _ = BasePlatformAdapter.extract_media(text)
+    existing, _ = _extract_outside_examples(BasePlatformAdapter.extract_media, text)
     seen = {
         safe for path, _voice in existing
         if (safe := _validate_output_path(path, session_key))
@@ -379,7 +393,7 @@ def patch_output_file_delivery(QQAdapter):
 
     @functools.wraps(original)
     def extract_media(content):
-        return _extract_outside_examples(original, _qq_file_directives(_preserve_leading_code(content)))
+        return _extract_outside_examples(original, _qq_file_directives(_fence_indented_code(content)))
 
     extract_media._qqbot_output_files_wrapped = True
     QQAdapter.extract_media = staticmethod(extract_media)
@@ -398,10 +412,15 @@ def _extract_outside_examples(extract, content):
     # strips leading whitespace, which otherwise turns indented code into a
     # bare path before ordinary delivery's second scan. Restore display text.
     protected = {}
+    from gateway.platforms.base import BasePlatformAdapter
     for start, end in reversed(_qq_example_spans(content)):
         example = content[start:end]
-        if re.fullmatch(r"`+MEDIA:[^\r\n]+`+", example):
-            continue  # Preserve Hermes' deliberate inline MEDIA contract.
+        if example.startswith("`") and "\n" not in example:
+            native_example = example
+            if re.search(r"MEDIA:\s*$", content[:start]):
+                native_example = "MEDIA:" + example
+            if BasePlatformAdapter.extract_media(native_example)[0]:
+                continue  # Preserve inline MEDIA syntax recognized by Hermes.
         marker = uuid.uuid4().hex
         protected[marker] = example
         content = content[:start] + marker + content[end:]
