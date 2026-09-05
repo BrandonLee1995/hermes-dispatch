@@ -31,6 +31,7 @@ from .outbound import (
     patch_expired_reply_fallback as _patch_expired_reply_fallback,
     patch_media_caption_retry as _patch_media_caption_retry,
     patch_output_file_delivery as _patch_output_file_delivery,
+    patch_post_stream_media_failures as _patch_post_stream_media_failures,
     patch_plain_text_retry as _patch_plain_text_retry,
     send_plain_text as _send_plain_text,
     should_retry_plain_text as _should_retry_plain_text,
@@ -66,6 +67,7 @@ def register(ctx):
     _patch_expired_reply_fallback(QQAdapter)
     _patch_media_caption_retry(QQAdapter)
     _patch_output_file_delivery(QQAdapter)
+    _patch_post_stream_media_failures(QQAdapter)
     streaming_status = _patch_qq_c2c_streaming(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", streaming_status)
     choices_status = _patch_codex_approval_choices(QQAdapter)

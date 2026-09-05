@@ -794,6 +794,20 @@ QQ downloads. This did not establish a reliability winner or add persistent
 guidance. See the ablation report for exact prompts, separate interruption
 counts, artifact-validation limits, and restored environment.
 
+Version 1.8.23 also reports a failed post-stream media upload through Hermes'
+existing user-visible attachment-failure notice. Upstream ordinary delivery
+already checks `SendResult.success`, but its post-stream rescan ignores that
+return value. This QQ-only wrapper adds the missing notice after the existing
+caption retry finishes, without duplicating ordinary-path notices or retrying
+the upload itself. `test_file_delivery.py` includes a failing HTTP upload
+control and verifies one notice on failure and one attachment on success.
+
+The optional Codex-native QQ delivery hook is documented in
+[`codex-app-server-phase-hotfix`](../codex-app-server-phase-hotfix/README.md#qq-file-delivery-hook-184).
+It is installed separately per profile/CODEX_HOME; this QQ plugin does not
+modify Codex hook configuration or hook trust. Remove that hook before rolling
+its companion Codex plugin back to a version without the hook script.
+
 Rollback using the exact backup printed by the installer:
 
 ```bash

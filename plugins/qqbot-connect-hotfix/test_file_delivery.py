@@ -141,10 +141,46 @@ async def main():
         from gateway.platforms.base import BasePlatformAdapter
         assert BasePlatformAdapter.extract_media(final)[0] == []
         assert final == f'已做好：[采购清单]({output})'
+
+        class FailingQQ(RecordingQQ):
+            async def _api_request(self, method, path, body=None, **kwargs):
+                if path.endswith('/upload_prepare'):
+                    raise RuntimeError('simulated upload failure')
+                return await super()._api_request(method, path, body, **kwargs)
+
+        # Reproduce the upstream post-stream gap: a failed SendResult was
+        # ignored, so the user got no failure notice after the final text.
+        failed_before = FailingQQ()
+        directive = f'MEDIA:"{output}"'
+        await deliver(directive, failed_before)
+        assert not any(p.endswith('/messages') for p, _ in failed_before.calls)
+        delivery.patch_post_stream_media_failures(RecordingQQ)
+        patched_dispatch = GatewayRunner._deliver_media_from_response
+        delivery.patch_post_stream_media_failures(RecordingQQ)
+        assert GatewayRunner._deliver_media_from_response is patched_dispatch
+        failed_after = FailingQQ()
+        await deliver(directive, failed_after)
+        notices = [b['content'] for p, b in failed_after.calls if p.endswith('/messages')]
+        assert len(notices) == 1 and "Couldn't deliver" in notices[0]
+
+        # Ordinary dispatch already notifies; the shared adapter patch must
+        # not emit a second notice there or leak state from another stream.
+        failed_ordinary = FailingQQ()
+        async def failed_response(_event):
+            return directive
+        failed_ordinary.set_message_handler(failed_response)
+        await failed_ordinary._process_message_background(event, agent._gateway_session_key)
+        notices = [b['content'] for p, b in failed_ordinary.calls if p.endswith('/messages')]
+        assert len(notices) == 1 and "Couldn't deliver" in notices[0]
+        success_after = RecordingQQ()
+        await deliver(directive, success_after)
+        assert success_after.uploaded == [output.read_bytes()]
+        assert sum(p.endswith('/messages') for p, _ in success_after.calls) == 1
         print('codex_final_to_qq_attachment=PASS')
         print('c2c_group_upload_bytes_and_file_info=PASS')
         print('nonstreaming_c2c_group_attachment_exactly_once=PASS')
         print('spaces_unicode_dedup_safe_paths_and_turn_scope=PASS')
+        print('post_stream_failure_visible_once_and_ordinary_notice_not_duplicated=PASS')
 
 
 if __name__ == '__main__':

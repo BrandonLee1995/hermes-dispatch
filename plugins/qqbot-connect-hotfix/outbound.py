@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import contextvars
 import logging
 import re
 import shlex
@@ -14,6 +15,7 @@ from typing import Any, Awaitable, Callable, Dict
 logger = logging.getLogger(__name__)
 
 _EXPIRED_REPLY_WRAPPER = "_qqbot_expired_reply_fallback_wrapped"
+_POST_STREAM_DELIVERY = contextvars.ContextVar("qq_post_stream_delivery", default=None)
 
 
 def is_expired_reply_error(error: object) -> bool:
@@ -329,3 +331,43 @@ def patch_output_file_delivery(QQAdapter):
 
     extract_media._qqbot_output_files_wrapped = True
     QQAdapter.extract_media = staticmethod(extract_media)
+
+
+def patch_post_stream_media_failures(QQAdapter):
+    """Reuse Hermes' ordinary failure notice for QQ post-stream attachments."""
+    from gateway.run import GatewayRunner
+
+    original_media = QQAdapter._send_media
+    if not getattr(original_media, "_qqbot_post_stream_failure_wrapped", False):
+        @functools.wraps(original_media)
+        async def send_media(self, chat_id, media_source, *args, **kwargs):
+            result = await original_media(self, chat_id, media_source, *args, **kwargs)
+            context = _POST_STREAM_DELIVERY.get()
+            if context is not None and context[0] is self and not result.success:
+                await self._notify_media_delivery_failure(
+                    chat_id, media_source, metadata=context[1],
+                )
+            return result
+
+        send_media._qqbot_post_stream_failure_wrapped = True
+        QQAdapter._send_media = send_media
+
+    original_dispatch = GatewayRunner._deliver_media_from_response
+    if getattr(original_dispatch, "_qqbot_post_stream_failure_wrapped", False):
+        return
+
+    @functools.wraps(original_dispatch)
+    async def deliver(self, response, event, adapter, thread_metadata=None):
+        platform = getattr(event.source.platform, "value", event.source.platform)
+        if platform != "qqbot":
+            return await original_dispatch(self, response, event, adapter, thread_metadata)
+        metadata = (dict(thread_metadata) if thread_metadata is not None else
+                    self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event)))
+        token = _POST_STREAM_DELIVERY.set((adapter, metadata))
+        try:
+            return await original_dispatch(self, response, event, adapter, metadata)
+        finally:
+            _POST_STREAM_DELIVERY.reset(token)
+
+    deliver._qqbot_post_stream_failure_wrapped = True
+    GatewayRunner._deliver_media_from_response = deliver
