@@ -802,6 +802,13 @@ caption retry finishes, without duplicating ordinary-path notices or retrying
 the upload itself. `test_file_delivery.py` includes a failing HTTP upload
 control and verifies one notice on failure and one attachment on success.
 
+Gateway-dependent patches install when the first QQ adapter is constructed,
+before it receives messages. Importing `gateway.run` during Hermes' background
+plugin discovery can deadlock with the main thread waiting for that discovery.
+`test_startup.py` checks that discovery does not import GatewayRunner and that
+the first adapter activates the patches. No special launcher or disabled
+background discovery is required.
+
 The optional Codex-native QQ delivery hook is documented in
 [`codex-app-server-phase-hotfix`](../codex-app-server-phase-hotfix/README.md#qq-file-delivery-hook-184).
 It is installed separately per profile/CODEX_HOME; this QQ plugin does not
