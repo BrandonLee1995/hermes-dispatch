@@ -231,7 +231,7 @@ async def main():
         for name in ('~~~report.txt', '```report.txt', '> report.txt', 'name ` code.txt'):
             odd = Path(tmp, name)
             odd.write_bytes(b'odd-name output')
-            reference = f'[real](<{odd}>)'
+            reference = f'[real]({odd.as_uri()})'
             for suffix, expected in (
                 (f'\nMEDIA:"{output}"', [output.read_bytes(), odd.read_bytes()]),
                 (f'\n\n~~~\nMEDIA:"{sample}"\n~~~', [odd.read_bytes()]),
