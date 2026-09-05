@@ -895,6 +895,13 @@ directives to the model's text. Native MEDIA handling, path safety, duplicate
 filtering and the existing QQ uploader remain in use, and the original example
 is retained for display. The same official 0.20.5/0.21.0 compatibility applies.
 
+Native MEDIA is captured from the original reply before display links are
+replaced. A safe plain basename may remain in the text; names containing
+spaces or Markdown syntax use the neutral label `attachment` there. The native
+QQ file card and downloaded file retain the exact filename. This prevents
+filenames such as `~~~report.txt` from changing the example boundaries during
+later ordinary-path scanning.
+
 Install 1.8.25 and restart only the selected profile; no hook registration or
 trust update is required. `test_file_delivery.py` covers both orderings with
 Markdown links and output citations, trailing/indented quotes, unclosed tilde

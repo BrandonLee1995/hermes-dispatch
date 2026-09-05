@@ -378,7 +378,10 @@ def _qq_output_files(text: str, session_key: str = ""):
             continue
         # Remove the local target too: non-streaming Hermes also scans bare
         # paths and would otherwise send the same file a second time.
-        links.append((start, end, Path(safe).name))
+        label = Path(safe).name
+        # The native file card retains the exact name. Do not put filenames
+        # containing Markdown syntax back into text that will be parsed again.
+        links.append((start, end, label if re.fullmatch(r"[\w.-]+", label) else "attachment"))
         if safe not in seen:
             seen.add(safe)
             media.extend(extracted)
@@ -395,8 +398,10 @@ def patch_output_file_delivery(QQAdapter):
 
     @functools.wraps(original)
     def extract_media(content):
-        outputs, content = _qq_output_files(_fence_indented_code(content))
-        media, cleaned = _extract_outside_examples(original, content)
+        content = _fence_indented_code(content)
+        media, _ = _extract_outside_examples(original, content)
+        outputs, content = _qq_output_files(content)
+        _, cleaned = _extract_outside_examples(original, content)
         # Generated output attachments are already parsed and validated. Never
         # insert directives into model text: a trailing quote or open fence can
         # absorb them when the text is parsed again.

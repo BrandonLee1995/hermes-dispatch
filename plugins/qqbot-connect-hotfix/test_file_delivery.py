@@ -226,6 +226,29 @@ async def main():
                     bodies = [b['content'] for p, b in protected.calls if p.endswith('/messages')]
                     assert len(bodies) == 1  # QQ applies its normal text formatting.
 
+        # A basename is data, not Markdown syntax. It must neither open a
+        # fence that hides native MEDIA nor close one that exposes examples.
+        for name in ('~~~report.txt', '```report.txt', '> report.txt', 'name ` code.txt'):
+            odd = Path(tmp, name)
+            odd.write_bytes(b'odd-name output')
+            reference = f'[real](<{odd}>)'
+            for suffix, expected in (
+                (f'\nMEDIA:"{output}"', [output.read_bytes(), odd.read_bytes()]),
+                (f'\n\n~~~\nMEDIA:"{sample}"\n~~~', [odd.read_bytes()]),
+                (f'\n\n~~~\n[example]({sample})\n~~~', [odd.read_bytes()]),
+            ):
+                response = reference + suffix
+                for chat_type in ('c2c', 'group'):
+                    streamed = RecordingQQ(chat_type)
+                    await deliver(response, streamed)
+                    assert streamed.uploaded == expected, (name, response)
+                    ordinary_name = RecordingQQ(chat_type)
+                    async def name_response(_event):
+                        return response
+                    ordinary_name.set_message_handler(name_response)
+                    await ordinary_name._process_message_background(event, agent._gateway_session_key)
+                    assert ordinary_name.uploaded == expected, (name, response)
+
         # An example and a real output in one answer must not hide the output
         # or erase the example while ordinary delivery scans remaining paths.
         mixed = f'~~~\n[sample]({sample})\n~~~\n\n{final}'
