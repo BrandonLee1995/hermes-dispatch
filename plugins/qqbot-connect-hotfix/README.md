@@ -776,6 +776,15 @@ create a CSV and send it. Do not mention media directives or upload APIs. Requir
 a downloadable file card and compare downloaded bytes to the generated file.
 See `docs/ablation-2026-09-05.md` for recorded results and limits.
 
+The follow-up live comparison disabled automatic skill/memory learning and used
+identical natural-language TXT/CSV/JSON requests. Native Codex skills, native
+Codex UserPromptSubmit hooks, and this extraction bridge each delivered 3/3
+downloadable files. That small sample does not rank long-term reliability. The
+bridge remains the default here and adds no persistent prompt guidance. Hermes
+skill discovery and pre_llm_call context did not reach the Codex app-server in
+the diagnostic controls; merely registering them is not evidence of model
+exposure. The report records the actual loading boundary and restored state.
+
 Rollback using the exact backup printed by the installer:
 
 ```bash
