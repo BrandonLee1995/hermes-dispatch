@@ -159,6 +159,21 @@ upload hints. Correlate native hook records with Codex turn IDs, inspect final
 bridge-only, combined and neither controls to separate their contributions.
 Also revise an output in the same conversation and check one new attachment.
 
+The 2026-09-05 procurement canary used Codex CLI 0.153.4 and
+`gpt-5.6-sol` / high. Hook-only, bridge-only, combined and negative controls
+behaved as expected; same-session revision, Python, four-slide PPTX, two-page
+PDF and ordinary-chat checks completed. A same-home/same-cwd direct CLI
+control emitted no QQ contract. A subsequent continuous-conversation check
+covered six natural file requests in a private chat and six in a real group:
+12/12 native hook executions, 12/12 final MEDIA responses and 16/16 downloaded
+files matching source bytes. Group history was retained, so this extension is
+live acceptance, not a clean-history causal comparison. Only procurement was
+deployed. Learning settings were restored and QQ reconnected at 20:06:12 +08:00.
+Private streaming text still sometimes exposes MEDIA fragments or literal
+output citations; attachment delivery and text rendering are separate results.
+See [the acceptance record](../../docs/ablation-2026-09-05.md#常驻-qq-hook-实现与私聊群聊验收2026-09-05-完成)
+for conditions and limits; these small samples do not establish long-term rates.
+
 Remove the hook before restoring an older Hermes plugin that lacks its script:
 
 ```bash

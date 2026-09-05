@@ -815,6 +815,15 @@ It is installed separately per profile/CODEX_HOME; this QQ plugin does not
 modify Codex hook configuration or hook trust. Remove that hook before rolling
 its companion Codex plugin back to a version without the hook script.
 
+The 2026-09-05 procurement acceptance with the native hook enabled covered
+six continuous private-chat turns and six continuous real-group turns. All
+12 emitted MEDIA and delivered the expected files: 16 downloads matched
+source bytes, with 16 file uploads and no observed duplicate file cards.
+Private streaming text still showed occasional MEDIA/citation fragments;
+this is not a text-rendering fix. The earlier hook-only/bridge-only controls
+and the scope of this single-model canary are recorded in
+[`docs/ablation-2026-09-05.md`](../../docs/ablation-2026-09-05.md).
+
 Rollback using the exact backup printed by the installer:
 
 ```bash
