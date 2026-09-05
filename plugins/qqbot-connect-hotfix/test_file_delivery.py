@@ -1,0 +1,151 @@
+"""Codex final answer -> real Gateway/QQ upload, with HTTP replaced only."""
+import asyncio
+import base64
+import importlib.util
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
+from gateway.platforms.qqbot.adapter import QQAdapter
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+spec = importlib.util.spec_from_file_location('file_delivery_test', Path(__file__).with_name('outbound.py'))
+delivery = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(delivery)
+
+
+class RecordingQQ(QQAdapter):
+    def __init__(self, chat_type='c2c'):
+        super().__init__(PlatformConfig(typing_indicator=False, extra={
+            'app_id': 'test-app', 'client_secret': 'test-secret',
+            'markdown_support': False}))
+        self._running = True
+        self._ws = SimpleNamespace(closed=False)
+        self._chat_type_map = {'test-chat': chat_type}
+        self._http_client = SimpleNamespace(put=self.put)
+        self.calls = []
+        self.uploaded = []
+
+    async def put(self, url, *, data, headers):
+        assert url == 'https://upload.invalid/part'
+        self.uploaded.append(data)
+        return SimpleNamespace(status_code=200)
+
+    async def _api_request(self, method, path, body=None, **kwargs):
+        self.calls.append((path, body))
+        if path.endswith('/upload_prepare'):
+            return {'upload_id': 'test-upload', 'block_size': body['file_size'],
+                    'parts': [{'part_index': 1, 'presigned_url': 'https://upload.invalid/part'}]}
+        if path.endswith('/upload_part_finish'):
+            return {}
+        if path.endswith('/files'):
+            if body.get('file_data'):
+                self.uploaded.append(base64.b64decode(body['file_data']))
+            return {'file_info': 'test-file-info'}
+        assert path.endswith('/messages')
+        if body['msg_type'] == 7:
+            assert body['media'] == {'file_info': 'test-file-info'}
+        else:
+            assert body['msg_type'] == 0 and 'Sorry' not in body['content']
+        return {'id': 'attachment-message'}
+
+
+async def deliver(text, adapter):
+    event = SimpleNamespace(source=SimpleNamespace(chat_id='test-chat', platform='qqbot'))
+    await GatewayRunner._deliver_media_from_response(
+        object.__new__(GatewayRunner), text, event, adapter, thread_metadata={})
+
+
+async def main():
+    delivery.patch_output_file_delivery(RecordingQQ)
+    patched = RecordingQQ.extract_media
+    delivery.patch_output_file_delivery(RecordingQQ)
+    assert RecordingQQ.extract_media is patched
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp, '采购清单.txt')
+        output.write_text('名称,数量\n测试物料,3\n')
+        final = f'已做好：[采购清单]({output})'
+        agent = SimpleNamespace(_gateway_session_key='agent:main:qqbot:dm:test-chat')
+        result = {'final_response': final}
+        adapter = RecordingQQ()
+        await deliver(result['final_response'], adapter)
+        assert adapter.uploaded == [output.read_bytes()], 'local output never uploaded to QQ'
+        assert sum(p.endswith('/messages') for p, _ in adapter.calls) == 1
+        # The same finalized answer reaches both group and C2C native upload.
+        group = RecordingQQ('group')
+        await deliver(result['final_response'], group)
+        assert group.uploaded == [output.read_bytes()]
+        assert all('/v2/groups/' in path for path, _ in group.calls)
+
+        # Non-streaming and streaming fallback use the adapter's full response
+        # pipeline, which scans both MEDIA tags and remaining local links.
+        for chat_type in ('c2c', 'group'):
+            ordinary = RecordingQQ(chat_type)
+            async def respond(event):
+                return result['final_response']
+            ordinary.set_message_handler(respond)
+            event = MessageEvent(text='请生成清单', source=SessionSource(
+                platform=Platform.QQBOT, chat_id='test-chat',
+                chat_type='dm' if chat_type == 'c2c' else 'group',
+                user_id='test-user'), message_id='incoming-test')
+            await ordinary._process_message_background(event, agent._gateway_session_key)
+            assert ordinary.uploaded == [output.read_bytes()], 'non-streaming upload duplicated or missing'
+            sent = [body for path, body in ordinary.calls if path.endswith('/messages')]
+            assert sum(body['msg_type'] == 7 for body in sent) == 1
+            assert [body['content'] for body in sent if body['msg_type'] == 0] == ['已做好：采购清单.txt']
+
+        # Full-path labels must not survive as a second bare-path attachment.
+        result['final_response'] = delivery._qq_file_directives(f'[{output}]({output})', agent._gateway_session_key)
+        ordinary = RecordingQQ()
+        ordinary.set_message_handler(respond)
+        await ordinary._process_message_background(event, agent._gateway_session_key)
+        assert ordinary.uploaded == [output.read_bytes()]
+        nested = f'[:codex-file-citation{{path="{output}" purpose="output"}}]({output}) tail-marker'
+        normalized = delivery._qq_file_directives(nested, agent._gateway_session_key)
+        assert 'tail-marker' in normalized and ':codex-file-citation' not in normalized
+        assert normalized.count('MEDIA:') == 1
+        null_tag = 'done MEDIA:/tmp/\x00.txt'
+        assert delivery._qq_file_directives(null_tag, agent._gateway_session_key) == null_tag
+
+        key = agent._gateway_session_key
+        spaced = Path(tmp, '测试 report.csv')
+        spaced.write_text('a,b\n1,2\n')
+        for link in (f'[file](<{spaced}>)', f'[file]({spaced.as_uri()})',
+                     f'Created :codex-file-citation{{path="{spaced}" purpose="output"}}'):
+            linked = delivery._qq_file_directives(link, key)
+            sent = RecordingQQ()
+            await deliver(linked, sent)
+            assert sent.uploaded == [spaced.read_bytes()]
+        dedup = delivery._qq_file_directives(final + '\n' + final +
+            f' :codex-file-citation{{path="{output}" purpose="output"}}', key)
+        assert dedup.count('MEDIA:') == 1
+        assert delivery._qq_file_directives(dedup, key) == dedup
+        for text in (f'`{final}`', f'```md\n{final}\n```', f'> {final}',
+                     f'[source]({output}:12)', f'[source]({output}#L1)',
+                     f'[missing]({tmp}/missing.pdf)', '[secret](/etc/passwd)',
+                     '[remote](https://example.invalid/report.pdf)',
+                     '[bad](http://[)', str(output),
+                     f':codex-file-citation{{path="{output}" purpose="source"}}',
+                     ':codex-file-citation{path="unclosed purpose="output"}',
+                     f'`:codex-file-citation{{path="{output}" purpose="output"}}`'):
+            assert delivery._qq_file_directives(text, key) == text, text
+        secret_link = Path(tmp, 'secret.txt')
+        secret_link.symlink_to('/etc/passwd')
+        text = f'[secret]({secret_link})'
+        assert delivery._qq_file_directives(text, key) == text
+        # The runtime/streamed text is untouched; only QQ's final extraction
+        # accepts output references. Base extraction used by history is intact.
+        from gateway.platforms.base import BasePlatformAdapter
+        assert BasePlatformAdapter.extract_media(final)[0] == []
+        assert final == f'已做好：[采购清单]({output})'
+        print('codex_final_to_qq_attachment=PASS')
+        print('c2c_group_upload_bytes_and_file_info=PASS')
+        print('nonstreaming_c2c_group_attachment_exactly_once=PASS')
+        print('spaces_unicode_dedup_safe_paths_and_turn_scope=PASS')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

@@ -711,3 +711,78 @@ When the buffered group history exceeds the message or character threshold, the
 plugin sends a compact extractive block: a count and small sample of earlier
 messages plus the latest messages that fit in the budget. It does not call an
 LLM for compression.
+
+## Ablation simplification (1.8.22)
+
+Four independently checked deletions remove a redundant cancellation rethrow,
+an unreachable duplicate final-completion branch, and two repeated lane-registry
+cleanup scans. No protocol behavior changes: claim-owned tasks remain shielded,
+completed delivery remains replayable, and active stream ownership still blocks
+LRU eviction. Unmark/remove each scan the lane registry once instead of twice.
+
+This remains a mounted plugin workaround for Hermes' missing native QQ C2C
+lifecycle. Enable/install and rollback as described above; to verify the
+simplification run `test_streaming.py`, `test_final_delivery.py`, and
+`test_steer.py` in an isolated Hermes environment. A negative ablation removing
+`asyncio.shield` fails the cancelled-holder delivery check and is **not** retained.
+See `docs/ablation-2026-09-05.md` for the baseline, individual results and live
+file-delivery acceptance. Existing profile data and credentials are unchanged.
+
+## Codex output attachments (1.8.22)
+
+Codex may deliver a local Markdown download link or a
+`:codex-file-citation{path="..." purpose="output"}` instead of a `MEDIA:`
+directive. Hermes' streamed-final dispatcher intentionally extracts explicit
+media directives only, leaving these output references visible but not uploaded.
+
+The QQ adapter's final `extract_media` boundary now converts these references to
+the existing Hermes attachment format. It uses Hermes path validation, resolves
+file names, removes the original target from the returned display text (avoiding
+non-streaming bare-path double uploads), and avoids adding directives for already-listed files.
+It reuses QQ's existing upload and `file_info` / `msg_type=7` sending code, per
+[QQ's official rich-media contract](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/rich-media.html).
+No upload client, hosting service, dependency, or model prompt is added.
+
+Only explicit output citations and absolute/home-relative inline Markdown links
+(including angle-bracket paths with spaces and local file URIs) are newly
+recognized. Source citations, line references, examples in code/quotes, remote
+URLs, malformed links and unsafe/missing paths are not promoted. Existing Hermes
+handling of ordinary paths and explicit media directives is unchanged. The new
+parser runs in QQ final delivery, including background/queued responses; it does
+not scan historical tool results or alter Codex runtime/streamed text. An already
+streamed citation can remain visible as text, followed by the real attachment.
+
+Install into an idle, selected canary Gateway:
+
+```bash
+scripts/install-plugins.sh "$HOME/.hermes/profiles/procurement" qqbot-connect-hotfix
+hermes -p procurement gateway restart
+```
+
+Verify with isolated `HERMES_HOME`, the Hermes Python environment and Hermes
+source on `PYTHONPATH`:
+
+```bash
+python plugins/qqbot-connect-hotfix/test_file_delivery.py
+python plugins/qqbot-connect-hotfix/test_streaming.py
+python plugins/qqbot-connect-hotfix/test_final_delivery.py
+python plugins/qqbot-connect-hotfix/test_steer.py
+```
+
+File tests drive real Gateway streamed/ordinary dispatch and QQ upload code,
+replacing only HTTP; private and group sends must upload matching bytes exactly
+once. For live acceptance, start a fresh QQ conversation and ask naturally to
+create a CSV and send it. Do not mention media directives or upload APIs. Require
+a downloadable file card and compare downloaded bytes to the generated file.
+See `docs/ablation-2026-09-05.md` for recorded results and limits.
+
+Rollback using the exact backup printed by the installer:
+
+```bash
+scripts/install-plugins.sh --restore "$HOME/.hermes/profiles/procurement" qqbot-connect-hotfix <backup-directory>
+hermes -p procurement gateway restart
+```
+
+Configuration, credentials, other plugins and generated files are preserved.
+Remove this bridge once upstream QQ extraction recognizes these output formats
+consistently in streamed and ordinary delivery.

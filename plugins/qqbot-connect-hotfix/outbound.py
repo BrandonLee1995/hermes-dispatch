@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
+import shlex
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 import uuid
 from typing import Any, Awaitable, Callable, Dict
 
@@ -255,3 +259,73 @@ def patch_media_caption_retry(QQAdapter):
     _send_media._qqbot_media_caption_retry_wrapped = True
     QQAdapter._send_media = _send_media
     logger.info("qqbot-connect-hotfix: patched QQAdapter media send with caption retry")
+
+
+def _qq_file_directives(text: str, session_key: str = "") -> str:
+    """Bridge explicit final-answer file links to Hermes' attachment contract."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    visible = BasePlatformAdapter._mask_protected_spans(text)
+    existing, _ = BasePlatformAdapter.extract_media(text)
+    seen = {
+        safe for path, _voice in existing
+        if (safe := BasePlatformAdapter.validate_media_delivery_path(path, session_key=session_key))
+    }
+    tags = []
+    links = []
+    # ponytail: explicit output citations and inline download links only;
+    # bare paths may be inspected source, not delivery intent.
+    candidates = [
+        (m.start(), m.end(), m.group(2).strip("<>"))
+        for m in re.finditer(r"!?\[([^\]\n]*)\]\((<[^>\n]+>|[^\s()]+)\)", visible)
+    ]
+    for match in re.finditer(r":codex-file-citation\{([^{}\n]*)\}", visible):
+        if any(start <= match.start() < end for start, end, _target in candidates):
+            continue  # Do not replace nested citations a second time.
+        try:
+            attrs = dict(token.split("=", 1) for token in shlex.split(match.group(1)))
+        except ValueError:
+            continue
+        if attrs.get("purpose") == "output" and attrs.get("path"):
+            path = attrs["path"]
+            candidates.append((match.start(), match.end(), quote(path, safe="/~")))
+    for start, end, target in sorted(candidates):
+        try:
+            parsed = urlsplit(target)
+        except ValueError:
+            continue
+        if parsed.scheme not in {"", "file"} or parsed.netloc or parsed.query or parsed.fragment:
+            continue
+        path = unquote(parsed.path)
+        if not path.startswith(("/", "~/")) or re.search(r":\d+(?::\d+)?$", path):
+            continue  # Source citations are not attachments.
+        safe = BasePlatformAdapter.validate_media_delivery_path(path, session_key=session_key)
+        if not safe or any(c in safe for c in '\n\r"'):
+            continue
+        tag = f'MEDIA:"{safe}"'
+        extracted, _ = BasePlatformAdapter.extract_media(tag)
+        if not extracted:
+            continue
+        # Remove the local target too: non-streaming Hermes also scans bare
+        # paths and would otherwise send the same file a second time.
+        links.append((start, end, Path(safe).name))
+        if safe not in seen:
+            seen.add(safe)
+            tags.append(tag)
+    for start, end, label in reversed(links):
+        text = text[:start] + label + text[end:]
+    return text + "\n" + "\n".join(tags) if tags else text
+
+
+def patch_output_file_delivery(QQAdapter):
+    """Expand QQ final-delivery syntax without changing streamed text."""
+    original = QQAdapter.extract_media
+    if getattr(original, "_qqbot_output_files_wrapped", False):
+        return
+
+    @functools.wraps(original)
+    def extract_media(content):
+        return original(_qq_file_directives(content))
+
+    extract_media._qqbot_output_files_wrapped = True
+    QQAdapter.extract_media = staticmethod(extract_media)
