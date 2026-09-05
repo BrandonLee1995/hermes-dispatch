@@ -872,3 +872,12 @@ new references, example-only and mixed replies, C2C/group, streamed/ordinary
 delivery, safe path validation and exactly-once success/failure behavior.
 Use the same backup-based rollback command above; reverting to 1.8.23 also
 restores the known compatibility defects.
+
+The final 1.8.24 review gate passed 13 isolated regression scripts against
+each official release above and development commit `1bbb6e5bc` (39 runs).
+Two independent review axes found no remaining P0/P1 after their initial
+counterexamples were fixed. The procurement-only live canary then downloaded
+one byte-matching CSV in each of a private chat and a real group; follow-up
+replies containing the actual files' links solely in code/quote examples sent
+no files. Replaying those same finals through the old bridge would extract
+one attachment each. See the ablation document for hashes, scope and limits.
