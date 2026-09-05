@@ -772,7 +772,8 @@ python plugins/qqbot-connect-hotfix/test_steer.py
 File tests drive real Gateway streamed/ordinary dispatch and QQ upload code,
 replacing only HTTP; private and group sends must upload matching bytes exactly
 once. For live acceptance, start a fresh QQ conversation and ask naturally to
-create a CSV and send it. Do not mention media directives or upload APIs. Require
+create a CSV. Omit delivery requests such as "send me", media directives, and
+upload APIs. Require
 a downloadable file card and compare downloaded bytes to the generated file.
 See `docs/ablation-2026-09-05.md` for recorded results and limits.
 
@@ -784,6 +785,14 @@ bridge remains the default here and adds no persistent prompt guidance. Hermes
 skill discovery and pre_llm_call context did not reach the Codex app-server in
 the diagnostic controls; merely registering them is not evidence of model
 exposure. The report records the actual loading boundary and restored state.
+
+The extended paired comparison used six report/PDF, presentation and code requests
+without delivery wording. Both native mechanisms triggered in 7/7 actual runs;
+each delivered 5/6 first attempts and covered 6/6 scenarios after one runtime
+silence interruption was retried. All 14 target/example attachments matched their
+QQ downloads. This did not establish a reliability winner or add persistent
+guidance. See the ablation report for exact prompts, separate interruption
+counts, artifact-validation limits, and restored environment.
 
 Rollback using the exact backup printed by the installer:
 
