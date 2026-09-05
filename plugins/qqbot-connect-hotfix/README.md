@@ -909,3 +909,11 @@ and backtick fences, closed-fence controls, and streamed/ordinary C2C/group
 delivery. It requires one byte-matching real attachment and zero example
 uploads. Existing native MEDIA and audio markers are also checked. Rollback
 uses the same installer backup command above; 1.8.24 restores this known P2.
+
+The 1.8.25 submission gate passed the 39-run official/development source matrix
+and two independent reviews with no remaining P0/P1/P2 findings. A fixed-reply
+canary covered both trailing quotes and unclosed tilde fences in real procurement
+private/group chats: four real files were downloaded with matching bytes, zero
+example files uploaded. The exact four model replies each reproduce zero
+attachments through 1.8.24 and one through the fix. This is targeted delivery
+acceptance, not a claim about natural generation or unlimited input coverage.
