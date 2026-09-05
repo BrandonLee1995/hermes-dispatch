@@ -111,7 +111,7 @@ def _manage_locked(profile, home, hooks_path, state_path, remove, python):
         interpreter = Path(python).expanduser().resolve()
         if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
             raise ValueError("--python must name an existing executable path")
-        command = shlex.join([str(interpreter), str(script),
+        command = shlex.join([str(interpreter), str(script), "--source-sha256", digest,
                               "--hermes-home", str(profile), "--codex-home", str(home)])
         entry = {"hooks": [{"type": "command", "command": command, "timeout": 5,
                              "statusMessage": f"QQ file delivery ({digest[:12]})"}]}

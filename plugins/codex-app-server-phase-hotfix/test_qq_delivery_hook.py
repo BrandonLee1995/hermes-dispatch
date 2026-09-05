@@ -1,5 +1,6 @@
 """QQ origin -> real Codex subprocess environment -> native hook entrypoint."""
 import concurrent.futures
+import hashlib
 import importlib.util
 import io
 import json
@@ -82,13 +83,16 @@ def main():
         event = {"hook_event_name": "UserPromptSubmit", "session_id": "codex-session",
                  "turn_id": "codex-turn", "cwd": "/same/project", "prompt": "A short report would help."}
 
-        def invoke(origin, target_profile=profile, target_home=home, body=event):
+        digest = hashlib.sha256(Path(hook.__file__).read_bytes()).hexdigest()
+
+        def invoke(origin, target_profile=profile, target_home=home, body=event, source_hash=digest, ok=True):
             env = {**os.environ, hook.PROFILE_ENV: origin.get(hook.PROFILE_ENV, ""),
                    hook.CODEX_HOME_ENV: origin.get(hook.CODEX_HOME_ENV, "")}
             result = subprocess.run([sys.executable, str(Path(hook.__file__)),
+                                     "--source-sha256", source_hash,
                                      "--hermes-home", str(target_profile), "--codex-home", str(target_home)],
                                     input=json.dumps(body), text=True, capture_output=True, env=env, timeout=5)
-            assert result.returncode == 0, result.stderr
+            assert (result.returncode == 0) == ok, result.stderr
             return result.stdout
 
         origin = {hook.PROFILE_ENV: str(profile), hook.CODEX_HOME_ENV: str(home)}
@@ -97,6 +101,7 @@ def main():
         assert invoke(origin, target_profile=other_profile) == ""
         assert invoke(origin, target_home=other_home) == ""
         assert invoke(origin, body={**event, "hook_event_name": "SessionStart"}) == ""
+        assert invoke(origin, source_hash="0" * 64, ok=False) == ""
         records = (profile / "logs/qq-delivery-hook.jsonl").read_text().splitlines()
         assert len(records) == 1
         record = json.loads(records[0])

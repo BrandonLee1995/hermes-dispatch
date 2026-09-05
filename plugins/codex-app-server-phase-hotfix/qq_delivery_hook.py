@@ -75,16 +75,19 @@ def patch_qq_delivery_context():
     return "QQ DM/group origin scoped to each Codex subprocess"
 
 
-def run_hook(event, hermes_home: Path, codex_home: Path):
+def run_hook(event, hermes_home: Path, codex_home: Path, source_sha256: str):
     profile, home = str(hermes_home.resolve()), str(codex_home.resolve())
     if (event.get("hook_event_name") != "UserPromptSubmit"
             or os.environ.get(PROFILE_ENV) != profile
             or os.environ.get(CODEX_HOME_ENV) != home):
         return
+    if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != source_sha256:
+        raise ValueError("QQ delivery hook changed; reinstall and review its native hook definition")
     record = {
         "time": time.time(), "event": "UserPromptSubmit",
         "session_id": event.get("session_id"), "turn_id": event.get("turn_id"),
         "contract_sha256": hashlib.sha256(CONTRACT.encode()).hexdigest(),
+        "source_sha256": source_sha256,
     }
     try:
         log = hermes_home / "logs" / "qq-delivery-hook.jsonl"
@@ -101,11 +104,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hermes-home", type=Path, required=True)
     parser.add_argument("--codex-home", type=Path, required=True)
+    parser.add_argument("--source-sha256", required=True)
     args = parser.parse_args()
     event = json.load(sys.stdin)
     if not isinstance(event, dict):
         raise ValueError("hook input must be an object")
-    run_hook(event, args.hermes_home.expanduser(), args.codex_home.expanduser())
+    run_hook(event, args.hermes_home.expanduser(), args.codex_home.expanduser(), args.source_sha256)
 
 
 if __name__ == "__main__":
