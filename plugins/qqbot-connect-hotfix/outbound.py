@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import contextvars
+import inspect
 import logging
 import re
 import shlex
@@ -263,15 +264,66 @@ def patch_media_caption_retry(QQAdapter):
     logger.info("qqbot-connect-hotfix: patched QQAdapter media send with caption retry")
 
 
+def _validate_output_path(path: str, session_key: str = ""):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    validate = BasePlatformAdapter.validate_media_delivery_path
+    # Official 0.20.5 accepts only path; newer releases also translate paths
+    # using session_key. Do not catch TypeError from inside path validation.
+    if "session_key" in inspect.signature(validate).parameters:
+        return validate(path, session_key=session_key)
+    return validate(path)
+
+
+def _qq_example_spans(text: str):
+    # markdown-it-py already ships with Hermes' required Rich dependency.
+    # Its source maps cover nested/lazy quotes and all CommonMark code blocks.
+    from markdown_it import MarkdownIt
+
+    offsets = [0] + [m.end() for m in re.finditer(r"\r\n?|\n", text)] + [len(text)]
+    spans = [(offsets[t.map[0]], offsets[t.map[1]])
+             for t in MarkdownIt().parse(text)
+             if t.type in {"fence", "code_block", "blockquote_open", "html_block"} and t.map]
+    # Inline code delimiters must have equal backtick-run lengths; spans may
+    # cross newlines and contain shorter runs as literal text.
+    spans.extend(m.span() for m in re.finditer(
+        r"(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)", text))
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _preserve_leading_code(text: str):
+    from markdown_it import MarkdownIt
+
+    tokens = MarkdownIt().parse(text)
+    if not tokens or tokens[0].type != "code_block":
+        return text
+    token = tokens[0]
+    offsets = [0] + [m.end() for m in re.finditer(r"\r\n?|\n", text)] + [len(text)]
+    start, end = offsets[token.map[0]], offsets[token.map[1]]
+    # Ordinary Hermes strips the response before scanning bare paths. A
+    # fenced representation preserves this leading code block's semantics
+    # through that strip, without carrying state between extraction calls.
+    fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", token.content)), default=0))
+    return text[:start] + fence + "\n" + token.content + fence + "\n" + text[end:]
+
+
 def _qq_file_directives(text: str, session_key: str = "") -> str:
     """Bridge explicit final-answer file links to Hermes' attachment contract."""
     from gateway.platforms.base import BasePlatformAdapter
 
     visible = BasePlatformAdapter._mask_protected_spans(text)
+    for start, end in _qq_example_spans(text):
+        visible = visible[:start] + " " * (end - start) + visible[end:]
     existing, _ = BasePlatformAdapter.extract_media(text)
     seen = {
         safe for path, _voice in existing
-        if (safe := BasePlatformAdapter.validate_media_delivery_path(path, session_key=session_key))
+        if (safe := _validate_output_path(path, session_key))
     }
     tags = []
     links = []
@@ -301,7 +353,7 @@ def _qq_file_directives(text: str, session_key: str = "") -> str:
         path = unquote(parsed.path)
         if not path.startswith(("/", "~/")) or re.search(r":\d+(?::\d+)?$", path):
             continue  # Source citations are not attachments.
-        safe = BasePlatformAdapter.validate_media_delivery_path(path, session_key=session_key)
+        safe = _validate_output_path(path, session_key)
         if not safe or any(c in safe for c in '\n\r"'):
             continue
         tag = f'MEDIA:"{safe}"'
@@ -327,10 +379,36 @@ def patch_output_file_delivery(QQAdapter):
 
     @functools.wraps(original)
     def extract_media(content):
-        return original(_qq_file_directives(content))
+        return _extract_outside_examples(original, _qq_file_directives(_preserve_leading_code(content)))
 
     extract_media._qqbot_output_files_wrapped = True
     QQAdapter.extract_media = staticmethod(extract_media)
+
+    original_local = QQAdapter.extract_local_files
+
+    @functools.wraps(original_local)
+    def extract_local_files(content):
+        return _extract_outside_examples(original_local, content)
+
+    QQAdapter.extract_local_files = staticmethod(extract_local_files)
+
+
+def _extract_outside_examples(extract, content):
+    # Hide examples through both extraction stages: upstream MEDIA cleanup
+    # strips leading whitespace, which otherwise turns indented code into a
+    # bare path before ordinary delivery's second scan. Restore display text.
+    protected = {}
+    for start, end in reversed(_qq_example_spans(content)):
+        example = content[start:end]
+        if re.fullmatch(r"`+MEDIA:[^\r\n]+`+", example):
+            continue  # Preserve Hermes' deliberate inline MEDIA contract.
+        marker = uuid.uuid4().hex
+        protected[marker] = example
+        content = content[:start] + marker + content[end:]
+    paths, cleaned = extract(content)
+    for marker, example in protected.items():
+        cleaned = cleaned.replace(marker, example)
+    return paths, cleaned
 
 
 def patch_post_stream_media_failures(QQAdapter):

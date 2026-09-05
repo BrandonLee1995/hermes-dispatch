@@ -5,6 +5,7 @@ import importlib.util
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -67,6 +68,30 @@ async def main():
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp, '采购清单.txt')
         output.write_text('名称,数量\n测试物料,3\n')
+        from gateway.platforms.base import BasePlatformAdapter
+        def old_validate(path):
+            return path
+        def new_validate(path, session_key=""):
+            assert session_key == 'test-session'
+            return path
+        for validator in (old_validate, new_validate):
+            with patch.object(BasePlatformAdapter, 'validate_media_delivery_path', staticmethod(validator)):
+                assert delivery._validate_output_path(str(output), 'test-session') == str(output)
+        def broken_validate(path, session_key=""):
+            raise TypeError('internal validator failure')
+        with patch.object(BasePlatformAdapter, 'validate_media_delivery_path', staticmethod(broken_validate)):
+            try:
+                delivery._validate_output_path(str(output))
+                assert False, 'internal validation errors must not bypass safety checks'
+            except TypeError as exc:
+                assert str(exc) == 'internal validator failure'
+        # Existing explicit attachments must work on official 0.20.5 too.
+        explicit = RecordingQQ()
+        await deliver(f'MEDIA:"{output}"', explicit)
+        assert explicit.uploaded == [output.read_bytes()], 'existing MEDIA attachment regressed'
+        inline_media = RecordingQQ()
+        await deliver(f'`MEDIA:{output}`', inline_media)
+        assert inline_media.uploaded == [output.read_bytes()]
         final = f'已做好：[采购清单]({output})'
         agent = SimpleNamespace(_gateway_session_key='agent:main:qqbot:dm:test-chat')
         result = {'final_response': final}
@@ -141,6 +166,62 @@ async def main():
         from gateway.platforms.base import BasePlatformAdapter
         assert BasePlatformAdapter.extract_media(final)[0] == []
         assert final == f'已做好：[采购清单]({output})'
+
+        # Use ASCII paths too: upstream ordinary delivery scans bare paths.
+        sample = Path(tmp, 'example.txt')
+        sample.write_text('example only')
+        for reference in (f'[sample]({sample})',
+                          f':codex-file-citation{{path="{sample}" purpose="output"}}'):
+            examples = [
+                f'~~~md\n{reference}\n~~~', f'    {reference}', f'\t{reference}',
+                f'  > {reference}', f'> example\n{reference}',
+                f'````md\n```\n{reference}\n```\n````',
+                f'~~~md\n{reference}', f'- example\n\n      {reference}',
+                f'`` text ` {reference} ` text ``',
+                f'`line one\n{reference}\nline three`',
+                f'\r\n    {reference}\r\n',
+            ]
+            for example in examples:
+                assert delivery._qq_file_directives(example) == example, example
+                for chat_type in ('c2c', 'group'):
+                    protected = RecordingQQ(chat_type)
+                    assert protected.extract_local_files(example) == ([], example)
+                    await deliver(example, protected)
+                    assert protected.uploaded == [], example
+                    async def example_response(_event):
+                        return example
+                    protected.set_message_handler(example_response)
+                    await protected._process_message_background(event, agent._gateway_session_key)
+                    assert protected.uploaded == [], example
+                    bodies = [b['content'] for p, b in protected.calls if p.endswith('/messages')]
+                    assert len(bodies) == 1  # QQ applies its normal text formatting.
+
+        # An example and a real output in one answer must not hide the output
+        # or erase the example while ordinary delivery scans remaining paths.
+        mixed = f'~~~\n[sample]({sample})\n~~~\n\n{final}'
+        for chat_type in ('c2c', 'group'):
+            sent = RecordingQQ(chat_type)
+            async def mixed_response(_event):
+                return mixed
+            sent.set_message_handler(mixed_response)
+            await sent._process_message_background(event, agent._gateway_session_key)
+            assert sent.uploaded == [output.read_bytes()]
+            bodies = [b['content'] for p, b in sent.calls if p.endswith('/messages') and b['msg_type'] == 0]
+            assert 'sample' in bodies[0]
+
+        from markdown_it import MarkdownIt
+        code = f'    ```\n    {sample}\n    ```\n'
+        before = MarkdownIt().parse(code)[0]
+        after = MarkdownIt().parse(delivery._preserve_leading_code(code))[0]
+        assert before.type == 'code_block' and after.type == 'fence'
+        assert before.content == after.content, 'code content changed during fencing'
+        # Ordinary bare paths outside examples keep their existing behavior.
+        bare = RecordingQQ()
+        async def bare_response(_event):
+            return str(sample)
+        bare.set_message_handler(bare_response)
+        await bare._process_message_background(event, agent._gateway_session_key)
+        assert bare.uploaded == [sample.read_bytes()]
 
         class FailingQQ(RecordingQQ):
             async def _api_request(self, method, path, body=None, **kwargs):

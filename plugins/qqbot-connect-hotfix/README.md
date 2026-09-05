@@ -746,8 +746,8 @@ No upload client, hosting service, dependency, or model prompt is added.
 Only explicit output citations and absolute/home-relative inline Markdown links
 (including angle-bracket paths with spaces and local file URIs) are newly
 recognized. Source citations, line references, examples in code/quotes, remote
-URLs, malformed links and unsafe/missing paths are not promoted. Existing Hermes
-handling of ordinary paths and explicit media directives is unchanged. The new
+URLs, malformed links and unsafe/missing paths are not promoted. Ordinary paths
+and explicit media directives outside examples retain Hermes' delivery behavior. The new
 parser runs in QQ final delivery, including background/queued responses; it does
 not scan historical tool results or alter Codex runtime/streamed text. An already
 streamed citation can remain visible as text, followed by the real attachment.
@@ -834,3 +834,39 @@ hermes -p procurement gateway restart
 Configuration, credentials, other plugins and generated files are preserved.
 Remove this bridge once upstream QQ extraction recognizes these output formats
 consistently in streamed and ordinary delivery.
+
+### Compatibility corrections (1.8.24)
+
+Version 1.8.24 supports the official Hermes 0.20.5 release
+[`v2026.8.19`, `fcbd1076a`](https://github.com/NousResearch/hermes-agent/tree/fcbd1076a93841fa88855acce810e342a5b78101)
+and 0.21.0 release
+[`v2026.8.31`, `29112bef`](https://github.com/NousResearch/hermes-agent/tree/29112bef099274229cadff79cdff7bf7b99c4b77).
+The path validator's signature is inspected: older Hermes receives only
+`path`, while newer Hermes also receives `session_key`. Validation is never
+skipped, and a TypeError inside the validator is not treated as an API fallback.
+The original 1.8.22/1.8.23 bridge regressed both explicit MEDIA and output
+references on official 0.20.5; use 1.8.24 for that release.
+
+Earlier live acceptance used development commit `1bbb6e5bc`, whose version
+field reported 0.20.5 but whose validator already supported `session_key`.
+That result is not proof of compatibility with the official 0.20.5 tag.
+
+QQ scans now use CommonMark block source maps from `markdown-it-py`, already
+included by Hermes' required Rich package, and equal-length inline backtick
+delimiters. Fences (including tildes, longer and unclosed fences), indented
+code, nested/lazy blockquotes and inline examples are protected during both
+MEDIA extraction and ordinary bare-path scanning. Leading indented code is
+represented as an equivalent fenced block so Hermes' intervening `.strip()`
+cannot turn its contents into attachment candidates. Example content remains
+text; QQ's normal display formatting still applies. Explicit inline MEDIA
+remains supported. No new dependency installation or global Base adapter patch
+is introduced.
+
+Enable by installing this QQ plugin version and restarting the selected profile;
+the Codex hook script, registration and trust do not change. Run
+`test_file_delivery.py` against each official source checkout using the isolated
+environment described above. Its public Gateway/QQ tests cover existing MEDIA,
+new references, example-only and mixed replies, C2C/group, streamed/ordinary
+delivery, safe path validation and exactly-once success/failure behavior.
+Use the same backup-based rollback command above; reverting to 1.8.23 also
+restores the known compatibility defects.
