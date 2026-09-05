@@ -68,8 +68,8 @@ def patch_qq_delivery_context():
     from agent import codex_runtime
     from agent.transports.codex_app_server import CodexAppServerClient
 
-    if not getattr(codex_runtime.run_codex_turn, _MARKER, False):
-        codex_runtime.run_codex_turn = wrap_runtime_turn(codex_runtime.run_codex_turn)
+    if not getattr(codex_runtime.run_codex_app_server_turn, _MARKER, False):
+        codex_runtime.run_codex_app_server_turn = wrap_runtime_turn(codex_runtime.run_codex_app_server_turn)
     if not getattr(CodexAppServerClient.__init__, _MARKER, False):
         CodexAppServerClient.__init__ = wrap_client_init(CodexAppServerClient.__init__)
     return "QQ DM/group origin scoped to each Codex subprocess"

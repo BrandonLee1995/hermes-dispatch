@@ -21,6 +21,17 @@ spec.loader.exec_module(hook)
 
 
 def main():
+    from agent import codex_runtime
+    old_runtime, old_client_init = codex_runtime.run_codex_app_server_turn, CodexAppServerClient.__init__
+    try:
+        hook.patch_qq_delivery_context()
+        patched_runtime, patched_init = codex_runtime.run_codex_app_server_turn, CodexAppServerClient.__init__
+        assert patched_runtime is not old_runtime and patched_init is not old_client_init
+        hook.patch_qq_delivery_context()
+        assert codex_runtime.run_codex_app_server_turn is patched_runtime
+        assert CodexAppServerClient.__init__ is patched_init
+    finally:
+        codex_runtime.run_codex_app_server_turn, CodexAppServerClient.__init__ = old_runtime, old_client_init
     with tempfile.TemporaryDirectory() as tmp:
         tmp = str(Path(tmp).resolve())
         profile, home = Path(tmp, "profile"), Path(tmp, "codex-home")
