@@ -184,8 +184,29 @@ The multi-profile QQ observations on 2026-10-07 are not independent accuracy
 estimates: all bots received full-group messages, and a denied-search reply
 explicitly reused another bot's group answer. Scope discovery itself was
 observed against each profile's real endpoint (one owned + seven shared KBs).
-Private isolation acceptance is pending: both test bots' private messages were
-rejected by QQ before Hermes received them. A connected tool list also does not
+Private isolation was initially blocked by QQ single-chat permissions; the
+operator enabled them and the follow-up test below supersedes that status. A connected tool list also does not
 prove execution permission: finance search was declined by Hermes' unhandled
 non-hermes-tools MCP elicitation path. Do not relax approval policy to make the
 experiment pass. Temporary group-history settings were restored.
+
+
+## Private isolation follow-up (2026-10-07)
+
+Two profiles/models each completed seven real QQ DM turns with colloquial
+requests. Native session resets created new private-project execution threads;
+all fourteen inputs lacked group context and the earlier precise test markers.
+Domestic-business/gpt-5.6-luna retrieved successfully on all three business
+turns; finance/gpt-6.1-sol attempted all three searches but all were declined by
+the existing MCP approval path. Each profile made no MCP call on translation,
+explicit no-KB and rewrite turns. All fourteen final replies were visible in QQ.
+
+Both independently enumerated one owned and seven shared KBs before search,
+used only that confirmed range, and later described all eight in response to
+“你能查哪些库？”. Department names with a common suffix omitted in prose are not
+missing libraries. Shared KBs participated in actual searches. Search requests
+remained bounded at two per turn and five matches each. This validates the
+observed placement/range behavior, not universal accuracy or every answer's
+factual correctness. Finance retrieval execution is still not accepted; no
+approval bypass or policy change was used. Temporary group-context settings
+were already restored before these private trials.
