@@ -82,7 +82,11 @@ def register(ctx):
                 and not message.lstrip().startswith('/')):
             return None
         home = Path(_agent_home(agent) or get_hermes_home()).resolve()
-        if home != Path(get_hermes_home()).resolve() or not configured():
+        if home != Path(get_hermes_home()).resolve():
+            log.info('WeKnora routing skipped: profile scope mismatch')
+            return None
+        if not configured():
+            log.info('WeKnora routing skipped: no enabled profile connection')
             return None
         path = getattr(agent, '_weknora_capabilities_path', None)
         if path is None:
@@ -166,6 +170,8 @@ def register(ctx):
                         tools = codex_tools(configured(), config.get('mcp_servers') or {}, status, os.environ)
                         scope['last_tools'] = tools
                         text = render(tools)
+                        log.info('WeKnora routing capability mode=%s tools=%d context=%s',
+                                 scope['mode'], len(tools), bool(text))
                         new_text = parts[0]['text']
                         if text and scope['mode'] in {'hermes', 'both'}:
                             new_text += '\n\n' + text

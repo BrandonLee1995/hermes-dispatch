@@ -97,3 +97,26 @@ same retrieval/reading allowlist. The plugin never silently changes production
 approval policy; a production profile that rejects MCP calls must resolve that
 permission boundary before retrieval can be accepted. No knowledge-base writes,
 real QQ sends, credential copies or live profile/config edits were performed.
+
+## QQ live retest instrumentation
+
+Version 1.0.1 logs only mode, available-tool count, whether routing context was
+prepared, and skipped/unavailable reasons. It logs no prompt, sender/chat ID,
+endpoint or credential. Combine these markers with actual MCP-call events and
+visible QQ final replies; a prepared context is not a retrieval decision.
+Enable mode `hermes` in the target profile after ensuring that profile has its
+own authorized WeKnora connection. Missing connections remain a normal-flow
+negative test and cannot establish positive retrieval acceptance.
+
+Live acceptance on 2026-10-07 used local QQ group mentions of the domestic-business
+bot, backed by its existing remote `guonei` profile and gpt-5.6-luna. One continuing
+conversation covered nine turns: four internal-material requests retrieved
+successfully; five greetings/translation/no-KB/calculation/rewrite requests made
+no MCP call. All nine Hermes contexts and final QQ replies were observed. Nine
+read-only MCP calls (five searches) completed without errors; no turn exceeded
+two searches. A requested file that was not found was reported as not found.
+The existing MCP/model/approval settings were preserved; mode remains `hermes`.
+Private chats were excluded at the user's request. This is one profile/model,
+not fleet-wide or answer-accuracy acceptance. A "do not introduce retrieval"
+request still received a retrieval progress message, an output-style limitation
+separate from the routing result.
