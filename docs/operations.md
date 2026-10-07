@@ -652,3 +652,26 @@ launcher unchanged. Its separate original-file backup is printed under the
 native Hermes root's `plugin-backups/qq-cron-launcher-*`; restore that file when
 rolling back this host prerequisite, in addition to any profile snapshots.
 Windows uses its native launcher and the QQ plugin's venv-overlay integration.
+
+## WeKnora-first QQ routing
+
+`plugins/weknora-qq-routing` provides independent Hermes and native Codex
+routing placements with one shared semantic policy. It checks the current
+profile's enabled endpoint, matching credential/transport identity and actual
+retrieval tool surface after QQ authorization. Ordinary/no-KB requests and
+unavailable tools retain normal behavior. It does not alter delivery routing,
+slash input, permissions, knowledge-base data or Hermes source.
+
+The 2026-10-07 pilot ran 72 real-model cases: baseline positive retrieval 3/9;
+Hermes, Codex and both 9/9 each, with no negative false positives or turn failures.
+Observed stability tied. When explicitly enabled, default to Hermes to avoid
+additional native-Hook/version/trust dependencies; Codex remains optional.
+Native UserPromptSubmit produces developer context, whereas Hermes's Codex
+compatibility adapter adds an ephemeral user-input context at turn/start.
+No production profile was enabled by the experimental runner.
+
+See the plugin README and `artifacts/weknora-routing-20261007/report.md` for
+source contracts, same-profile/Prompt/PID guards, native scoped Hook trust,
+experiment limitations and rollback. Never equate tool listing with successful
+inference/retrieval: initial never-policy trials were blocked by MCP review and
+excluded; final on-request trials preserved review and only exposed read tools.

@@ -1,0 +1,8 @@
+[
+  {"id":"kb_materials","expected_search":true,"prompt":"我们公司的付款审批要准备哪些材料？请给出办理步骤。"},
+  {"id":"kb_brief","expected_search":true,"prompt":"关于公司的包装验收标准，直接给我三条能执行的结论，不要介绍检索过程。"},
+  {"id":"kb_no_web","expected_search":true,"prompt":"根据部门的操作规范，客户退货应该怎么处理？不需要查询外部网页。"},
+  {"id":"greeting","expected_search":false,"prompt":"你好！请用一句话问候我。"},
+  {"id":"translate","expected_search":false,"prompt":"仅根据我提供的文字翻译成英文，不要补充信息：请在周五前完成付款审批。"},
+  {"id":"no_kb","expected_search":false,"prompt":"不要查询知识库，只依据通用知识，简述如何写一封礼貌的询价邮件。"}
+]
