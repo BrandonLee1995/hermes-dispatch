@@ -120,3 +120,72 @@ Private chats were excluded at the user's request. This is one profile/model,
 not fleet-wide or answer-accuracy acceptance. A "do not introduce retrieval"
 request still received a retrieval progress message, an output-style limitation
 separate from the routing result.
+
+If this profile already has a working WeKnora connector in its own Codex config
+but no Hermes MCP declaration, declare the same endpoint and existing bearer
+variable as an HTTP MCP server in this profile's Hermes config before enabling
+the Hook. Keep credentials as environment references, preserve the existing
+Codex tool/approval policy, and never take a connector from another profile.
+This supplies the explicit endpoint identity the capability guard checks;
+removing only this added server declaration and plugin entry is the rollback.
+
+For short-prompt acceptance, `/new` alone does not remove durable group snapshots
+from the next input. To exclude earlier precise test prompts, temporarily set
+`MESSAGE_SNAPSHOT_CONTEXT_MESSAGES`, `QQBOT_GROUP_CONTEXT_MESSAGES` and
+`QQBOT_GROUP_CONTEXT_BUFFER_MESSAGES` to `1`, retain the normal per-bot
+conversation history, and verify the actual native input contains no earlier
+precise test markers. Restore these environment settings after the test; do not
+delete archived snapshots. These limits exclude earlier precise prompts but do
+not isolate other bots: shared-group results are transport/function observations,
+not independent routing-accuracy estimates. For independent acceptance use
+private QQ sessions, a native session reset, a new execution thread and an
+input audit proving no group snapshots or other-bot context. Exclude warm-up/configuration failures from routing
+accuracy counts, but report them separately. Do not tune routing policy against
+the tested cases.
+
+## Accessible KB scope (1.0.2)
+
+A connected search tool is not a complete knowledge-base inventory. Legacy
+WeKnora connectors expose separate owned and shared KB lists; querying only
+the owned list misses readable shared departmental material. Version 1.0.2
+uses the common policy in both Hermes and Codex placements to require both
+available list tools on the selected connection before choosing a KB. Merge by
+KB ID, retain origin/read permissions, respect endpoint restrictions and choose
+by question and bot department rather than preferring the endpoint owner's KB.
+One-sided old results or a failed shared-list call do not establish complete
+scope. Other bots' group messages cannot establish this profile's permissions.
+
+A connector with only a unified list must establish that its endpoint contract
+or returned metadata covers shared KBs; otherwise disclose incomplete scope,
+not "no shared KBs". Tools from different connections cannot form a paired
+inventory. A successfully confirmed scope may be reused within that conversation;
+profile/connection/permission changes require a fresh inventory. Greetings,
+translation, rewrite and explicit no-KB requests do not enumerate libraries.
+Scope discovery is internal context, not a requirement to print a full KB table
+in every answer. It neither searches every KB nor enables writes or new access.
+This remains model guidance, not a guarantee that the model follows every rule.
+
+Update the plugin through the installer and restart an idle target Gateway.
+Existing endpoint credentials and approval policy are unchanged. Verify actual
+owned + shared list calls on a fresh colloquial business request, a relevant KB
+choice, a successful search and a visible QQ final reply. Verify no enumeration
+on a non-KB turn. Roll back with the installer backup and restart the profile.
+Native Codex Hook trust uses the changed source digest automatically.
+
+The official [WeKnora MCP documentation](https://github.com/Tencent/WeKnora/blob/main/website-docs/03-features/08-mcp.md)
+also describes independently scoped endpoints and tool lists; current native
+endpoints and legacy connectors may have different inventory surfaces. No API
+key or knowledge-base ID is hardcoded in this compatibility plugin.
+Pagination must be completed using the exposed tool's supported cursor/page
+parameters; a partial result or unsupported continuation cannot prove complete
+scope, even when the first owned/shared list calls both succeed.
+
+The multi-profile QQ observations on 2026-10-07 are not independent accuracy
+estimates: all bots received full-group messages, and a denied-search reply
+explicitly reused another bot's group answer. Scope discovery itself was
+observed against each profile's real endpoint (one owned + seven shared KBs).
+Private isolation acceptance is pending: both test bots' private messages were
+rejected by QQ before Hermes received them. A connected tool list also does not
+prove execution permission: finance search was declined by Hermes' unhandled
+non-hermes-tools MCP elicitation path. Do not relax approval policy to make the
+experiment pass. Temporary group-history settings were restored.

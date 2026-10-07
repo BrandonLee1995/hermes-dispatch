@@ -30,6 +30,18 @@ def main():
     tools = p.codex_tools(configured, effective, status, {})
     assert [x['tool'] for x in tools] == ['hybrid_search', 'list_knowledge_bases']
     assert 'CURRENT TURN ONLY' in p.render(tools)
+    assert '共享范围尚未确认' in p.render(tools)
+    scoped = tools + [{'server': 'weknora', 'tool': 'list_shared_knowledge_bases',
+                      'name': 'mcp__weknora__list_shared_knowledge_bases'}]
+    text = p.render(scoped)
+    assert '两类都成功才算范围已确认' in text and '按知识库ID合并去重' in text
+    assert '共享库同样参与选择' in text and '不做库范围枚举、检索或阅读' in text
+    assert '不把共享库查询失败当成共享库为空' in text
+    assert '未加载库范围枚举工具' in p.render([tools[0]])
+    separate = tools + [{'server': 'other', 'tool': 'list_shared_knowledge_bases', 'name': 'other_shared'},
+                        {'server': 'other', 'tool': 'hybrid_search', 'name': 'other_search'}]
+    assert '两类都成功才算范围已确认' not in p.render(separate)
+    assert '直属范围尚未确认' in p.render(separate)
     assert p.render([{'tool': 'list_knowledge_bases', 'name': 'kb'}]) == ''
     for value in [False, 'false', '0', None]:
         bad = {'weknora': {**configured['weknora'], 'enabled': value}}
@@ -128,7 +140,7 @@ def main():
     plugin.configured = real_configured
     turn_context.build_turn_context = original_build
     codex_runtime.run_codex_app_server_turn = original_codex
-    print('WeKnora: disabled/disconnected/no retrieval, endpoint isolation, stale/changed/prompt-bound Hook data, legacy contexts PASS')
+    print('WeKnora: paired/partial KB scopes, connection isolation, disabled/disconnected, prompt-bound Hooks, legacy contexts PASS')
 
 
 if __name__ == '__main__':
