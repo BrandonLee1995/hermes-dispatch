@@ -56,6 +56,20 @@ def make_fixture_repo(base: Path) -> Path:
 
 
 class UpdaterTests(unittest.TestCase):
+    def test_explicit_launchd_domain_reaches_separate_cli_process(self) -> None:
+        with patch.object(ops, "hermes_argv", return_value=["hermes"]), patch.object(ops, "run") as call:
+            ops.hermes_call("hermes", "default", "gateway", "start", launchd_domain="gui/501")
+            self.assertEqual(call.call_args.kwargs["env"]["HERMES_DISPATCH_LAUNCHD_DOMAIN"], "gui/501")
+
+    def test_newer_local_approval_fix_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);source=base/"source";home=base/"home"
+            write_plugin(source,"sample","1.8.8","release")
+            local=write_plugin(home,"sample","1.8.9","local approval repair")
+            kept=ops.newer_local_plugins(source,home,["sample"])
+            self.assertEqual(kept,{"sample":ops.tree_digest(local)})
+            (local/"plugin.yaml").write_text("name: sample\nversion: 1.8.8\n")
+            self.assertEqual(ops.newer_local_plugins(source,home,["sample"]),{})
     def test_python_cli_uses_hermes_interpreter_not_shebang(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cli = Path(tmp) / "hermes"
@@ -347,6 +361,40 @@ class UpdaterTests(unittest.TestCase):
             ), patch.object(ops, "hermes_call", side_effect=cli):
                 self.assertEqual(ops.perform_update(args)["status"], "updated")
             self.assertEqual((home / "plugins/sample/runtime.py").read_text(), "new")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS launchd only")
+    def test_background_update_and_rollback_use_same_captured_domain(self) -> None:
+        for fail in (False, True):
+            with self.subTest(rollback=fail), tempfile.TemporaryDirectory() as tmp:
+                base=Path(tmp);source=make_fixture_repo(base);home=base/"home"
+                home.mkdir();write_plugin(home,"sample","1","old")
+                installer=source/"scripts/install-macos-launchd-guard.py"
+                installer.parent.mkdir();installer.write_text("print('{}')\n")
+                subprocess.run(["git","-C",str(source),"add","."],check=True)
+                subprocess.run(["git","-C",str(source),"commit","-qm","guard fixture"],check=True)
+                state={"gateway_state":"running","pid":11,"platforms":{"qqbot":{"state":"connected"}}};seen=[]
+                def cli(_hermes,_profile,*args,**kw):
+                    if args == ("gateway","stop"):
+                        seen.append(("stop",kw.get("launchd_domain")));state["gateway_state"]="stopped"
+                    elif args == ("gateway","start"):
+                        seen.append(("start",kw.get("launchd_domain")));state.update(gateway_state="running",pid=22)
+                    return subprocess.CompletedProcess([],0,"","")
+                args=argparse.Namespace(profile="default",remote=str(source),ref="main",hermes_cli=sys.executable,git_cli=shutil_which_git(),health_timeout=.01,apply=True,retry_blocked=False)
+                domain=f"gui/{os.getuid()}"
+                with patch.object(ops,"profile_home",return_value=home),patch.object(ops,"native_hermes_root",return_value=home),patch.object(ops,"macos_domains",return_value=(domain,domain)),patch.object(ops,"hermes_version",return_value=(0,21,0)),patch.object(ops,"desired_state_drift",return_value=[]),patch.object(ops,"run_regressions"),patch.object(ops,"qqbot_enabled",return_value=True),patch.object(ops,"read_gateway_state",side_effect=lambda _:dict(state)),patch.object(ops,"process_alive",side_effect=lambda pid:state['gateway_state']=='running' and pid==state['pid']),patch.object(ops,"hermes_call",side_effect=cli),patch.object(ops,"wait_for_stopped"),patch.object(ops,"apply_managed_settings",side_effect=ops.UpdateError('forced rollback') if fail else None):
+                    if fail:
+                        with self.assertRaises(ops.UpdateError):ops.perform_update(args)
+                    else:self.assertEqual(ops.perform_update(args)['status'],'updated')
+                self.assertTrue(seen);self.assertTrue(all(d==domain for _,d in seen),seen)
+                self.assertEqual(seen[-1],('start',domain))
+                self.assertEqual((home/'plugins/sample/runtime.py').read_text(),'old' if fail else 'new')
+
+    def test_stop_waits_for_old_launchd_registration(self) -> None:
+        outputs=[subprocess.CompletedProcess([],0,'',''),subprocess.CompletedProcess([],1,'','')]
+        with patch.object(ops,'process_alive',return_value=False),patch.object(ops,'run',side_effect=outputs) as call,patch.object(ops.time,'sleep') as sleep:
+            ops.wait_for_stopped(Path('/Users/example/.hermes/profiles/sales'),{'pid':11},1,launchd_domain='gui/501')
+        self.assertEqual(call.call_args.args[0],['launchctl','print','gui/501/ai.hermes.gateway-sales'])
+        sleep.assert_called_once()
 
     def test_stop_waits_until_api_socket_can_rebind(self) -> None:
         previous = {"pid": 11, "platforms": {"api_server": {"state": "connected"}}}

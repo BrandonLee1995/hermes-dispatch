@@ -14,6 +14,7 @@ import argparse
 import datetime as dt
 import getpass
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -575,8 +576,38 @@ def restore_backup(home: Path, backup: Path, metadata: dict[str, Any]) -> None:
             target.unlink()
 
 
-def hermes_call(hermes: str, profile: str, *args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
-    return run(hermes_argv(hermes, profile, *args), timeout=timeout)
+def hermes_call(hermes: str, profile: str, *args: str, timeout: float = 120,
+                launchd_domain: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = None
+    if launchd_domain is not None:
+        env = {**os.environ, "HERMES_DISPATCH_LAUNCHD_DOMAIN": launchd_domain}
+    return run(hermes_argv(hermes, profile, *args), timeout=timeout, env=env)
+
+
+def macos_guard(home: Path):
+    path = Path(__file__).with_name("macos_launchd.py")
+    if not path.is_file():
+        path = installation_root(home) / "scripts/dispatch-macos-launchd.py"
+    if path.is_symlink() or not path.is_file() or path.stat().st_uid != os.getuid():
+        raise UpdateError("owner-owned macOS launchd guard is missing; install it before applying updates")
+    spec = importlib.util.spec_from_file_location("dispatch_macos_launchd", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def macos_domains(home: Path, profile: str) -> tuple[str | None, str | None]:
+    if sys.platform != "darwin" or installation_root(home).resolve() != native_hermes_root().resolve():
+        return None, None
+    guard = macos_guard(home)
+    label = "ai.hermes.gateway" + ("-" + profile if profile != "default" else "")
+    previous = guard.loaded_domain(label)
+    if previous is None:
+        raise UpdateError("running macOS Gateway has no unique launchd registration; refusing detached update")
+    target = f"gui/{os.getuid()}" if guard.keyring_enabled(home) else previous
+    guard.require_domain(target)
+    guard.remember_domain(installation_root(home), label, target)
+    return previous, target
 
 
 def expected_config_text(value: Any) -> str:
@@ -651,7 +682,8 @@ print(json.dumps([e.get('host',os.getenv('API_SERVER_HOST','127.0.0.1')),int(e.g
     return str(address[0]), int(address[1])
 
 
-def wait_for_stopped(home: Path, previous: dict[str, Any], timeout: float) -> None:
+def wait_for_stopped(home: Path, previous: dict[str, Any], timeout: float,
+                     launchd_domain: str | None = None) -> None:
     address = None
     if previous.get("platforms", {}).get("api_server", {}).get("state") == "connected":
         address = api_bind_address(home)
@@ -666,6 +698,12 @@ def wait_for_stopped(home: Path, previous: dict[str, Any], timeout: float) -> No
                     except OSError:
                         time.sleep(.5)
                         continue
+            if launchd_domain:
+                label = "ai.hermes.gateway" + ("-" + home.name if home.parent.name == "profiles" else "")
+                probe = run(["launchctl", "print", f"{launchd_domain}/{label}"], check=False, timeout=10)
+                if probe.returncode == 0:
+                    time.sleep(.5)
+                    continue
             return
         time.sleep(.5)
     raise UpdateError("old Gateway process or API port was not released")
@@ -693,6 +731,22 @@ def plugin_differences(checkout: Path, home: Path, plugins: list[str]) -> list[s
         for plugin in plugins
         if tree_digest(checkout / "plugins" / plugin) != tree_digest(home / "plugins" / plugin)
     ]
+
+
+def newer_local_plugins(checkout: Path, home: Path, plugins: list[str]) -> dict[str, str]:
+    import yaml
+    def version(path):
+        if not path.is_file():
+            return None
+        value = (yaml.safe_load(path.read_text()) or {}).get("version")
+        return version_tuple(str(value)) if VERSION_RE.fullmatch(str(value)) else None
+    preserved = {}
+    for name in plugins:
+        local = version(home / "plugins" / name / "plugin.yaml")
+        release = version(checkout / "plugins" / name / "plugin.yaml")
+        if local and release and local > release:
+            preserved[name] = tree_digest(home / "plugins" / name)
+    return preserved
 
 
 def save_state(path: Path, state: dict[str, Any], **updates: Any) -> None:
@@ -754,6 +808,8 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                 return {"status": "blocked_by_hermes_version", "commit": commit, "reason": reason}
 
             changed = plugin_differences(checkout, home, manifest["plugins"])
+            preserved = newer_local_plugins(checkout, home, manifest["plugins"])
+            changed = [name for name in changed if name not in preserved]
             manifest_changed = state.get("manifest_digest") != digest
             drift = desired_state_drift(hermes, args.profile, home, manifest)
             if not changed and not manifest_changed and not drift:
@@ -764,7 +820,7 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     last_seen_commit=commit,
                     last_result="no-live-change",
                 )
-                return {"status": "no-live-change", "commit": commit}
+                return {"status": "no-live-change", "commit": commit, "preserved_local_plugins": list(preserved)}
 
             try:
                 run_regressions(checkout, home, manifest, git)
@@ -806,23 +862,33 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                 return {"status": "deferred", "commit": commit, "active_agents": active}
 
             was_running = gateway_running(gateway)
+            stop_domain, start_domain = (None, None)
+            if sys.platform == "darwin" and installation_root(home).resolve() == native_hermes_root().resolve():
+                installer = checkout / "scripts/install-macos-launchd-guard.py"
+                if not installer.is_file():
+                    raise UpdateError("macOS launchd guard installer is absent from this release")
+                run([hermes_python(home), installer, "--home", installation_root(home)], timeout=60)
+                if was_running:
+                    stop_domain, start_domain = macos_domains(home, args.profile)
             require_qq_ready = qqbot_enabled(hermes, args.profile)
             preflight_active_plugins(home, changed)
             backup, metadata = backup_live_state(home, changed, commit)
+            metadata["launchd"] = {"stop_domain": stop_domain, "start_domain": start_domain}
+            write_json(backup / "metadata.json", metadata)
             stage = stage_plugins(checkout, home, changed, commit)
             try:
                 if was_running:
-                    hermes_call(hermes, args.profile, "gateway", "stop", timeout=360)
-                    wait_for_stopped(home, gateway, args.health_timeout)
+                    hermes_call(hermes, args.profile, "gateway", "stop", timeout=360, launchd_domain=stop_domain)
+                    wait_for_stopped(home, gateway, args.health_timeout, launchd_domain=stop_domain)
                 replace_plugins(home, stage, changed)
                 apply_managed_settings(hermes, args.profile, home, manifest)
                 for plugin in manifest["plugins"]:
-                    expected = tree_digest(checkout / "plugins" / plugin)
+                    expected = preserved.get(plugin) or tree_digest(checkout / "plugins" / plugin)
                     actual = tree_digest(home / "plugins" / plugin)
                     if expected != actual:
                         raise UpdateError(f"installed plugin hash mismatch: {plugin}")
                 if was_running:
-                    hermes_call(hermes, args.profile, "gateway", "start", timeout=60)
+                    hermes_call(hermes, args.profile, "gateway", "start", timeout=60, launchd_domain=start_domain)
                     if not wait_for_ready(home, gateway, require_qq_ready, args.health_timeout):
                         raise UpdateError("new Gateway did not restore its connected platforms")
                     hermes_call(hermes, args.profile, "gateway", "status", "--deep", timeout=60)
@@ -836,17 +902,20 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     last_result="updated",
                     last_backup=str(backup),
                     changed_plugins=changed,
+                    preserved_local_plugins=list(preserved),
+                    launchd_domain=start_domain,
                     blocked_commit=None,
                     blocked_reason=None,
                 )
                 shutil.rmtree(home / "update-staging" / commit, ignore_errors=True)
-                return {"status": "updated", "commit": commit, "plugins": changed, "backup": str(backup)}
+                return {"status": "updated", "commit": commit, "plugins": changed, "backup": str(backup),
+                        "preserved_local_plugins": list(preserved), "launchd_domain": start_domain}
             except Exception as exc:
                 rollback_errors: list[str] = []
                 recovery = {**gateway, "pid": read_gateway_state(home).get("pid")} if was_running else {}
                 if was_running:
                     try:
-                        hermes_call(hermes, args.profile, "gateway", "stop", timeout=360)
+                        hermes_call(hermes, args.profile, "gateway", "stop", timeout=360, launchd_domain=start_domain)
                     except Exception as rollback_exc:
                         rollback_errors.append(f"stop: {rollback_exc}")
                 try:
@@ -855,8 +924,8 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     rollback_errors.append(f"restore: {rollback_exc}")
                 if was_running:
                     try:
-                        wait_for_stopped(home, recovery, args.health_timeout)
-                        hermes_call(hermes, args.profile, "gateway", "start", timeout=60)
+                        wait_for_stopped(home, recovery, args.health_timeout, launchd_domain=start_domain)
+                        hermes_call(hermes, args.profile, "gateway", "start", timeout=60, launchd_domain=start_domain)
                         if not wait_for_ready(home, recovery, require_qq_ready, args.health_timeout):
                             rollback_errors.append("restored Gateway did not reconnect")
                     except Exception as rollback_exc:

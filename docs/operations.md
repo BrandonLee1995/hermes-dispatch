@@ -64,6 +64,72 @@ scripts/test_install_plugins.sh
 
 ## Automatic Updates on macOS and Windows
 
+### macOS launchd domain and Codex Keychain compatibility (#21)
+
+Hermes 0.21.0 probes a Gateway's loaded service to choose its launchd domain.
+After an updater's separate stop/start processes unload that service, a
+Background caller instead selects `user/<uid>`. QQ/API connections can recover
+while Codex `keyring` credentials are unavailable and real requests fail with
+401/Missing bearer. Platform connectivity is not authentication acceptance.
+
+Dispatch now records each profile's exact domain before stopping it and passes
+the target domain explicitly to both normal and rollback starts. The removable
+`ops/macos_launchd.py` CLI guard persists domains below the owner's Hermes
+`state/dispatch-launchd-domains.json`; it also guards service-definition refresh
+and ordinary restart. Explicit Codex app-server `keyring` profiles require
+`gui/<uid>` and Aqua-only plists. Other profiles keep their existing domain and
+session types. This applies to named profiles as well as default. Unspecified
+credential-store settings are not reclassified as keyring.
+
+The generated host launcher and the plist's core CLI entrypoint route through
+`~/.hermes/scripts/dispatch-macos-launchd.py`. The installer preserves the QQ
+cron bootstrap and unrelated shell content. It changes no Hermes core source,
+Codex credential storage, tokens, profile model/provider or approval policy.
+Run as the owning macOS department user:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python scripts/install-macos-launchd-guard.py
+```
+
+The all-profile update entrypoint installs this prerequisite automatically.
+Updates wait for active work; GUI unavailability or duplicate service
+registrations fail explicitly before stopping the Gateway. A guarded service
+never silently falls back to a detached Background process. Keychain-backed
+services require that macOS user to remain logged into a GUI session; this
+workaround does not provide unattended authentication after logout/reboot.
+
+Restart an idle affected profile through the guarded CLI to migrate its wrong
+user-domain job. The guard waits for the previous PID, API bind port and launchd
+registration to disappear before relaunching, compensating for upstream's
+quick restart/late-unregistration race. Verify the exact label in gui and user
+domains and issue a no-tool fixed-marker model request; require the completed
+terminal state and exact output, not only HTTP 200 or `codex login status`.
+Run `ops/test_macos_launchd.py`, `scripts/test_macos_launchd_install.py` and the
+updater regressions. Live acceptance must include a genuine Background caller,
+independent stop/start, ordinary restart, service-definition refresh and
+rollback, followed by real model requests.
+
+The updater also preserves owner-validated local plugins whose semantic
+version is newer than the fetched release, reports `preserved_local_plugins`,
+and verifies their full code digest remains unchanged. Equal-version drift
+still follows the release. This prevents the finance profile's 1.8.9 approval
+repair from being downgraded to the release's 1.8.8; it does not automatically
+merge local repairs into the remote repository.
+
+The installer prints an owner-local `plugin-backups/macos-launchd-*` snapshot
+covering its launcher, guard, policy and plists. Stop the relevant idle services,
+restore that snapshot, then restart them in their recorded original domains:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python scripts/install-macos-launchd-guard.py \
+  --restore /path/to/.hermes/plugin-backups/macos-launchd-TIMESTAMP
+```
+
+Updater plugin rollback retains this independent domain guard and uses its
+captured start domain. Remove/restore the guard separately when upstream fixes
+domain selection and service refresh. Restoring an old user-domain keyring
+setup can reintroduce the authentication failure.
+
 ### One-command update for every profile
 
 macOS/Linux operators can update the default profile and every named profile

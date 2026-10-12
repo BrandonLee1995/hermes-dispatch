@@ -86,6 +86,13 @@ UPDATER=$SOURCE/ops/hermes_dispatch_update.py
 COMMIT=$("$GIT" -C "$SOURCE" rev-parse HEAD)
 [[ $COMMIT =~ ^[0-9a-f]{40}$ ]] || { echo "invalid fetched commit: $COMMIT" >&2; exit 1; }
 
+if (( ! DRY_RUN )) && [[ $(uname -s) == Darwin && -f $SOURCE/scripts/install-macos-launchd-guard.py ]]; then
+  "$PYTHON" "$SOURCE/scripts/install-macos-launchd-guard.py" --home "$HERMES_ROOT" || {
+    echo "macOS launchd guard setup failed; profiles were not updated" >&2
+    exit 1
+  }
+fi
+
 profiles=(default)
 unsafe=()
 shopt -s nullglob
