@@ -24,6 +24,53 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+## Working-delimited private-chat bubbles (1.8.39)
+
+Hermes 0.21 keeps a native draft cumulative across an entire turn while its
+three-minute Working reminders are separate messages. Later output can therefore
+appear above the latest reminder in an old bubble. This extension closes the
+current C2C carrier immediately before a native Working reminder is sent. The
+next output starts a new carrier below that reminder and continues streaming
+inside it. Between Working reminders, intermediate commentary, tool/assistant
+segment boundaries and the final answer reuse the current carrier. Existing
+QQ size/age limits and accepted steering may still rotate carriers as before.
+
+The extension annotates metadata only when called by Hermes' native
+`gateway.run._notify_long_running` callback. It does not inspect model text or
+split at ordinary commentary, tool updates, approvals or inactivity warnings.
+The existing anchor-scoped delivery broker serializes Working delivery with
+drafts and final delivery, retaining the cumulative acknowledgement ledger
+across bubble changes. Groups and non-streaming profiles are unchanged.
+If closing a carrier exhausts its bounded retries, its acknowledged text stays
+visible and the carrier is retired locally; later content cannot modify it.
+QQ may keep that older bubble's typing indication until its own timeout. Existing
+passive-reply limits, ordinary fallback, and delivery-failure reporting still apply.
+
+Real attachment acceptance also exposed an upstream partial-directive gap: a
+streamed `MEDIA:` path can become visible before it is complete enough for the
+Hermes display cleaner to remove it. The cleaned final then no longer extends
+that visible text, causing a repeated final. The C2C consumer holds a possible
+unfinished directive until it can be cleaned, retaining ordinary prose, fenced
+examples and final literal text. Attachment extraction/delivery is unchanged.
+
+Keep QQ `streaming` and `interim_assistant_messages` enabled. Install only
+`qqbot-connect-hotfix` with `scripts/install-plugins.sh <hermes-home>
+qqbot-connect-hotfix`, then restart the idle target Gateway. Verify with
+`test_message_order.py`, existing streaming/final/steering checks, and real QQ
+private chats: output before Working shares one bubble; output after Working
+opens a new one and keeps streaming there through the final answer until the
+next reminder. Verify native callback metadata again when upgrading Hermes.
+This release requires local and Windows public-computer acceptance using
+everyday tasks, with QQ-visible results and host log evidence. Roll back the
+exact installer backup and restart the same profile. No Hermes core edit or
+extra configuration key is needed.
+
+Acceptance on 2026-10-12 used local macOS and product-R&D Windows QQ bots:
+ordinary inspection/document and product-review tasks exercised natural Working
+reminders, bubble reuse, new post-reminder output and final file delivery. The
+attachment follow-up passed on both; 27 unique release regressions and four
+native Windows streaming/final/steering checks also passed.
+
 Version 1.8.38 fixes [Issue #18](https://github.com/mwe-support/hermes-dispatch/issues/18):
 QQ also reports an expired anchor as `msgid已经过期,不能回复`, without the
 underscore in `msg_id`. Hermes 0.20.5 forwards this API message verbatim, but
