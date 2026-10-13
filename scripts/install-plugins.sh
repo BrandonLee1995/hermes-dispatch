@@ -153,7 +153,7 @@ target_root="$1"
 [[ "$target_root" != "/" ]] || usage
 shift
 
-plugins=(codex-app-server-phase-hotfix qqbot-connect-hotfix message-snapshot-store whatsapp-bridge-policy-hotfix weknora-qq-routing)
+plugins=(codex-app-server-phase-hotfix qqbot-connect-hotfix message-snapshot-store whatsapp-bridge-policy-hotfix)
 if [[ $# -gt 0 ]]; then
   plugins=("$@")
 fi

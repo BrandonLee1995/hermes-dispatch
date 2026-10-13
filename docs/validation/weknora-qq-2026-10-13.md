@@ -5,7 +5,8 @@
 The release combines WeKnora routing 1.0.3, QQ compatibility 1.8.41 and the
 finance approval fixes promoted into Codex compatibility 1.8.10. Hermes core,
 endpoint credentials, approval policy and reasoning settings are unchanged.
-WeKnora is shipped by the installer/updater but remains opt-in per profile.
+WeKnora is available as an optional release plugin; updates require explicit
+profile opt-in, and the default installer omits it.
 
 ## Finance private-chat evidence
 
@@ -74,10 +75,12 @@ explains the compact transcript boundary and denial handling.
 
 - All 31 declared release scripts passed in isolated HERMES_HOME environments
   on local macOS and native Windows.
-- Red/green checks cover current-turn scope instructions and shipping an
-  optional plugin without enabling it. Existing trust, endpoint/profile,
+- Red/green checks cover current-turn scope instructions and updating an
+  explicitly selected optional plugin without enabling it elsewhere. Existing trust, endpoint/profile,
   permission-response, reviewer, delivery, streaming and updater tests passed.
-- The default installer copies WeKnora while preserving profile configuration.
+- Review follow-up covers actual Hermes legacy migration after default install,
+  optional-plugin selection across absent/enabled/disabled configurations, and
+  full updater preservation of newer local fixes.
 - Earlier two-host QQ long-task acceptance established Working-only bubble
   boundaries; subsequent receipt/duplicate fixes were verified with real QQ
   tasks on local macOS and the product-R&D Windows computer.
@@ -91,3 +94,19 @@ replace the live finance approval module as part of this acceptance. No fleet
 rollout or automatic PR merge is included. Use each profile's installer/updater
 backup and original service domain for rollback; see the owned plugin READMEs
 and operations guide for enablement and verification steps.
+
+## PR review follow-up
+
+GitHub had no submitted reviews or status checks when inspected. Two additional
+cases were reproduced during local review: the default installer made legacy
+Hermes migration enable the newly copied hook, and a repair installed while
+regressions ran could be overwritten using stale version decisions. Both have
+red/green regressions. Default installation now excludes the optional hook; the
+updater selects it only from explicit enabled/non-disabled profile state, and
+defers before live mutation if plugin content or selection changes during tests.
+The current finance 1.8.9 plugin was compared file-by-file with the PR's
+1.8.10 release: all code and tests match; only README and version metadata
+differ. Read-only selection probes excluded WeKnora from the comparison host's
+default, product and procurement profiles and retained finance's explicit opt-in.
+All 31 release scripts passed again on macOS and native Windows; the updater
+suite has 33 tests, with the POSIX installer migration test skipped on Windows.

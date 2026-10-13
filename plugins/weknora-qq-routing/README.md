@@ -253,3 +253,12 @@ they were not hidden by resetting the thread or bypassing approval. A comparison
 profile had the same Hermes 0.21.0 source and base approval settings but no routing
 hook and only a Codex-side WeKnora declaration, so it is not an equivalent
 hook-enabled control.
+
+## Optional update boundary
+
+The all-profile updater selects this optional plugin only for profiles that
+explicitly enable it and do not explicitly disable it. The default installer
+does not copy it; deliberate installation uses the named-plugin argument. This
+prevents legacy Hermes migration from enabling a newly copied plugin merely
+because its enabled list was missing. Existing disabled copies are left alone.
+No MCP connection or permissions are created by installation or update.

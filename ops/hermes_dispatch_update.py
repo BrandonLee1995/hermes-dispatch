@@ -256,6 +256,26 @@ def validate_manifest(raw: Any) -> dict[str, Any]:
     return raw
 
 
+def managed_plugins_for_profile(home: Path, manifest: dict[str, Any]) -> list[str]:
+    """Only install optional code where the operator explicitly opted in."""
+    required = set(manifest["enable_plugins"])
+    if set(manifest["plugins"]) <= required:
+        return list(manifest["plugins"])
+    import yaml
+    path = home / "config.yaml"
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, yaml.YAMLError):
+        raise UpdateError("cannot read optional plugin opt-in from profile config") from None
+    selection = config.get("plugins", {}) if isinstance(config, dict) else {}
+    selection = selection if isinstance(selection, dict) else {}
+    enabled, disabled = selection.get("enabled", []), selection.get("disabled", [])
+    enabled = enabled if isinstance(enabled, list) else []
+    disabled = disabled if isinstance(disabled, list) else []
+    return [name for name in manifest["plugins"]
+            if name in required or name in enabled and name not in disabled]
+
+
 def manifest_digest(manifest: dict[str, Any]) -> str:
     data = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(data).hexdigest()
@@ -771,7 +791,8 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
     with FileLock(state_dir / "hermes-dispatch-update.lock"):
         checkout, commit = git_checkout(git, args.remote, args.ref, update_root)
         try:
-            manifest = validate_manifest(load_json(checkout / MANIFEST_REL, None))
+            release_manifest = validate_manifest(load_json(checkout / MANIFEST_REL, None))
+            manifest = {**release_manifest, "plugins": managed_plugins_for_profile(home, release_manifest)}
             digest = manifest_digest(manifest)
             if state.get("blocked_commit") == commit and not args.retry_blocked:
                 return {"status": "blocked", "commit": commit, "reason": state.get("blocked_reason")}
@@ -806,6 +827,8 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 return {"status": "blocked_by_hermes_version", "commit": commit, "reason": reason}
 
+            local_before_tests = {name: tree_digest(home / "plugins" / name)
+                                  for name in manifest["plugins"]}
             changed = plugin_differences(checkout, home, manifest["plugins"])
             preserved = newer_local_plugins(checkout, home, manifest["plugins"])
             changed = [name for name in changed if name not in preserved]
@@ -859,6 +882,15 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                 save_state(state_path, state, last_seen_commit=commit,
                            last_result="deferred-active-agents", active_agents=active)
                 return {"status": "deferred", "commit": commit, "active_agents": active}
+
+            changed_locally = [name for name, digest_before in local_before_tests.items()
+                               if tree_digest(home / "plugins" / name) != digest_before]
+            selection_changed = managed_plugins_for_profile(home, release_manifest) != manifest["plugins"]
+            if changed_locally or selection_changed:
+                save_state(state_path, state, last_seen_commit=commit,
+                           last_result="deferred-local-state-change", changed_plugins=changed_locally)
+                return {"status": "deferred", "commit": commit, "reason": "local-state-changed",
+                        "plugins": changed_locally, "selection_changed": selection_changed}
 
             was_running = gateway_running(gateway)
             stop_domain, start_domain = (None, None)

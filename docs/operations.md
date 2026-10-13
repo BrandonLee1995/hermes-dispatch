@@ -679,13 +679,16 @@ excluded; final on-request trials preserved review and only exposed read tools.
 
 ### WeKnora and finance approval rollout (2026-10-13)
 
-The default installer and release manifest now ship `weknora-qq-routing`, but
-the updater deliberately does not add it to `plugins.enabled`. Manifest validation
-now permits installed plugins outside `enable_plugins`; only the latter list
-controls automatic enablement. Existing enabled
-profiles retain their setting; new profiles must opt in after their own Hermes
-MCP declaration matches their authorized Codex endpoint/credential identity.
-A Codex-only connector declaration is not sufficient for this profile guard.
+The release manifest includes `weknora-qq-routing` as optional. The updater
+installs or updates it only when the profile explicitly lists it in
+`plugins.enabled` and does not list it in `plugins.disabled`. Missing or invalid
+enable lists are not opt-in. Unselected optional plugins are excluded from file
+replacement and hash verification; an existing disabled copy stays untouched.
+The default installer omits it. To opt in deliberately, install this named
+plugin and enable it after checking the profile's own authorized MCP declaration.
+This avoids Hermes' legacy migration that grandfathers already-installed user
+plugins when `plugins.enabled` is absent. A Codex-only connector declaration is
+not sufficient for the profile guard.
 Select mode `hermes` through
 `plugins.entries.weknora-qq-routing.settings.mode`; keep existing credentials
 as environment references, never copy another profile's connector.
@@ -705,3 +708,17 @@ no-results and preserve reviewer denials. Roll back each changed plugin using
 the updater's exact profile backup, retain the recorded launchd domain, and
 restart only that profile. See the validation record for the observed scope and
 remaining rollout limits.
+
+### Update review guards
+
+The updater rechecks managed plugin hashes and optional-plugin selection after
+regressions, before backup, stop or replacement. If an operator changed a plugin
+or its selection during tests, the run reports `deferred-local-state-change` and
+leaves services/plugins unchanged. The next run reevaluates current versions;
+this is not permanent protection for unversioned private edits. Locally newer
+plugin versions remain preserved by the existing version guard.
+
+The finance 1.8.9 code and test files are byte-identical to those included in the
+1.8.10 shared release; only version metadata and documentation differ. That version upgrade can replace the plugin directory
+while retaining its MCP consent and reviewer behavior; it is not a downgrade to
+the old shared 1.8.8 implementation. Both approval regressions remain mandatory.

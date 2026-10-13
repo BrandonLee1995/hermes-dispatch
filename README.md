@@ -49,7 +49,8 @@ docs/
   CLI-owned cross-platform `codex app <path>` entrypoint.
 - WeKnora: opt-in QQ routing with current-turn owned/shared KB evidence,
   profile/endpoint isolation, and Hermes/Codex ablation modes. The updater ships
-  the plugin without enabling it on new profiles; see its README.
+  it only for profiles that explicitly enabled it; the default installer omits
+  it. See its README for the explicit installation path.
 - WhatsApp: split private-chat allowlist from group openness, enforce mention
   response policy, capture passive Baileys events before that response gate,
   and persist text/media in the same structured + BM25 snapshot store as QQ.
