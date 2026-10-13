@@ -125,6 +125,19 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(ops.UpdateError):
             ops.validate_manifest(unsafe_test)
 
+    def test_release_ships_optional_routing_without_enabling_it(self) -> None:
+        manifest = json.loads((MODULE_PATH.parent / "release.json").read_text())
+        self.assertIn("weknora-qq-routing", manifest["plugins"])
+        self.assertNotIn("weknora-qq-routing", manifest["enable_plugins"])
+        ops.validate_manifest(manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".env").write_text("OPERATOR_SETTING=keep\n")
+            with patch.object(ops, "hermes_call") as cli:
+                ops.apply_managed_settings("hermes", "default", home, manifest)
+            self.assertFalse(any("weknora-qq-routing" in call.args for call in cli.call_args_list))
+            self.assertIn("OPERATOR_SETTING=keep", (home / ".env").read_text())
+
     def test_env_defaults_preserve_existing_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".env"

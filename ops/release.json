@@ -4,7 +4,8 @@
   "plugins": [
     "codex-app-server-phase-hotfix",
     "qqbot-connect-hotfix",
-    "message-snapshot-store"
+    "message-snapshot-store",
+    "weknora-qq-routing"
   ],
   "enable_plugins": [
     "openai-codex",
@@ -53,6 +54,9 @@
     "ops/test_hermes_dispatch_update.py",
     "ops/test_macos_launchd.py",
     "scripts/test_macos_launchd_install.py",
-    "plugins/qqbot-connect-hotfix/test_model_scope.py"
+    "plugins/qqbot-connect-hotfix/test_model_scope.py",
+    "plugins/codex-app-server-phase-hotfix/test_mcp_approvals.py",
+    "plugins/codex-app-server-phase-hotfix/test_approval_reviewer.py",
+    "plugins/weknora-qq-routing/test_routing.py"
   ]
 }

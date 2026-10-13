@@ -670,8 +670,38 @@ Native UserPromptSubmit produces developer context, whereas Hermes's Codex
 compatibility adapter adds an ephemeral user-input context at turn/start.
 No production profile was enabled by the experimental runner.
 
-See the plugin README and `artifacts/weknora-routing-20261007/report.md` for
+See the plugin README and [sanitized acceptance record](validation/weknora-qq-2026-10-13.md) for
 source contracts, same-profile/Prompt/PID guards, native scoped Hook trust,
 experiment limitations and rollback. Never equate tool listing with successful
 inference/retrieval: initial never-policy trials were blocked by MCP review and
 excluded; final on-request trials preserved review and only exposed read tools.
+
+
+### WeKnora and finance approval rollout (2026-10-13)
+
+The default installer and release manifest now ship `weknora-qq-routing`, but
+the updater deliberately does not add it to `plugins.enabled`. Manifest validation
+now permits installed plugins outside `enable_plugins`; only the latter list
+controls automatic enablement. Existing enabled
+profiles retain their setting; new profiles must opt in after their own Hermes
+MCP declaration matches their authorized Codex endpoint/credential identity.
+A Codex-only connector declaration is not sufficient for this profile guard.
+Select mode `hermes` through
+`plugins.entries.weknora-qq-routing.settings.mode`; keep existing credentials
+as environment references, never copy another profile's connector.
+
+The shared Codex hotfix is 1.8.10: it includes the finance 1.8.9 MCP consent and
+effective reviewer synchronization, plus the current main-branch long-turn
+implementation. Do not replace finance's plugin with an older release. QQ 1.8.41
+keeps Working-only stream boundaries, accepted-task receipts, and commentary/
+attachment deduplication. These are separate plugins and do not change model
+effort, approval policy, tool permissions or knowledge-base data.
+
+Run the manifest regressions before an idle update, then verify Gateway/QQ
+connectivity, actual read-only MCP execution and visible QQ final delivery.
+Current-turn scope evidence can help a reviewer assess authorization; it is not
+a permission grant or a guarantee of approval. Keep failures distinct from
+no-results and preserve reviewer denials. Roll back each changed plugin using
+the updater's exact profile backup, retain the recorded launchd domain, and
+restart only that profile. See the validation record for the observed scope and
+remaining rollout limits.

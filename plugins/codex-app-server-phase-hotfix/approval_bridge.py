@@ -7,7 +7,8 @@ requests are also answered with the legacy ``decision`` response even though
 current Codex expects the granted permission subset in ``permissions``.
 Computer Use app authorization arrives through ``mcpServer/elicitation/request``;
 Hermes declines every non-``hermes-tools`` elicitation, so the Computer Use
-runtime receives a denial without a Gateway prompt.
+runtime receives a denial without a Gateway prompt. Native MCP tool-call
+confirmations are declined in the same way, including WeKnora searches.
 
 This compatibility patch reuses Hermes' existing per-session blocking queue.
 It does not persist grants itself: Codex owns turn/session permission scope,
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _INIT_MARKER = "_codex_gateway_approval_init_hotfix_wrapped"
 _REQUEST_MARKER = "_codex_gateway_server_request_hotfix_wrapped"
+_REVIEWER_MARKER = "_codex_current_approval_reviewer_wrapped"
 _COMMAND_METHOD = "item/commandExecution/requestApproval"
 _FILE_METHOD = "item/fileChange/requestApproval"
 _PERMISSION_METHOD = "item/permissions/requestApproval"
@@ -95,6 +97,7 @@ def _gateway_approval_choice(
         choices = _normalize_ui_choices(approval_choices)
         if choices:
             approval_data[_UI_CHOICES_KEY] = choices
+            approval_data["allow_session"] = "session" in choices
         result = _approval_module._await_gateway_decision(
             session_key,
             notify_cb,
@@ -402,12 +405,50 @@ def computer_use_elicitation_response(choice: str) -> dict[str, Any]:
     return response
 
 
+def _is_mcp_tool_confirmation(params: dict[str, Any]) -> bool:
+    """Match Codex's empty tool-consent form, never an input or OAuth form."""
+    schema = params.get("requestedSchema")
+    return bool(
+        isinstance(params.get("serverName"), str)
+        and params["serverName"].strip()
+        and params["serverName"] != "hermes-tools"
+        and params.get("mode") in ("form", "openai/form")
+        and _elicitation_meta(params).get("codex_approval_kind") == "mcp_tool_call"
+        and isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and schema.get("properties") == {}
+        and schema.get("required", []) == []
+        and set(schema) <= {"type", "properties", "required", "additionalProperties"}
+    )
+
+
+def _mcp_tool_prompt(params: dict[str, Any]) -> tuple[str, str]:
+    server = params["serverName"]
+    message = str(params.get("message") or f"Allow MCP tool call from {server}?")
+    tool_params = _elicitation_meta(params).get("tool_params")
+    preview = json.dumps(tool_params if isinstance(tool_params, dict) else {},
+                         ensure_ascii=False, sort_keys=True, default=str)
+    # Include arguments in the queue's identity so parallel calls with distinct
+    # inputs cannot accidentally coalesce onto the same refusal or approval.
+    command = f"MCP {server}: {message} {preview}"
+    return command, "MCP 工具调用确认；仅允许本次调用。"
+
+
+def mcp_tool_confirmation_response(choice: str) -> dict[str, Any]:
+    # No persistence is advertised by this request. Reject broader choices,
+    # including a manually entered /approve session or /approve always.
+    if choice == "once":
+        return {"action": "accept", "content": {}, "_meta": None}
+    return {"action": "decline", "content": None, "_meta": None}
+
+
 def wrap_server_request_handler(
     original: Callable,
     *,
     patch_command_file: bool = True,
     patch_permissions: bool = True,
     patch_computer_use: bool = True,
+    patch_mcp_tools: bool = True,
 ) -> Callable:
     """Render complete Codex approval choices and delegate unrelated requests."""
 
@@ -482,6 +523,26 @@ def wrap_server_request_handler(
                 req.get("id"),
                 computer_use_elicitation_response(choice),
             )
+            return None
+
+        if (
+            patch_mcp_tools
+            and method == _ELICITATION_METHOD
+            and _is_mcp_tool_confirmation(params)
+        ):
+            client = getattr(self, "_client", None)
+            if client is None:
+                return None
+            command, description = _mcp_tool_prompt(params)
+            choice = "deny"
+            try:
+                choice = _ask_callback(
+                    getattr(self, "_approval_callback", None),
+                    command, description, ["once", "deny"],
+                )
+            except Exception:
+                logger.exception("Codex MCP tool approval callback raised")
+            client.respond(req.get("id"), mcp_tool_confirmation_response(choice))
             return None
 
         if not (patch_permissions and method == _PERMISSION_METHOD):
@@ -604,11 +665,92 @@ def _upstream_handles_computer_use_elicitation(
     )
 
 
+def _upstream_handles_mcp_tool_confirmation(session_cls, handler: Callable) -> bool:
+    """Skip our bridge only when upstream asks and honors accept AND deny."""
+    responses = []
+    callbacks = []
+
+    class ProbeClient:
+        def respond(self, _request_id, result):
+            responses.append(result)
+
+        def respond_error(self, *_args, **_kwargs):
+            pass
+
+    probe = object.__new__(session_cls)
+    probe._client = ProbeClient()
+    probe._routing = SimpleNamespace(auto_approve_exec=False, auto_approve_apply_patch=False)
+    probe._cwd = "/tmp"
+    request = {
+        "id": "mcp-consent-hotfix-probe", "method": _ELICITATION_METHOD,
+        "params": {
+            "serverName": "weknora", "mode": "form",
+            "threadId": "probe-thread", "turnId": "probe-turn",
+            "message": 'Allow the weknora MCP server to run tool "hybrid_search"?',
+            "requestedSchema": {"type": "object", "properties": {}},
+            "_meta": {"codex_approval_kind": "mcp_tool_call", "tool_params": {}},
+        },
+    }
+    try:
+        for choice, expected in (("once", "accept"), ("deny", "decline")):
+            def callback(*args, **kwargs):
+                callbacks.append(choice)
+                return choice
+            probe._approval_callback = callback
+            handler(probe, copy.deepcopy(request))
+            if not responses or responses[-1].get("action") != expected:
+                return False
+        return callbacks == ["once", "deny"]
+    except Exception:
+        return False
+
+
+def wrap_approval_reviewer_request(original: Callable) -> Callable:
+    """Apply the current profile reviewer even when resuming an old thread.
+
+    Codex retains a thread's reviewer. A global config edit therefore changes
+    fresh threads but does not by itself change an existing QQ conversation.
+    Read effective config through the same client so CODEX_HOME, CLI overrides,
+    and project layers stay authoritative. Do not alter per-tool policies.
+    """
+    @functools.wraps(original)
+    def request(self, method, params=None, *args, **kwargs):
+        if method not in {"thread/start", "thread/resume", "turn/start"}:
+            return original(self, method, params, *args, **kwargs)
+        current = dict(params or {})
+        cwd = current.get("cwd") or getattr(self, "_dispatch_approval_cwd", None)
+        if current.get("cwd"):
+            self._dispatch_approval_cwd = current["cwd"]
+        if current.get("approvalsReviewer") is None:
+            try:
+                config_params = {"includeLayers": False}
+                if cwd:
+                    config_params["cwd"] = cwd
+                effective = original(self, "config/read", config_params, timeout=10)
+                reviewer = effective.get("config", {}).get("approvals_reviewer")
+                if reviewer in ("user", "auto_review"):
+                    current["approvalsReviewer"] = reviewer
+                else:
+                    logger.warning("Codex effective approval reviewer unavailable; preserving upstream request")
+            except Exception as exc:
+                logger.warning("Codex approval reviewer sync failed (%s); preserving upstream request", type(exc).__name__)
+        return original(self, method, current, *args, **kwargs)
+
+    setattr(request, _REVIEWER_MARKER, True)
+    return request
+
+
 def patch_codex_gateway_approvals() -> str:
     """Install missing Gateway approval protocol patches once."""
     from agent.transports.codex_app_server_session import CodexAppServerSession
+    from agent.transports.codex_app_server import CodexAppServerClient
 
     statuses: list[str] = []
+    if not getattr(CodexAppServerClient.request, _REVIEWER_MARKER, False):
+        CodexAppServerClient.request = wrap_approval_reviewer_request(CodexAppServerClient.request)
+        statuses.append("current profile approval reviewer synced on resume/turn")
+    else:
+        statuses.append("current approval reviewer already patched")
     original_init = CodexAppServerSession.__init__
     if getattr(original_init, _INIT_MARKER, False):
         statuses.append("gateway callback already patched")
@@ -628,11 +770,15 @@ def patch_codex_gateway_approvals() -> str:
             CodexAppServerSession,
             handler,
         )
+        patch_mcp_tools = not _upstream_handles_mcp_tool_confirmation(
+            CodexAppServerSession, handler,
+        )
         CodexAppServerSession._handle_server_request = wrap_server_request_handler(
             handler,
             patch_command_file=True,
             patch_permissions=patch_permissions,
             patch_computer_use=patch_computer_use,
+            patch_mcp_tools=patch_mcp_tools,
         )
         statuses.append("command/file approval choices patched")
         statuses.append(
@@ -644,5 +790,10 @@ def patch_codex_gateway_approvals() -> str:
             "Computer Use elicitations patched"
             if patch_computer_use
             else "upstream handles Computer Use elicitations; skipped"
+        )
+        statuses.append(
+            "MCP tool confirmations patched"
+            if patch_mcp_tools
+            else "upstream handles MCP tool confirmations; skipped"
         )
     return ", ".join(statuses)

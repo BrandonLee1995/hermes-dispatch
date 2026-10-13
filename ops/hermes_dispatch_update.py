@@ -238,8 +238,7 @@ def validate_manifest(raw: Any) -> dict[str, Any]:
     for name in raw["plugins"] + raw["enable_plugins"] + raw["enable_tools"]:
         if not PLUGIN_NAME_RE.fullmatch(name):
             raise UpdateError(f"invalid managed name in release manifest: {name!r}")
-    if not set(raw["plugins"]) <= set(raw["enable_plugins"]):
-        raise UpdateError("every managed plugin must also appear in enable_plugins")
+    # Installation and enablement are separate so opt-in plugins stay opt-in.
     config_set = raw.get("config_set") or {}
     env_defaults = raw.get("env_set_if_missing") or {}
     if not isinstance(config_set, dict) or not set(config_set) <= MANAGED_CONFIG_KEYS:

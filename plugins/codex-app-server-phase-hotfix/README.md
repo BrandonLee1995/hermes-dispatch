@@ -93,9 +93,48 @@ For Computer Use, the bridge matches only the bundled connector identity,
 renders the requested display name and bundle id through the same Gateway
 queue, and returns the MCP elicitation `accept`/`decline` response. **始终允许**
 adds `_meta.persist=always`, allowing Codex to persist its own Computer Use app
-policy. Unknown or third-party MCP elicitations continue through Hermes'
+policy. Unsupported MCP input/OAuth elicitations continue through Hermes'
 upstream fail-closed handler. Apps marked `forbidden` by the Computer Use
 runtime never emit this elicitation and remain blocked.
+
+This behavior follows the current upstream [Codex app-server approval
+contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#approvals).
+
+Version 1.8.10 promotes the finance-only MCP approval fixes into the shared
+release, preserving the newer long-turn and lifecycle fixes. It forwards native MCP tool-call confirmations, including
+WeKnora retrieval, through the same queue. Upstream Hermes 0.21.0 declines
+non-`hermes-tools` MCP requests before a user can answer; the earlier local
+WeKnora configuration covered only two inventory tools. This bridge matches
+`_meta.codex_approval_kind=mcp_tool_call` with an empty object form and displays
+the server, tool confirmation message, and redacted arguments. It offers only
+**本次允许** and **拒绝**, never a session or permanent grant. Missing notifiers,
+delivery errors, timeout, and unsupported choices remain denied. Structured
+input forms, URL/OAuth flows, and other MCP requests continue through upstream.
+The patch does not edit MCP permissions, API keys, or business approval rules.
+
+Enable through the existing plugin entry, install this plugin alone with
+`scripts/install-plugins.sh "$HERMES_HOME" codex-app-server-phase-hotfix`, then
+use a drain-aware Gateway restart. Run `test_mcp_approvals.py` with the Hermes
+Python/runtime path to verify real queue resolution and refusal cases, plus
+the existing Codex and QQ regressions. Check fresh startup logs for
+`MCP tool confirmations patched`. Roll back with the installer's `--restore`
+using its recorded plugin backup, then restart the idle Gateway. The bridge
+becomes a no-op when upstream demonstrably prompts and honors both decisions.
+For an existing installation carrying newer unrelated local hotfixes, apply
+only `approval_bridge.py`, its regression, and the corresponding documentation
+to a backed-up copy; do not replace those unrelated lifecycle/project files.
+
+The preserved finance 1.8.9 behavior synchronizes the current profile's `approvals_reviewer` on
+`thread/start`, `thread/resume`, and `turn/start`. Codex persists the reviewer
+on each thread, so changing global config to `auto_review` previously fixed
+new tests while old QQ threads resumed with `user` and still waited for a
+button. The bridge reads effective configuration through the owning client,
+including its CODEX_HOME and project layers, and sends `approvalsReviewer`.
+Explicit upstream reviewer fields take precedence. It does not set approvals
+for individual tools or change the sandbox. Verify with `test_approval_reviewer.py`
+and a genuine resumed thread that previously used `user`; roll back with the
+recorded plugin backup and drain-aware restart. Logs report
+`current profile approval reviewer synced on resume/turn` on activation.
 
 This behavior follows the current upstream [Codex app-server approval
 contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#approvals).
