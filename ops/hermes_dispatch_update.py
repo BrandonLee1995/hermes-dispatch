@@ -269,9 +269,14 @@ def managed_plugins_for_profile(home: Path, manifest: dict[str, Any]) -> list[st
         raise UpdateError("cannot read optional plugin opt-in from profile config") from None
     selection = config.get("plugins", {}) if isinstance(config, dict) else {}
     selection = selection if isinstance(selection, dict) else {}
-    enabled, disabled = selection.get("enabled", []), selection.get("disabled", [])
-    enabled = enabled if isinstance(enabled, list) else []
+    enabled, disabled = selection.get("enabled"), selection.get("disabled", [])
     disabled = disabled if isinstance(disabled, list) else []
+    ambiguous = [name for name in manifest["plugins"] if name not in required
+                 and name not in disabled and (home / "plugins" / name).is_dir()]
+    if not isinstance(enabled, list) and ambiguous:
+        raise UpdateError("installed optional plugins need explicit plugins.enabled or plugins.disabled "
+                          "before Hermes config migration: " + ", ".join(ambiguous))
+    enabled = enabled if isinstance(enabled, list) else []
     return [name for name in manifest["plugins"]
             if name in required or name in enabled and name not in disabled]
 

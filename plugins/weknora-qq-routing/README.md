@@ -262,3 +262,9 @@ does not copy it; deliberate installation uses the named-plugin argument. This
 prevents legacy Hermes migration from enabling a newly copied plugin merely
 because its enabled list was missing. Existing disabled copies are left alone.
 No MCP connection or permissions are created by installation or update.
+
+If optional plugin files already exist but the profile has no valid enable list
+and no explicit disable entry, the updater stops before calling Hermes CLI.
+Choose the intended enabled/disabled state first; otherwise Hermes migration
+could grandfather those pre-existing files. This check does not change that
+profile's configuration or stop its Gateway.

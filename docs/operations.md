@@ -718,7 +718,15 @@ leaves services/plugins unchanged. The next run reevaluates current versions;
 this is not permanent protection for unversioned private edits. Locally newer
 plugin versions remain preserved by the existing version guard.
 
-The finance 1.8.9 code and test files are byte-identical to those included in the
-1.8.10 shared release; only version metadata and documentation differ. That version upgrade can replace the plugin directory
+The finance 1.8.9 runtime code and dedicated approval regressions are byte-identical
+to those included in the 1.8.10 shared release. Version metadata and documentation
+differ; the generic deadline regression now uses a deterministic clock instead
+of a 30 ms sleep, without changing production timeout logic. That version upgrade can replace the plugin directory
 while retaining its MCP consent and reviewer behavior; it is not a downgrade to
 the old shared 1.8.8 implementation. Both approval regressions remain mandatory.
+
+If optional plugin files already exist but the profile has no valid enable list
+and no explicit disable entry, the updater stops before calling Hermes CLI.
+Choose the intended enabled/disabled state first; otherwise Hermes migration
+could grandfather those pre-existing files. This check does not change that
+profile's configuration or stop its Gateway.

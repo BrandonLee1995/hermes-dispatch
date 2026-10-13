@@ -105,8 +105,17 @@ red/green regressions. Default installation now excludes the optional hook; the
 updater selects it only from explicit enabled/non-disabled profile state, and
 defers before live mutation if plugin content or selection changes during tests.
 The current finance 1.8.9 plugin was compared file-by-file with the PR's
-1.8.10 release: all code and tests match; only README and version metadata
-differ. Read-only selection probes excluded WeKnora from the comparison host's
+1.8.10 release: runtime code and dedicated approval tests match. README, version
+metadata and a deterministic-clock change in the generic regression differ. Read-only selection probes excluded WeKnora from the comparison host's
 default, product and procurement profiles and retained finance's explicit opt-in.
 All 31 release scripts passed again on macOS and native Windows; the updater
-suite has 33 tests, with the POSIX installer migration test skipped on Windows.
+suite has 34 tests, with the POSIX installer migration test skipped on Windows.
+
+The legacy-file check also covers a previously copied optional plugin with no
+selection list: update stops before any Hermes CLI call could grandfather it.
+Explicitly disabled legacy copies remain untouched and do not block updating
+required plugins.
+
+A Windows rerun exposed an intermittent deadline assertion in an existing
+30 ms sleep-based test. The test now supplies before-deadline and at-deadline
+clock values explicitly; production timeout code is unchanged.

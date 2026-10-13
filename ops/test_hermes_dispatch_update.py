@@ -140,6 +140,7 @@ class UpdaterTests(unittest.TestCase):
 
     def test_optional_plugin_is_installed_only_for_explicit_opt_in(self) -> None:
         for selection, install, existing in (({}, False, False),
+                ({"disabled": ["weknora-qq-routing"]}, False, True),
                 ({"enabled": []}, False, False),
                 ({"enabled": []}, False, True),
                 ({"enabled": ["weknora-qq-routing"]}, True, False),
@@ -173,6 +174,31 @@ class UpdaterTests(unittest.TestCase):
                 if existing:
                     self.assertEqual(target.read_text(), "disabled local copy")
                 self.assertEqual((home / "config.yaml").read_text(), config)
+
+    def test_legacy_installed_optional_without_selection_stops_before_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+            home.mkdir(); config = home / "config.yaml"
+            config.write_text('{"_config_version":20,"plugins":{}}')
+            write_plugin(home, "weknora-qq-routing", "1.0.2", "staged optional hook")
+            write_plugin(source, "weknora-qq-routing", "1.0.3", "optional release")
+            path = source / "ops/release.json"
+            manifest = json.loads(path.read_text());manifest["plugins"].append("weknora-qq-routing")
+            path.write_text(json.dumps(manifest))
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "optional plugin"], check=True)
+            args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                apply=True, retry_blocked=False)
+            with patch.object(ops, "profile_home", return_value=home), patch.object(
+                ops, "hermes_version", return_value=(0, 21, 0)) as version, patch.object(
+                ops, "desired_state_drift", return_value=[]), patch.object(
+                ops, "qqbot_enabled", return_value=False), patch.object(ops, "hermes_call"):
+                with self.assertRaisesRegex(ops.UpdateError, "explicit"):
+                    ops.perform_update(args)
+            version.assert_not_called()
+            self.assertEqual(json.loads(config.read_text())["plugins"], {})
+            self.assertFalse((home / "update-backups").exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX default installer")
     def test_default_install_does_not_enable_hook_through_hermes_migration(self) -> None:
