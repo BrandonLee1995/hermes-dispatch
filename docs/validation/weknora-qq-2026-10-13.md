@@ -119,3 +119,17 @@ required plugins.
 A Windows rerun exposed an intermittent deadline assertion in an existing
 30 ms sleep-based test. The test now supplies before-deadline and at-deadline
 clock values explicitly; production timeout code is unchanged.
+
+## Authorized fleet opt-in follow-up
+
+The operator subsequently authorized enabling Hermes-side routing on other
+profiles only when their own existing WeKnora MCP is reachable. A separate
+capability-gated preparation command now performs real HTTP MCP tool discovery
+and successful owned/shared inventory reads before writing the profile's explicit
+selection. Ordinary updater/install defaults remain unchanged. Six CLI/HTTP
+boundary cases cover successful dry-run/apply and exact backup preservation,
+access failures, disabled/absent connections, active work, missing retrieval
+capability, endpoint mismatch, and named-profile isolation. Both macOS and native
+Windows pass these cases; the full release matrix passes all 32 scripts on both.
+Fleet deployment/connection evidence is recorded separately from this prior
+Finance QQ acceptance; these automated checks do not claim new QQ conversations.

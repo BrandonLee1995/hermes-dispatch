@@ -730,3 +730,16 @@ and no explicit disable entry, the updater stops before calling Hermes CLI.
 Choose the intended enabled/disabled state first; otherwise Hermes migration
 could grandfather those pre-existing files. This check does not change that
 profile's configuration or stop its Gateway.
+
+### Authorized capability-gated WeKnora rollout
+
+When an operator explicitly requests automatic enablement on accessible profiles,
+use `ops/enable_weknora_routing.py --home PROFILE --apply` before the one-click
+all-profile updater. This is a separate, deliberate opt-in step; scheduled and
+ordinary updates keep their existing non-enabling behavior. See the plugin's
+[probe, verification and rollback procedure](../plugins/weknora-qq-routing/README.md#capability-gated-fleet-opt-in).
+Run it as the profile owner. Record skipped/offline/deferred profiles separately,
+and preserve any pre-existing disabled selection. The bundled phase hotfix 1.8.10
+includes Finance's approved 1.8.9 runtime/approval tests; compare its approval
+bridge with the live profile before replacement. A newer local repair still wins
+under the updater's version guard.

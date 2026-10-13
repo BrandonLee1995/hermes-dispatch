@@ -268,3 +268,45 @@ and no explicit disable entry, the updater stops before calling Hermes CLI.
 Choose the intended enabled/disabled state first; otherwise Hermes migration
 could grandfather those pre-existing files. This check does not change that
 profile's configuration or stop its Gateway.
+
+## Capability-gated fleet opt-in
+
+Normal installation and one-click updates still do not enable this optional
+plugin. For an explicitly authorized rollout, run the following with the host's
+Hermes venv Python for **each real profile**, then run the normal all-profile
+updater from the same reviewed release:
+
+```sh
+python ops/enable_weknora_routing.py --home "$HERMES_HOME"
+python ops/enable_weknora_routing.py --home "$HERMES_HOME" --apply
+bash scripts/update-hermes-dispatch-all.sh
+```
+
+PowerShell uses the same Python helper and `update-hermes-dispatch-all.ps1`.
+The first command is a read-only MCP/config probe (it creates only a local lock
+state directory). The second is explicit consent to capability-gated opt-in.
+It uses that profile's `.env`/`CODEX_HOME` and existing Codex HTTP MCP connection;
+missing credentials, disabled servers/hooks, missing retrieval or owned/shared
+inventory tools, access errors, and unsupported transports leave config unchanged.
+It calls only `list_knowledge_bases` and `list_shared_knowledge_bases`, never a
+model or a search, and exports tool names and success states, not KB contents.
+Successful enumeration establishes access, not exhaustive scope or search quality;
+the runtime hook still refreshes and checks scope on each retrieval turn.
+
+Hermes 0.21.0 does not expose a Codex-only MCP declaration to its profile plugin
+capability checks. If needed, the helper mirrors that **same profile's** already
+configured endpoint/header identity into Hermes with a read-only tool include
+list; it never changes Codex config, credentials, trust or approval modes.
+It sets routing mode `hermes`, preserves other config, refuses mismatched existing
+same-name endpoints and live config races, and defers while an agent is active.
+The profile's config snapshot is written owner-only under `state/weknora-optin-*`.
+HTTP MCP uses the installed SDK's [Streamable HTTP protocol](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+Paginated tool catalogs and non-HTTP transports are conservatively skipped.
+
+After the updater, verify the hook version/selection, Gateway's new process and
+QQ connection, then check a fresh request's `WeKnora routing capability` log.
+A successful probe alone does not prove model routing or QQ delivery. If update
+fails, restore the helper's reported config backup before retrying or restarting.
+For rollback after a successful rollout, restore that backup and restart the same
+profile through its guarded Hermes launcher. Keep the updater plugin backup too;
+do not replace Finance's approval bridge with an older standalone snapshot.

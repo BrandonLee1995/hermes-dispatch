@@ -57,6 +57,7 @@
     "plugins/qqbot-connect-hotfix/test_model_scope.py",
     "plugins/codex-app-server-phase-hotfix/test_mcp_approvals.py",
     "plugins/codex-app-server-phase-hotfix/test_approval_reviewer.py",
-    "plugins/weknora-qq-routing/test_routing.py"
+    "plugins/weknora-qq-routing/test_routing.py",
+    "ops/test_enable_weknora_routing.py"
   ]
 }
