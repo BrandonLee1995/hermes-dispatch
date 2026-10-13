@@ -29,6 +29,7 @@ class _ReplyRoute:
     anchor: str
     consumer: object = None
     running: bool = False
+    receipt_attempted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     barrier: object = None
 

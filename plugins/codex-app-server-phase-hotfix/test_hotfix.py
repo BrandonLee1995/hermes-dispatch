@@ -618,22 +618,26 @@ def main():
         notification_poll_timeout,
         post_tool_quiet_timeout,
     ):
-        time.sleep(turn_timeout)
         return TurnResult("still working")
 
-    import time
-
-    deadline_session = IsolatedSession("deadline")
-    deadline_result = mod.long_turn.wrap_session_run_turn(deadline_original)(
-        deadline_session,
-        "work",
-        turn_timeout=0.03,
-        notification_poll_timeout=0.001,
-    )
-    assert deadline_result.interrupted is True
-    assert deadline_result.should_retire is True
-    assert "without turn/completed" in deadline_result.error
-    assert deadline_session.interrupts == ["turn-still working"]
+    # Model time explicitly: short Windows sleeps need not land exactly on
+    # the requested clock boundary under the remote test runner.
+    for elapsed, interrupted in ((0.02, False), (0.03, True)):
+        deadline_session = IsolatedSession("deadline")
+        with patch.object(mod.long_turn.time, "monotonic", side_effect=[100.0, 100.0 + elapsed]):
+            deadline_result = mod.long_turn.wrap_session_run_turn(deadline_original)(
+                deadline_session,
+                "work",
+                turn_timeout=0.03,
+                notification_poll_timeout=0.001,
+            )
+        assert deadline_result.interrupted is interrupted
+        if interrupted:
+            assert deadline_result.should_retire is True
+            assert "without turn/completed" in deadline_result.error
+            assert deadline_session.interrupts == ["turn-still working"]
+        else:
+            assert not deadline_session.interrupts
 
     delegated = []
 

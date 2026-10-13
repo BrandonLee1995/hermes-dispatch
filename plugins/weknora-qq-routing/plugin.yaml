@@ -1,0 +1,5 @@
+name: weknora-qq-routing
+version: 1.0.3
+description: Profile-scoped WeKnora retrieval routing for QQ, with Hermes/Codex ablation modes
+author: local
+kind: standalone

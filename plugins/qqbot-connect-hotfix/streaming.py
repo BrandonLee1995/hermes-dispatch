@@ -1086,6 +1086,7 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
         return "QQ C2C turn-final context already patched"
 
     original_append = GatewayStreamConsumer._append_accumulated
+    original_init = GatewayStreamConsumer.__init__
 
     def _eligible(self):
         adapter = getattr(self, "adapter", None)
@@ -1096,6 +1097,25 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
             and chat_id in _native_lane_chats(adapter)
             and _is_c2c(adapter, chat_id)
         )
+
+    @functools.wraps(original_init)
+    def _initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        original_clean = self._clean_for_display
+
+        def clean(text):
+            cleaned = original_clean(text)
+            if not _eligible(self) or getattr(self, "_qq_display_finalizing", False):
+                return cleaned
+            from gateway.platforms.base import BasePlatformAdapter
+            masked = BasePlatformAdapter._mask_protected_spans(cleaned)
+            masked = BasePlatformAdapter._mask_json_string_media(masked)
+            # Hold an unfinished attachment marker until its path can be stripped;
+            # otherwise the cleaned final cannot extend the acknowledged draft.
+            pending = re.search(r"(?<!\w)(?:M|ME|MED|MEDI|MEDIA|MEDIA:[^\n]*)$", masked, re.I)
+            return cleaned[:pending.start()].rstrip() if pending else cleaned
+
+        self._clean_for_display = clean
 
     @functools.wraps(original_append)
     def _append_accumulated(self, text: str):
@@ -1131,6 +1151,7 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
                 is_turn_final=is_turn_final,
             )
 
+        self._qq_display_finalizing = True
         token = _TURN_FINAL_CONTEXT.set(
             _TurnFinalContext(
                 adapter_identity=id(adapter),
@@ -1153,8 +1174,10 @@ def _patch_gateway_turn_final_context(QQAdapter) -> str:
             )
         finally:
             _TURN_FINAL_CONTEXT.reset(token)
+            self._qq_display_finalizing = False
 
     setattr(_send_or_edit, _TURN_FINAL_PATCHED, True)
+    GatewayStreamConsumer.__init__ = _initialize
     GatewayStreamConsumer._append_accumulated = _append_accumulated
     GatewayStreamConsumer._send_or_edit = _send_or_edit
     return "QQ C2C turn-final context patched"
@@ -2827,8 +2850,10 @@ def patch_qq_c2c_streaming(QQAdapter):
                     )
                     or (
                         trusted_commentary
-                        and _visible_stream_content(state).endswith(
-                            str(content or "")
+                        # Hermes strips completed commentary; native deltas
+                        # retain its trailing newlines. Both own the same text.
+                        and _visible_stream_content(state).rstrip().endswith(
+                            str(content or "").rstrip()
                         )
                     )
                 )
@@ -2927,9 +2952,15 @@ def patch_qq_c2c_streaming(QQAdapter):
     final_context_status = _patch_gateway_turn_final_context(QQAdapter)
     from .steering import patch_qq_steering
     steer_status = patch_qq_steering(QQAdapter)
+    from .segments import patch_qq_display_segments
+    segments_status = patch_qq_display_segments(QQAdapter)
+    from .receipts import patch_qq_start_receipt
+    receipt_status = patch_qq_start_receipt(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
     logger.info("qqbot-connect-hotfix: %s", overflow_status)
     logger.info("qqbot-connect-hotfix: %s", commentary_status)
     logger.info("qqbot-connect-hotfix: %s", final_context_status)
     logger.info("qqbot-connect-hotfix: %s", steer_status)
+    logger.info("qqbot-connect-hotfix: %s", segments_status)
+    logger.info("qqbot-connect-hotfix: %s", receipt_status)
     return "QQ C2C native streaming patched"

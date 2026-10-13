@@ -652,3 +652,94 @@ launcher unchanged. Its separate original-file backup is printed under the
 native Hermes root's `plugin-backups/qq-cron-launcher-*`; restore that file when
 rolling back this host prerequisite, in addition to any profile snapshots.
 Windows uses its native launcher and the QQ plugin's venv-overlay integration.
+
+## WeKnora-first QQ routing
+
+`plugins/weknora-qq-routing` provides independent Hermes and native Codex
+routing placements with one shared semantic policy. It checks the current
+profile's enabled endpoint, matching credential/transport identity and actual
+retrieval tool surface after QQ authorization. Ordinary/no-KB requests and
+unavailable tools retain normal behavior. It does not alter delivery routing,
+slash input, permissions, knowledge-base data or Hermes source.
+
+The 2026-10-07 pilot ran 72 real-model cases: baseline positive retrieval 3/9;
+Hermes, Codex and both 9/9 each, with no negative false positives or turn failures.
+Observed stability tied. When explicitly enabled, default to Hermes to avoid
+additional native-Hook/version/trust dependencies; Codex remains optional.
+Native UserPromptSubmit produces developer context, whereas Hermes's Codex
+compatibility adapter adds an ephemeral user-input context at turn/start.
+No production profile was enabled by the experimental runner.
+
+See the plugin README and [sanitized acceptance record](validation/weknora-qq-2026-10-13.md) for
+source contracts, same-profile/Prompt/PID guards, native scoped Hook trust,
+experiment limitations and rollback. Never equate tool listing with successful
+inference/retrieval: initial never-policy trials were blocked by MCP review and
+excluded; final on-request trials preserved review and only exposed read tools.
+
+
+### WeKnora and finance approval rollout (2026-10-13)
+
+The release manifest includes `weknora-qq-routing` as optional. The updater
+installs or updates it only when the profile explicitly lists it in
+`plugins.enabled` and does not list it in `plugins.disabled`. Missing or invalid
+enable lists are not opt-in. Unselected optional plugins are excluded from file
+replacement and hash verification; an existing disabled copy stays untouched.
+The default installer omits it. To opt in deliberately, install this named
+plugin and enable it after checking the profile's own authorized MCP declaration.
+This avoids Hermes' legacy migration that grandfathers already-installed user
+plugins when `plugins.enabled` is absent. A Codex-only connector declaration is
+not sufficient for the profile guard.
+Select mode `hermes` through
+`plugins.entries.weknora-qq-routing.settings.mode`; keep existing credentials
+as environment references, never copy another profile's connector.
+
+The shared Codex hotfix is 1.8.10: it includes the finance 1.8.9 MCP consent and
+effective reviewer synchronization, plus the current main-branch long-turn
+implementation. Do not replace finance's plugin with an older release. QQ 1.8.41
+keeps Working-only stream boundaries, accepted-task receipts, and commentary/
+attachment deduplication. These are separate plugins and do not change model
+effort, approval policy, tool permissions or knowledge-base data.
+
+Run the manifest regressions before an idle update, then verify Gateway/QQ
+connectivity, actual read-only MCP execution and visible QQ final delivery.
+Current-turn scope evidence can help a reviewer assess authorization; it is not
+a permission grant or a guarantee of approval. Keep failures distinct from
+no-results and preserve reviewer denials. Roll back each changed plugin using
+the updater's exact profile backup, retain the recorded launchd domain, and
+restart only that profile. See the validation record for the observed scope and
+remaining rollout limits.
+
+### Update review guards
+
+The updater rechecks managed plugin hashes and optional-plugin selection after
+regressions, before backup, stop or replacement. If an operator changed a plugin
+or its selection during tests, the run reports `deferred-local-state-change` and
+leaves services/plugins unchanged. The next run reevaluates current versions;
+this is not permanent protection for unversioned private edits. Locally newer
+plugin versions remain preserved by the existing version guard.
+
+The finance 1.8.9 runtime code and dedicated approval regressions are byte-identical
+to those included in the 1.8.10 shared release. Version metadata and documentation
+differ; the generic deadline regression now uses a deterministic clock instead
+of a 30 ms sleep, without changing production timeout logic. That version upgrade can replace the plugin directory
+while retaining its MCP consent and reviewer behavior; it is not a downgrade to
+the old shared 1.8.8 implementation. Both approval regressions remain mandatory.
+
+If optional plugin files already exist but the profile has no valid enable list
+and no explicit disable entry, the updater stops before calling Hermes CLI.
+Choose the intended enabled/disabled state first; otherwise Hermes migration
+could grandfather those pre-existing files. This check does not change that
+profile's configuration or stop its Gateway.
+
+### Authorized capability-gated WeKnora rollout
+
+When an operator explicitly requests automatic enablement on accessible profiles,
+use `ops/enable_weknora_routing.py --home PROFILE --apply` before the one-click
+all-profile updater. This is a separate, deliberate opt-in step; scheduled and
+ordinary updates keep their existing non-enabling behavior. See the plugin's
+[probe, verification and rollback procedure](../plugins/weknora-qq-routing/README.md#capability-gated-fleet-opt-in).
+Run it as the profile owner. Record skipped/offline/deferred profiles separately,
+and preserve any pre-existing disabled selection. The bundled phase hotfix 1.8.10
+includes Finance's approved 1.8.9 runtime/approval tests; compare its approval
+bridge with the live profile before replacement. A newer local repair still wins
+under the updater's version guard.

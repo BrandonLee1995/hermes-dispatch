@@ -16,6 +16,7 @@ plugins/
   message-snapshot-store/            Persistent snapshots and hybrid retrieval
   qqbot-connect-hotfix/              QQ Bot adapter compatibility plugin
   whatsapp-bridge-policy-hotfix/     WhatsApp bridge/policy/admin plugin
+  weknora-qq-routing/                Opt-in profile-scoped owned/shared KB routing
 mcp/
   http-gateway/                      Streamable HTTP MCP wrapper and tests
   servers/                           Codex/Hermes MCP client examples
@@ -46,6 +47,10 @@ docs/
   authorization requests into Hermes' existing Gateway approval queue. Stable
   channel projects can optionally be registered in Codex Desktop through the
   CLI-owned cross-platform `codex app <path>` entrypoint.
+- WeKnora: opt-in QQ routing with current-turn owned/shared KB evidence,
+  profile/endpoint isolation, and Hermes/Codex ablation modes. The updater ships
+  it only for profiles that explicitly enabled it; the default installer omits
+  it. See its README for the explicit installation path.
 - WhatsApp: split private-chat allowlist from group openness, enforce mention
   response policy, capture passive Baileys events before that response gate,
   and persist text/media in the same structured + BM25 snapshot store as QQ.

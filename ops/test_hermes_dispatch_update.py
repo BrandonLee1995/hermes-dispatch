@@ -125,6 +125,99 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(ops.UpdateError):
             ops.validate_manifest(unsafe_test)
 
+    def test_release_ships_optional_routing_without_enabling_it(self) -> None:
+        manifest = json.loads((MODULE_PATH.parent / "release.json").read_text())
+        self.assertIn("weknora-qq-routing", manifest["plugins"])
+        self.assertNotIn("weknora-qq-routing", manifest["enable_plugins"])
+        ops.validate_manifest(manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".env").write_text("OPERATOR_SETTING=keep\n")
+            with patch.object(ops, "hermes_call") as cli:
+                ops.apply_managed_settings("hermes", "default", home, manifest)
+            self.assertFalse(any("weknora-qq-routing" in call.args for call in cli.call_args_list))
+            self.assertIn("OPERATOR_SETTING=keep", (home / ".env").read_text())
+
+    def test_optional_plugin_is_installed_only_for_explicit_opt_in(self) -> None:
+        for selection, install, existing in (({}, False, False),
+                ({"disabled": ["weknora-qq-routing"]}, False, True),
+                ({"enabled": []}, False, False),
+                ({"enabled": []}, False, True),
+                ({"enabled": ["weknora-qq-routing"]}, True, False),
+                ({"enabled": ["weknora-qq-routing"], "disabled": ["weknora-qq-routing"]}, False, False)):
+            with self.subTest(selection=selection, existing=existing), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+                home.mkdir()
+                config = json.dumps({"_config_version": 20, "plugins": selection})
+                (home / "config.yaml").write_text(config)
+                write_plugin(source, "weknora-qq-routing", "2", "optional release")
+                if existing:
+                    write_plugin(home, "weknora-qq-routing", "1", "disabled local copy")
+                manifest_path = source / "ops/release.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["plugins"].append("weknora-qq-routing")
+                manifest_path.write_text(json.dumps(manifest))
+                subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(source), "commit", "-qm", "optional plugin"], check=True)
+                args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                    hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                    apply=True, retry_blocked=False)
+                with patch.object(ops, "profile_home", return_value=home), patch.object(
+                    ops, "hermes_version", return_value=(0, 21, 0)
+                ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                    ops, "qqbot_enabled", return_value=False
+                ), patch.object(ops, "hermes_call"):
+                    result = ops.perform_update(args)
+                target = home / "plugins/weknora-qq-routing/runtime.py"
+                self.assertEqual("weknora-qq-routing" in result["plugins"], install)
+                self.assertEqual(target.exists(), install or existing)
+                if existing:
+                    self.assertEqual(target.read_text(), "disabled local copy")
+                self.assertEqual((home / "config.yaml").read_text(), config)
+
+    def test_legacy_installed_optional_without_selection_stops_before_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+            home.mkdir(); config = home / "config.yaml"
+            config.write_text('{"_config_version":20,"plugins":{}}')
+            write_plugin(home, "weknora-qq-routing", "1.0.2", "staged optional hook")
+            write_plugin(source, "weknora-qq-routing", "1.0.3", "optional release")
+            path = source / "ops/release.json"
+            manifest = json.loads(path.read_text());manifest["plugins"].append("weknora-qq-routing")
+            path.write_text(json.dumps(manifest))
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "optional plugin"], check=True)
+            args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                apply=True, retry_blocked=False)
+            with patch.object(ops, "profile_home", return_value=home), patch.object(
+                ops, "hermes_version", return_value=(0, 21, 0)) as version, patch.object(
+                ops, "desired_state_drift", return_value=[]), patch.object(
+                ops, "qqbot_enabled", return_value=False), patch.object(ops, "hermes_call"):
+                with self.assertRaisesRegex(ops.UpdateError, "explicit"):
+                    ops.perform_update(args)
+            version.assert_not_called()
+            self.assertEqual(json.loads(config.read_text())["plugins"], {})
+            self.assertFalse((home / "update-backups").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX default installer")
+    def test_default_install_does_not_enable_hook_through_hermes_migration(self) -> None:
+        from hermes_cli.config import migrate_config
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.yaml").write_text('_config_version: 20\nplugins: {}\n')
+            subprocess.run(["bash", str(MODULE_PATH.parent.parent / "scripts/install-plugins.sh"), str(home)],
+                           capture_output=True, check=True)
+            token = set_hermes_home_override(home)
+            try:
+                migrate_config(interactive=False, quiet=True)
+            finally:
+                reset_hermes_home_override(token)
+            import yaml
+            config = yaml.safe_load((home / "config.yaml").read_text())
+            self.assertNotIn("weknora-qq-routing", config["plugins"]["enabled"])
+
     def test_env_defaults_preserve_existing_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".env"
@@ -464,6 +557,78 @@ class UpdaterTests(unittest.TestCase):
                 self.assertEqual(ops.perform_update(args)["status"], "deferred")
             self.assertEqual((home / "plugins/sample/runtime.py").read_text(), "old")
             self.assertFalse((home / "update-backups").exists())
+
+    def test_full_update_keeps_newer_local_approval_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+            home.mkdir(); plugin = write_plugin(home, "sample", "1.8.11", "local approval repair")
+            (source / "plugins/sample/plugin.yaml").write_text("name: sample\nversion: 1.8.10\n")
+            subprocess.run(["git", "-C", str(source), "commit", "-am", "release version", "-q"], check=True)
+            before = ops.tree_digest(plugin)
+            args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                apply=True, retry_blocked=False)
+            with patch.object(ops, "profile_home", return_value=home), patch.object(
+                ops, "hermes_version", return_value=(0, 21, 0)
+            ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                ops, "qqbot_enabled", return_value=False), patch.object(ops, "hermes_call"):
+                result = ops.perform_update(args)
+            self.assertEqual(result["status"], "updated")
+            self.assertEqual(result["preserved_local_plugins"], ["sample"])
+            self.assertEqual(result["plugins"], [])
+            self.assertEqual(ops.tree_digest(plugin), before)
+
+    def test_optional_opt_in_removed_during_tests_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+            home.mkdir()
+            config = home / "config.yaml"
+            config.write_text('{"plugins":{"enabled":["weknora-qq-routing"]}}')
+            write_plugin(source, "weknora-qq-routing", "2", "optional release")
+            path = source / "ops/release.json"
+            manifest = json.loads(path.read_text());manifest["plugins"].append("weknora-qq-routing")
+            path.write_text(json.dumps(manifest))
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "optional plugin"], check=True)
+            args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                apply=True, retry_blocked=False)
+            with patch.object(ops, "profile_home", return_value=home), patch.object(
+                ops, "hermes_version", return_value=(0, 21, 0)
+            ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                ops, "run_regressions", side_effect=lambda *a: config.write_text('{"plugins":{"enabled":[]}}')
+            ), patch.object(ops, "hermes_call") as cli:
+                result = ops.perform_update(args)
+            self.assertEqual(result["status"], "deferred")
+            self.assertTrue(result["selection_changed"])
+            self.assertFalse((home / "plugins/weknora-qq-routing").exists())
+            self.assertFalse((home / "update-backups").exists())
+            cli.assert_not_called()
+
+    def test_local_repair_changed_during_tests_is_not_overwritten(self) -> None:
+        for version in ("1.8.9", "1.8.11"):
+            with self.subTest(local_version=version), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+                home.mkdir(); plugin = write_plugin(home, "sample", "1.8.9", "old")
+                (source / "plugins/sample/plugin.yaml").write_text("name: sample\nversion: 1.8.10\n")
+                subprocess.run(["git", "-C", str(source), "commit", "-am", "release version", "-q"], check=True)
+                args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                    hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                    apply=True, retry_blocked=False)
+                def operator_repair(*args):
+                    (plugin / "plugin.yaml").write_text(f"name: sample\nversion: {version}\n")
+                    (plugin / "runtime.py").write_text("new local approval repair")
+                with patch.object(ops, "profile_home", return_value=home), patch.object(
+                    ops, "hermes_version", return_value=(0, 21, 0)
+                ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                    ops, "run_regressions", side_effect=operator_repair
+                ), patch.object(ops, "qqbot_enabled", return_value=False), patch.object(
+                    ops, "hermes_call") as cli:
+                    result = ops.perform_update(args)
+                self.assertEqual((plugin / "runtime.py").read_text(), "new local approval repair")
+                self.assertEqual(result["status"], "deferred")
+                self.assertFalse((home / "update-backups").exists())
+                cli.assert_not_called()
 
     def test_scheduler_arguments_default_to_dry_run(self) -> None:
         args = argparse.Namespace(
