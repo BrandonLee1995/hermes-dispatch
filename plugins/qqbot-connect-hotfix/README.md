@@ -24,6 +24,47 @@ structured self-mention gating, emoji-only group mentions, reply `msg_id`
 handling, native C2C streaming, bounded input notifications, markdown fallback,
 and media caption compatibility.
 
+## Accepted-task receipt (1.8.41)
+
+Long Codex reasoning can precede the first visible model text even at `high`
+effort. Native Working reminders start three minutes later, so users may mistake
+an accepted task for an idle bot. The extension now observes Hermes' authenticated
+`agent:start` lifecycle event and sends `已收到，正在处理。` once to the originating
+QQ private chat, before model execution. This is a system receipt, not generated
+progress and not a guarantee that model output will arrive by a deadline.
+
+The receipt uses the current background route and inbound reply anchor. It is
+an interim ordinary status message, never part of the model's cumulative stream
+or final-delivery ownership. Groups, slash responses that do not start an agent,
+unscoped/internal events and busy-input handling are unchanged. A failed or
+ambiguous receipt is not retried for the same task; the attempt is bounded at
+five seconds and the accepted task continues. Working-only model bubble
+segmentation and 1.8.40 whitespace deduplication remain enabled.
+
+Install only this plugin and restart the idle Gateway using the procedure below.
+Verify `test_start_receipt.py`, `test_message_order.py` and real QQ private input:
+the system receipt precedes model output, each later completed paragraph appears
+once, and text continues in the active bubble until Working. Existing active
+turns keep their loaded code until the Gateway safely restarts. Roll back the
+exact installer backup and restart to remove both additions; no Hermes core,
+model effort or session history change is needed.
+
+## Completed commentary whitespace (1.8.40)
+
+Hermes strips trailing whitespace from completed commentary callbacks while
+Codex live deltas retain it. After a Working boundary, a completed item ending
+in newlines could therefore fail the connector's exact ownership check and be
+sent again as a separate ordinary bubble. For the trusted, same-anchor consumer
+callback only, ownership comparison now ignores trailing whitespace. Streamed
+text itself is unchanged; independent finals and unrelated status sends retain
+their existing rules. This does not shorten model reasoning or add a receipt.
+
+Install `qqbot-connect-hotfix` and restart the idle Gateway as below. Verify
+`test_message_order.py` (newline-bearing deltas plus stripped completion) and
+real QQ messages after Working: each completed paragraph must have one visible
+carrier. Preserve active work before restarting. Roll back the installer backup
+and restart the same profile to remove the workaround. Hermes core is unchanged.
+
 ## Working-delimited private-chat bubbles (1.8.39)
 
 Hermes 0.21 keeps a native draft cumulative across an entire turn while its

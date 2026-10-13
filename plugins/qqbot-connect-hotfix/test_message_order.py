@@ -118,4 +118,20 @@ async def main():
     print('Literal trailing letters and fenced MEDIA examples remain visible: PASS')
 
 
+    # Hermes strips completed commentary while Codex deltas retain newlines.
+    a=TimelineAdapter();chat='user-trimmed-commentary';anchor='trimmed-commentary'
+    streaming_mod._mark_native_lane(a,chat)
+    c=GatewayStreamConsumer(a,chat,StreamConsumerConfig(transport='auto',chat_type='dm',edit_interval=.01,buffer_threshold=1,cursor=''),initial_reply_to_id=anchor)
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(c.run);c.on_delta('FIRST\n\n');await anyio.sleep(.06)
+        c.on_segment_break();await anyio.sleep(.06)
+        await a.send(chat,'Working',metadata={'_interim_send':True,'_qq_working_boundary':True,'reply_to_message_id':anchor})
+        c.on_delta('SECOND\n\n');await anyio.sleep(.06)
+        c.on_commentary('SECOND');await anyio.sleep(.06)
+        c.on_delta('FINAL');c.finish('FINAL');await anyio.sleep(.06)
+    assert [x[1] for x in a.normal_sends]==['Working'],a.normal_sends
+    assert [x[2] for x in a.timeline if x[0]=='stream' and x[3]==10]==['FIRST\n\n','SECOND\n\nFINAL'],a.timeline
+    print('Trimmed completed commentary does not create a second bubble: PASS')
+
+
 if __name__=='__main__':anyio.run(main)

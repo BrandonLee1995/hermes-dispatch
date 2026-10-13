@@ -42,6 +42,7 @@
     "plugins/qqbot-connect-hotfix/test_final_delivery.py",
     "plugins/qqbot-connect-hotfix/test_streaming.py",
     "plugins/qqbot-connect-hotfix/test_message_order.py",
+    "plugins/qqbot-connect-hotfix/test_start_receipt.py",
     "plugins/qqbot-connect-hotfix/test_steer.py",
     "plugins/message-snapshot-store/test_store.py",
     "plugins/message-snapshot-store/test_capture.py",

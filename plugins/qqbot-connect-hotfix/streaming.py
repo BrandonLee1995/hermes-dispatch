@@ -2850,8 +2850,10 @@ def patch_qq_c2c_streaming(QQAdapter):
                     )
                     or (
                         trusted_commentary
-                        and _visible_stream_content(state).endswith(
-                            str(content or "")
+                        # Hermes strips completed commentary; native deltas
+                        # retain its trailing newlines. Both own the same text.
+                        and _visible_stream_content(state).rstrip().endswith(
+                            str(content or "").rstrip()
                         )
                     )
                 )
@@ -2952,10 +2954,13 @@ def patch_qq_c2c_streaming(QQAdapter):
     steer_status = patch_qq_steering(QQAdapter)
     from .segments import patch_qq_display_segments
     segments_status = patch_qq_display_segments(QQAdapter)
+    from .receipts import patch_qq_start_receipt
+    receipt_status = patch_qq_start_receipt(QQAdapter)
     logger.info("qqbot-connect-hotfix: %s", gate_status)
     logger.info("qqbot-connect-hotfix: %s", overflow_status)
     logger.info("qqbot-connect-hotfix: %s", commentary_status)
     logger.info("qqbot-connect-hotfix: %s", final_context_status)
     logger.info("qqbot-connect-hotfix: %s", steer_status)
     logger.info("qqbot-connect-hotfix: %s", segments_status)
+    logger.info("qqbot-connect-hotfix: %s", receipt_status)
     return "QQ C2C native streaming patched"
