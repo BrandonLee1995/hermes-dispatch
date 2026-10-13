@@ -60,6 +60,9 @@ def main():
         env = {'HERMES_HOME': str(home), c.CAPS_ENV: str(file)}
         s.write_capabilities(file, home, 'codex', tools, event['prompt'])
         assert c.context(event, env, p.source_digest()) == p.render(tools)
+        routed = c.context(event, env, p.source_digest())
+        assert '本轮重新枚举' in routed and '精简的范围证据' in routed
+        assert '不以旧回合的枚举结果替代' in routed
         assert c.context(event, env, 'changed-code') == ''
         assert c.context({**event, 'prompt': 'OTHER request'}, env, p.source_digest()) == ''
         assert c.context(event, {'HERMES_HOME': str(home / 'OTHER'), c.CAPS_ENV: str(file)}, p.source_digest()) == ''

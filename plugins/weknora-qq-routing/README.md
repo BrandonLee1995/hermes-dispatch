@@ -158,8 +158,8 @@ scope. Other bots' group messages cannot establish this profile's permissions.
 A connector with only a unified list must establish that its endpoint contract
 or returned metadata covers shared KBs; otherwise disclose incomplete scope,
 not "no shared KBs". Tools from different connections cannot form a paired
-inventory. A successfully confirmed scope may be reused within that conversation;
-profile/connection/permission changes require a fresh inventory. Greetings,
+inventory. Version 1.0.3 refreshes this evidence for every retrieval-bearing user turn;
+prior conversation scope is not a substitute for evidence visible to this turn’s reviewer. Greetings,
 translation, rewrite and explicit no-KB requests do not enumerate libraries.
 Scope discovery is internal context, not a requirement to print a full KB table
 in every answer. It neither searches every KB nor enables writes or new access.
@@ -210,3 +210,46 @@ observed placement/range behavior, not universal accuracy or every answer's
 factual correctness. Finance retrieval execution is still not accepted; no
 approval bypass or policy change was used. Temporary group-context settings
 were already restored before these private trials.
+
+## Current-turn approval evidence (1.0.3)
+
+A real finance retest found that a new shared-KB target could be declined even
+after a prior-turn inventory returned viewer access: the Auto-review compact
+transcript retained the tool names but omitted the permission field. The shared
+policy now requires fresh owned/shared enumeration on each retrieval-bearing
+request and concise tool-output evidence containing only actual KB IDs, names,
+origin and read permissions. Full storage/model configuration, credentials and
+knowledge text are not part of that evidence. Non-KB turns still skip inventory.
+
+This guides the model to expose verifiable evidence; it neither grants permission
+nor changes approval policy, reviewer, MCP tool approvals or endpoint rights. A
+denied action stays stopped; missing evidence may be checked before asking the
+same reviewer again, and an unresolved rejection must be reported to the user.
+See [what Auto-review sees](https://learn.chatgpt.com/docs/sandboxing/auto-review#what-the-reviewer-sees).
+
+Install this plugin alone and restart an idle Gateway, preserving the finance
+approval plugin. Verify `test_routing.py`, then real colloquial QQ requests across
+multiple turns: fresh paired inventory, authorized shared search, tool success
+and visible final delivery. Check no inventory on translation/rewrite/no-KB
+turns. The earlier 72-trial results describe the older policy and are not a new
+accuracy estimate for 1.0.3. Roll back the exact plugin backup and restart to
+restore the prior policy; model, endpoint and approval configuration stay intact.
+
+## Finance private-chat completion (2026-10-13)
+
+The 1.0.3 finance retest used the same isolated private thread after a 1.0.2
+shared-target denial. Fresh inventory restored the missing evidence; the exact
+previously denied target then passed the unchanged reviewer. Three colloquial
+business turns completed six successful searches (four shared, two owned),
+all preceded by both inventories in the same turn. Three translation/rewrite/
+explicit-no-KB turns made no knowledge-base calls. A final scope question
+confirmed one owned and seven shared KBs. All seven final replies were visible
+in QQ. These are observed execution/routing results, not a general accuracy rate.
+
+Finance's 1.8.9 approval plugin source hashes, approval policy, credentials and
+configuration were retained. Its QQ plugin alone was updated to 1.8.41 to remove
+the known duplicate-commentary issue. Earlier 1.0.2 denials remain recorded;
+they were not hidden by resetting the thread or bypassing approval. A comparison
+profile had the same Hermes 0.21.0 source and base approval settings but no routing
+hook and only a Codex-side WeKnora declaration, so it is not an equivalent
+hook-enabled control.
