@@ -1,0 +1,5 @@
+name: a2a-https-hotfix
+version: 1.0.2
+description: HTTPS-only A2A transport, runtime failure propagation, and first-turn Codex MCP readiness
+author: local
+kind: standalone

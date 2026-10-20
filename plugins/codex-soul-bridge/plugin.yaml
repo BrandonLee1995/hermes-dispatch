@@ -1,0 +1,7 @@
+name: codex-soul-bridge
+version: 1.0.1
+description: Gateway-scoped SOUL instructions for Hermes-owned Codex threads
+author: local
+kind: standalone
+requires_plugins:
+  - codex-app-server-phase-hotfix

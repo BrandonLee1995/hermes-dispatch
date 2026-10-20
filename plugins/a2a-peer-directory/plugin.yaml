@@ -1,0 +1,7 @@
+name: a2a-peer-directory
+version: 1.0.0
+description: Add configured responsibility descriptions to the native A2A peer list
+author: local
+kind: standalone
+requires_plugins:
+  - a2a-https-hotfix

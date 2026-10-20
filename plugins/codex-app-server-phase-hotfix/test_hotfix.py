@@ -224,6 +224,9 @@ def main():
                 self.resume_error = resume_error
                 self.calls = []
 
+            def close(self):
+                self.calls.append(("close",))
+
             def initialize(self, **kwargs):
                 self.calls.append(("initialize", kwargs))
 

@@ -12,6 +12,9 @@ edit container-internal source files.
 
 ```text
 plugins/
+  a2a-https-hotfix/                 HTTPS-only native A2A transport
+  a2a-peer-directory/              Optional peer responsibilities in a2a_list
+  codex-soul-bridge/               Gateway-only SOUL injection and thread refresh
   codex-app-server-phase-hotfix/     Codex routing, media, approvals, and persistent session projects
   message-snapshot-store/            Persistent snapshots and hybrid retrieval
   qqbot-connect-hotfix/              QQ Bot adapter compatibility plugin
@@ -19,6 +22,7 @@ plugins/
   weknora-qq-routing/                Opt-in profile-scoped owned/shared KB routing
 mcp/
   http-gateway/                      Streamable HTTP MCP wrapper and tests
+  hermes-tools-a2a/                  Opt-in A2A tools for Codex app-server runtime
   servers/                           Codex/Hermes MCP client examples
 deploy/
   mwe-support-dev/                   Gateway + HTTP MCP + Caddy example
@@ -80,6 +84,20 @@ The updater backs up changed files and may restart an idle Gateway. See
 for dry-run, verification, and rollback.
 
 ## Installation Shape
+
+For A2A calls from the Codex app-server runtime, see the opt-in
+[`hermes-tools` A2A entrypoint](mcp/hermes-tools-a2a/README.md). It reuses Hermes'
+A2A client without changing the messaging HTTP bridge or installing a listener.
+For responsibility descriptions and business-facing peer aliases, see the optional
+[A2A peer directory](plugins/a2a-peer-directory/README.md). It preserves internal
+profile IDs and existing authenticated routes.
+The [Codex SOUL bridge](plugins/codex-soul-bridge/README.md) forwards
+profile identity only for Hermes Gateway threads; it is not enabled by default.
+The [proactive A2A collaboration study](docs/research/a2a-proactive-collaboration-2026-10-20.md)
+proposes when to request peer assistance and how to blind-test routing, failures,
+and ordinary Codex isolation. It is a research proposal, not an enabled policy.
+See the [A2A and identity release checks](docs/validation/a2a-release-2026-10-20.md)
+for the included versions, rerun regressions, and deployment evidence boundaries.
 
 Copy plugins into the target Hermes data directory:
 

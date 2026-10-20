@@ -557,3 +557,35 @@ long task included intermediate commentary, so the separate deterministic
 transport replay establishes the more specific post-tool >90-second case.
 `test_long_turn_delivery.py` and `test_hotfix.py` passed. This acceptance covers
 one local profile; other hosts and a manual `/stop` were not exercised.
+
+## Closed session reuse and active writers (1.8.11)
+
+Hermes 0.21.0 caches Agents while this plugin can retire an idle thread owner
+when another Agent resumes the same durable thread. The retired Agent still
+references its closed session. Reusing that object can spawn a new app-server
+while `_closed=True`; the next upstream `close()` then returns immediately and
+leaks the writer. Serial continuation can consequently fail with `active writer`.
+
+A second path is cache-signature replacement without `release_clients()`: the
+old Agent/session cycle can be collected, removing its weak owner registration,
+while the client's reader threads keep the app-server process alive. A client
+finalizer now releases that process when its owning session is collected. It
+holds only the client, not the session, and cannot collect an active call frame.
+
+The runtime binding wrapper also discards a closed session before allocating its
+replacement. The persisted project/thread mapping and transcript remain intact.
+Active sessions and writers belonging to other processes remain protected.
+
+Enable by replacing `session_project.py` in the existing mounted plugin and
+restarting an idle Gateway. Verify with `test_writer_lifecycle.py` using the
+installed Hermes Python/source: it alternates two cached Agents over six turns
+and checks that exactly one writer exists and the final close releases it. It
+also drops a cyclic cached session, forces GC, then resumes the same thread.
+Run `test_hotfix.py` as well. For existing leaked subprocesses, first stop the
+idle Gateway normally; identify its app-server children by PID, parent, start
+time and executable before reclaiming only those confirmed idle children.
+Never remove thread locks or kill desktop/other-profile Codex processes.
+
+Rollback: restore the backed-up `session_project.py` and plugin metadata, then
+restart the idle Gateway. This reintroduces the continuation defect; do not
+remove project databases or conversation history as a workaround.

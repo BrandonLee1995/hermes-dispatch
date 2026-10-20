@@ -5,7 +5,10 @@
     "codex-app-server-phase-hotfix",
     "qqbot-connect-hotfix",
     "message-snapshot-store",
-    "weknora-qq-routing"
+    "weknora-qq-routing",
+    "a2a-https-hotfix",
+    "a2a-peer-directory",
+    "codex-soul-bridge"
   ],
   "enable_plugins": [
     "openai-codex",
@@ -58,6 +61,13 @@
     "plugins/codex-app-server-phase-hotfix/test_mcp_approvals.py",
     "plugins/codex-app-server-phase-hotfix/test_approval_reviewer.py",
     "plugins/weknora-qq-routing/test_routing.py",
-    "ops/test_enable_weknora_routing.py"
+    "ops/test_enable_weknora_routing.py",
+    "plugins/codex-app-server-phase-hotfix/test_writer_lifecycle.py",
+    "mcp/hermes-tools-a2a/test_hermes_tools_a2a.py",
+    "plugins/a2a-https-hotfix/test_https.py",
+    "plugins/a2a-https-hotfix/test_mcp_startup.py",
+    "plugins/a2a-https-hotfix/test_result_status.py",
+    "plugins/a2a-peer-directory/test_directory.py",
+    "plugins/codex-soul-bridge/test_bridge.py"
   ]
 }
