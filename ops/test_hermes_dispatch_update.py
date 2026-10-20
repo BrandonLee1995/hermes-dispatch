@@ -56,6 +56,93 @@ def make_fixture_repo(base: Path) -> Path:
 
 
 class UpdaterTests(unittest.TestCase):
+    def test_existing_a2a_wrapper_updates_and_rolls_back_with_plugins(self) -> None:
+        for fail in (False, True):
+            with self.subTest(rollback=fail), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+                home.mkdir()
+                write_plugin(source, "a2a-https-hotfix", "1.0.2", "TLS release")
+                manifest_path = source / "ops/release.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["plugins"].append("a2a-https-hotfix")
+                manifest_path.write_text(json.dumps(manifest))
+                wrapper_source = source / "mcp/hermes-tools-a2a/hermes_tools_a2a.py"
+                wrapper_source.parent.mkdir(parents=True)
+                wrapper_source.write_text("new wrapper")
+                subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(source), "commit", "-qm", "A2A release"], check=True)
+                config = json.dumps({"plugins": {"enabled": ["a2a-https-hotfix"]}})
+                (home / "config.yaml").write_text(config)
+                target = home / "scripts/hermes_tools_a2a.py"
+                target.parent.mkdir()
+                target.write_text("old wrapper")
+                args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                    hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                    apply=True, retry_blocked=False)
+                with patch.object(ops, "profile_home", return_value=home), patch.object(
+                    ops, "hermes_version", return_value=(0, 21, 0)
+                ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                    ops, "qqbot_enabled", return_value=False
+                ), patch.object(ops, "apply_managed_settings",
+                    side_effect=ops.UpdateError("forced failure") if fail else None):
+                    if fail:
+                        with self.assertRaises(ops.UpdateError):
+                            ops.perform_update(args)
+                        self.assertEqual(target.read_text(), "old wrapper")
+                    else:
+                        result = ops.perform_update(args)
+                        self.assertEqual(target.read_text(), "new wrapper")
+                        self.assertEqual((Path(result["backup"]) / "scripts/hermes_tools_a2a.py").read_text(),
+                                         "old wrapper")
+                self.assertEqual((home / "config.yaml").read_text(), config)
+
+    def test_a2a_wrapper_respects_opt_out_and_newer_local_repairs(self) -> None:
+        for state in ("disabled", "absent", "concurrent-edit", "newer-plugin"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp); source = make_fixture_repo(base); home = base / "home"
+                home.mkdir()
+                write_plugin(source, "a2a-https-hotfix", "1.0.2", "TLS release")
+                manifest_path = source / "ops/release.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["plugins"].append("a2a-https-hotfix")
+                manifest_path.write_text(json.dumps(manifest))
+                wrapper_source = source / "mcp/hermes-tools-a2a/hermes_tools_a2a.py"
+                wrapper_source.parent.mkdir(parents=True)
+                wrapper_source.write_text("new wrapper")
+                subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(source), "commit", "-qm", "A2A release"], check=True)
+                (home / "config.yaml").write_text(json.dumps({"plugins": {
+                    "enabled": ["a2a-https-hotfix"],
+                    "disabled": ["a2a-https-hotfix"] if state == "disabled" else [],
+                }}))
+                target = home / "scripts/hermes_tools_a2a.py"
+                target.parent.mkdir()
+                if state != "absent":
+                    target.write_text("local wrapper")
+                if state == "newer-plugin":
+                    write_plugin(home, "a2a-https-hotfix", "1.0.3", "local repair")
+                def regressions(*args):
+                    if state == "concurrent-edit":
+                        target.write_text("concurrent repair")
+                args = argparse.Namespace(profile="default", remote=str(source), ref="main",
+                    hermes_cli=sys.executable, git_cli=shutil_which_git(), health_timeout=1,
+                    apply=True, retry_blocked=False)
+                with patch.object(ops, "profile_home", return_value=home), patch.object(
+                    ops, "hermes_version", return_value=(0, 21, 0)
+                ), patch.object(ops, "desired_state_drift", return_value=[]), patch.object(
+                    ops, "qqbot_enabled", return_value=False
+                ), patch.object(ops, "apply_managed_settings"), patch.object(
+                    ops, "run_regressions", side_effect=regressions):
+                    result = ops.perform_update(args)
+                if state == "absent":
+                    self.assertFalse(target.exists())
+                elif state == "concurrent-edit":
+                    self.assertEqual(result["status"], "deferred")
+                    self.assertEqual(target.read_text(), "concurrent repair")
+                    self.assertFalse((home / "update-backups").exists())
+                else:
+                    self.assertEqual(target.read_text(), "local wrapper")
+
     def test_explicit_launchd_domain_reaches_separate_cli_process(self) -> None:
         with patch.object(ops, "hermes_argv", return_value=["hermes"]), patch.object(ops, "run") as call:
             ops.hermes_call("hermes", "default", "gateway", "start", launchd_domain="gui/501")

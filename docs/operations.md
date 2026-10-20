@@ -768,3 +768,29 @@ back the five-call limit; it does not delete conversation history. This setting
 is local to the receiving profile and must be applied to both directions.
 
 Validation record: [cross-host limit 20, nine rounds](validation/a2a-limit20-2026-10-15.md).
+
+### Updating existing A2A and SOUL deployments
+
+The release manifest also carries `a2a-https-hotfix`, `a2a-peer-directory` and
+`codex-soul-bridge` as optional plugins. The one-click updater refreshes them only
+where the profile already explicitly enables them; it does not add their enable
+entries. This closes the deployment gap where a successful update of the base
+plugins left an opted-in A2A transport or identity bridge on its old version.
+
+For a profile that opts into `a2a-https-hotfix`, an existing regular
+`scripts/hermes_tools_a2a.py` is updated from the release's MCP wrapper in the same
+idle Gateway transaction. Missing wrappers are not created, arbitrary MCP command
+paths are not changed, and shared/symlinked paths are rejected. Configure any
+nonstandard wrapper location separately according to its owner. The wrapper is
+backed up with the plugin/config snapshot, hash-checked, and restored on a failed
+update. An edit during regression checks defers installation; a newer local A2A
+plugin also preserves its associated wrapper. Credentials, SOUL contents and
+Codex MCP configuration are outside this update operation.
+
+Run the standard all-profile script, then inspect its applied commit, installed
+plugin hashes and `a2a_wrapper_changed` result. Confirm existing enable/disable
+lists and Finance's approval bridge are preserved. Test a real authenticated A2A
+call and original QQ reply separately from the updater's process/connectivity
+checks. Roll back using the reported backup, including its wrapper file, and
+restart the affected idle Gateway through the guarded launcher. Keep HTTPS and
+existing authentication requirements enabled.

@@ -33,6 +33,8 @@ from typing import Any, Optional, Sequence
 DEFAULT_REMOTE = "https://github.com/mwe-support/hermes-dispatch.git"
 DEFAULT_REF = "main"
 MANIFEST_REL = Path("ops/release.json")
+A2A_WRAPPER_REL = Path("scripts/hermes_tools_a2a.py")
+A2A_WRAPPER_SOURCE = Path("mcp/hermes-tools-a2a/hermes_tools_a2a.py")
 PLUGIN_NAME_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 VERSION_RE = re.compile(r"(?:Hermes Agent v)?(\d+)\.(\d+)\.(\d+)")
@@ -286,6 +288,20 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def existing_a2a_wrapper(home: Path, plugins: list[str]) -> bytes | None:
+    """Refresh only an already-installed entrypoint in an opted-in profile."""
+    if "a2a-https-hotfix" not in plugins:
+        return None
+    target = home / A2A_WRAPPER_REL
+    if is_link_or_reparse(target.parent) or is_link_or_reparse(target):
+        raise UpdateError("A2A MCP entrypoint must not use a symlink or reparse point")
+    if not target.exists():
+        return None
+    if not target.is_file():
+        raise UpdateError("A2A MCP entrypoint must be a regular file")
+    return target.read_bytes()
+
+
 def tree_digest(root: Path) -> Optional[str]:
     if not root.is_dir():
         return None
@@ -514,7 +530,8 @@ def env_missing(path: Path, keys: Sequence[str]) -> list[str]:
     return [key for key in keys if key not in present]
 
 
-def backup_live_state(home: Path, plugins: list[str], commit: str) -> tuple[Path, dict[str, Any]]:
+def backup_live_state(home: Path, plugins: list[str], commit: str,
+                      extra_files: Sequence[str] = ()) -> tuple[Path, dict[str, Any]]:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup_root = home / "update-backups"
     assert_real_directory(backup_root, "update backup root", create=True)
@@ -525,10 +542,11 @@ def backup_live_state(home: Path, plugins: list[str], commit: str) -> tuple[Path
         suffix += 1
     backup.mkdir()
     metadata: dict[str, Any] = {"files": {}, "plugins": {}}
-    for name in ("config.yaml", ".env"):
+    for name in ("config.yaml", ".env", *extra_files):
         source = home / name
         metadata["files"][name] = source.exists()
         if source.exists():
+            (backup / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, backup / name)
     for plugin in plugins:
         source = home / "plugins" / plugin
@@ -595,7 +613,8 @@ def restore_backup(home: Path, backup: Path, metadata: dict[str, Any]) -> None:
         target = home / name
         source = backup / name
         if existed:
-            atomic_write(target, source.read_bytes(), 0o600)
+            mode = stat.S_IMODE(source.stat().st_mode) if name == A2A_WRAPPER_REL.as_posix() else 0o600
+            atomic_write(target, source.read_bytes(), mode)
         elif target.exists():
             target.unlink()
 
@@ -834,12 +853,17 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
 
             local_before_tests = {name: tree_digest(home / "plugins" / name)
                                   for name in manifest["plugins"]}
+            wrapper_before = existing_a2a_wrapper(home, manifest["plugins"])
             changed = plugin_differences(checkout, home, manifest["plugins"])
             preserved = newer_local_plugins(checkout, home, manifest["plugins"])
+            wrapper_release = wrapper_before
+            if wrapper_before is not None and "a2a-https-hotfix" not in preserved:
+                wrapper_release = (checkout / A2A_WRAPPER_SOURCE).read_bytes()
+            wrapper_changed = wrapper_before != wrapper_release
             changed = [name for name in changed if name not in preserved]
             manifest_changed = state.get("manifest_digest") != digest
             drift = desired_state_drift(hermes, args.profile, home, manifest)
-            if not changed and not manifest_changed and not drift:
+            if not changed and not wrapper_changed and not manifest_changed and not drift:
                 save_state(
                     state_path,
                     state,
@@ -876,6 +900,7 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     "status": "dry-run-passed",
                     "commit": commit,
                     "plugins": changed,
+                    "a2a_wrapper_changed": wrapper_changed,
                     "state_drift": drift,
                 }
 
@@ -891,11 +916,13 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
             changed_locally = [name for name, digest_before in local_before_tests.items()
                                if tree_digest(home / "plugins" / name) != digest_before]
             selection_changed = managed_plugins_for_profile(home, release_manifest) != manifest["plugins"]
-            if changed_locally or selection_changed:
+            wrapper_changed_locally = existing_a2a_wrapper(home, manifest["plugins"]) != wrapper_before
+            if changed_locally or selection_changed or wrapper_changed_locally:
                 save_state(state_path, state, last_seen_commit=commit,
                            last_result="deferred-local-state-change", changed_plugins=changed_locally)
                 return {"status": "deferred", "commit": commit, "reason": "local-state-changed",
-                        "plugins": changed_locally, "selection_changed": selection_changed}
+                        "plugins": changed_locally, "selection_changed": selection_changed,
+                        "a2a_wrapper_changed_locally": wrapper_changed_locally}
 
             was_running = gateway_running(gateway)
             stop_domain, start_domain = (None, None)
@@ -908,7 +935,8 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     stop_domain, start_domain = macos_domains(home, args.profile)
             require_qq_ready = qqbot_enabled(hermes, args.profile)
             preflight_active_plugins(home, changed)
-            backup, metadata = backup_live_state(home, changed, commit)
+            backup, metadata = backup_live_state(
+                home, changed, commit, [A2A_WRAPPER_REL.as_posix()] if wrapper_changed else [])
             metadata["launchd"] = {"stop_domain": stop_domain, "start_domain": start_domain}
             write_json(backup / "metadata.json", metadata)
             stage = stage_plugins(checkout, home, changed, commit)
@@ -917,7 +945,12 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     hermes_call(hermes, args.profile, "gateway", "stop", timeout=360, launchd_domain=stop_domain)
                     wait_for_stopped(home, gateway, args.health_timeout, launchd_domain=stop_domain)
                 replace_plugins(home, stage, changed)
+                if wrapper_changed:
+                    target = home / A2A_WRAPPER_REL
+                    atomic_write(target, wrapper_release, stat.S_IMODE(target.stat().st_mode))
                 apply_managed_settings(hermes, args.profile, home, manifest)
+                if wrapper_changed and existing_a2a_wrapper(home, manifest["plugins"]) != wrapper_release:
+                    raise UpdateError("installed A2A MCP entrypoint hash mismatch")
                 for plugin in manifest["plugins"]:
                     expected = preserved.get(plugin) or tree_digest(checkout / "plugins" / plugin)
                     actual = tree_digest(home / "plugins" / plugin)
@@ -938,6 +971,7 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                     last_result="updated",
                     last_backup=str(backup),
                     changed_plugins=changed,
+                    a2a_wrapper_changed=wrapper_changed,
                     preserved_local_plugins=list(preserved),
                     launchd_domain=start_domain,
                     blocked_commit=None,
@@ -945,6 +979,7 @@ def perform_update(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 shutil.rmtree(home / "update-staging" / commit, ignore_errors=True)
                 return {"status": "updated", "commit": commit, "plugins": changed, "backup": str(backup),
+                        "a2a_wrapper_changed": wrapper_changed,
                         "preserved_local_plugins": list(preserved), "launchd_domain": start_domain}
             except Exception as exc:
                 rollback_errors: list[str] = []

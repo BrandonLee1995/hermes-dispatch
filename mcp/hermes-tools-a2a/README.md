@@ -207,3 +207,13 @@ A successful standalone `tools/list` does not prove that the first Codex model
 turn waited for the server. `a2a-https-hotfix` 1.0.2 uses Codex's native required
 MCP setting for Hermes-created clients, without rewriting the shared config.
 See the [startup fix and QQ acceptance](../../docs/validation/a2a-windows-first-turn-2026-10-15.md).
+
+## One-click updates for existing installations
+
+The all-profile updater now refreshes an already-installed
+`$HERMES_HOME/scripts/hermes_tools_a2a.py` together with an explicitly enabled
+`a2a-https-hotfix`. The file shares the plugin update's idle check, backup, hash
+verification and rollback. It does not install a missing wrapper, rewrite MCP
+configuration, or enable optional plugins. Other command paths remain operator
+managed; a newer local A2A plugin preserves the wrapper too. See the
+[operating procedure](../../docs/operations.md#updating-existing-a2a-and-soul-deployments).
