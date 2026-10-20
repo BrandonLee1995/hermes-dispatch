@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import wraps
+import json
 import os
 from pathlib import Path
 import sys
@@ -28,7 +29,16 @@ def with_error_status(dispatch):
         except Exception as exc:
             result = f"Error: {exc}"
         # These are native tool envelopes, never keywords inside a peer reply.
-        if isinstance(result, str) and result.startswith(("Error:", "All peers failed:")):
+        is_error = isinstance(result, str) and result.startswith(("Error:", "All peers failed:"))
+        if isinstance(result, str) and not is_error:
+            try:
+                envelope = json.loads(result)
+            except json.JSONDecodeError:
+                pass
+            else:
+                # Registry dispatch serializes uncaught handler exceptions.
+                is_error = isinstance(envelope, dict) and isinstance(envelope.get("error"), str)
+        if is_error:
             return CallToolResult(content=[TextContent(type="text", text=result)],
                                   structuredContent={"result": result}, isError=True)
         return result

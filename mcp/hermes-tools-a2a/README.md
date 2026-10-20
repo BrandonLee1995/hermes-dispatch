@@ -185,6 +185,22 @@ responses for both successful and failed TLS fixtures. Roll back both components
 from the deployment backup and restart if needed. Neither enabling nor rolling
 back this change requires changing tokens or global model defaults.
 
+Hermes' registry also catches escaped handler exceptions and serializes them as
+JSON objects with a top-level string `error`. The wrapper recognizes these native
+envelopes as well as the text prefixes, retaining the original serialized text
+in both `content` and `{result: string}`. For example, a rejected Agent Card RPC
+origin must return `isError=true` instead of a successful tool result containing
+an error message. This follows the [MCP tool-error contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling).
+Successful peer replies containing quoted JSON error examples remain successful.
+
+To apply just this correction, back up and replace the installed
+`hermes_tools_a2a.py`, then replace the owning idle MCP runtime. No plugin or
+configuration change is required. `test_integration.py` covers cross-origin and
+HTTP-downgrade cards through a real local TLS peer and MCP wire, checks error
+text/output-schema preservation, and checks the quoted-JSON success case.
+Rollback restores the wrapper backup and reloads the idle MCP runtime; doing so
+restores the old false-success status for these registry errors.
+
 ## First-turn availability after a Gateway restart
 
 A successful standalone `tools/list` does not prove that the first Codex model

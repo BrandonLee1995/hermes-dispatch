@@ -45,7 +45,8 @@ class Peer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         name = self.path.split("/")[1]
-        self.reply(200, {"name": name, "url": f"https://127.0.0.1:{self.server.server_port}/{name}",
+        url = getattr(self.server, "card_rpc_url", f"https://127.0.0.1:{self.server.server_port}/{name}")
+        self.reply(200, {"name": name, "url": url,
                          "skills": [{"id": "echo", "name": "echo", "description": "Test fixture"}]})
 
     def do_POST(self):
@@ -226,6 +227,21 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             if body["params"]["message"]["parts"][0]["text"].startswith("hello-"):
                 self.assertEqual(body["params"]["message"]["contextId"], "shared-test-context")
 
+    async def test_rejected_agent_card_sets_mcp_error_for_registry_json(self):
+        home = self.home("card-errors")
+        async with self.client(home) as client:
+            for target in ("https://other.example/rpc", "http://127.0.0.1/rpc"):
+                with self.subTest(target=target):
+                    self.peer.card_rpc_url = target
+                    result = await client.call_tool("a2a_discover", {
+                        "url": f"https://127.0.0.1:{self.peer.server_port}/card-errors",
+                    })
+                    payload = json.loads(result.content[0].text)
+                    self.assertIn("[TOOL_ERROR]", payload["error"])
+                    self.assertTrue(result.is_error, result)
+                    self.assertEqual(result.structured_content, {"result": result.content[0].text})
+        self.assertEqual(self.peer.requests, [], "Rejected cards must not dispatch a task")
+
     async def test_a2a_failures_set_mcp_is_error(self):
         home = self.home("errors")
         async with self.client(home) as client:
@@ -234,9 +250,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.is_error, (message, result))
                 self.assertTrue(result.content[0].text.startswith("Error:"), result)
                 self.assertNotIn("validation error", result.content[0].text)
-            for message in ("INPUT_REQUIRED", "Error: harmless quoted example"):
+            for message in ("INPUT_REQUIRED", "Error: harmless quoted example",
+                            '{"error": "harmless quoted example"}'):
                 result = await client.call_tool("a2a_call", {"agent": "peer-errors", "message": message})
                 self.assertFalse(result.is_error, result)
+                self.assertIn(message, result.content[0].text)
             denied = await client.call_tool("a2a_call", {
                 "agent": f"https://127.0.0.1:{self.peer.server_port}/errors", "message": "no credentials"})
             self.assertTrue(denied.is_error, denied)
