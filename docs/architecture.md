@@ -146,6 +146,23 @@ metadata until explicit restore.
 
 ## MCP Area
 
+`plugins/a2a-https-hotfix` replaces the disabled bundled A2A platform registration
+with the same upstream protocol over native TLS. It rejects HTTP, redirects,
+unverified certificates, and Agent Card origin changes. There is no plaintext
+proxy hop. Certificate material and per-peer tokens stay in the owning profile's
+runtime data. See its [deployment and rollback guide](../plugins/a2a-https-hotfix/README.md).
+
+`mcp/hermes-tools-a2a` is an optional stdio startup wrapper for the Codex runtime's
+`hermes-tools` callback. Hermes 0.21.0 ships A2A handlers but omits them from this
+callback's fixed exports. The wrapper adds only the five upstream A2A tools,
+retains their profile-config availability gates, and supplements raw A2A schemas
+when tool-search compaction hides them. It reuses the upstream builder and
+dispatch path; authentication and conversation storage remain upstream-owned.
+Codex must forward the calling profile's absolute `HERMES_HOME` through the
+MCP entry's `env_vars`; relative homes are rejected, while missing homes retain
+upstream tools without A2A to prevent silent default-profile fallback. This entrypoint neither starts inbound A2A nor
+changes Gateway routes. See its [enable, verification, and rollback guide](../mcp/hermes-tools-a2a/README.md).
+
 `mcp/http-gateway` exposes Hermes MCP over streamable HTTP with bearer-token
 authentication. It is intended for local network reverse proxying through Caddy
 or Cloudflare Tunnel while keeping authentication inside the Python wrapper, so

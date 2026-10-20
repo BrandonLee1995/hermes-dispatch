@@ -743,3 +743,28 @@ and preserve any pre-existing disabled selection. The bundled phase hotfix 1.8.1
 includes Finance's approved 1.8.9 runtime/approval tests; compare its approval
 bridge with the live profile before replacement. A newer local repair still wins
 under the updater's version guard.
+
+## A2A conversation limit for the cross-host test profiles
+
+The two cross-host test profiles may set `A2A_MAX_PINGPONG_TURNS=20` in their
+existing profile `.env` files. Hermes 0.21.0 defaults to five inbound calls per
+`context_id` and clamps this setting to 1–20. Raising it allows longer
+collaboration while retaining the built-in anti-loop guard; this is configuration
+of an upstream feature and requires no source-code workaround.
+
+Back up `.env`, change only this variable, and restart each idle Gateway using its
+existing service/task mechanism. Preserve other environment values, credentials,
+Hermes YAML, Codex configuration and session mappings. Verify both actual MCP
+inventories and sequential calls in the same context beyond turn five, including
+correct retained context and successful sixth/seventh/eighth replies. Check a
+recipient-visible QQ round trip separately when accepting the channel path.
+Runtime failures still consume turns; an idle context's counter expires after one
+hour. A different context needs an explicit background handoff.
+
+Rollback by restoring this variable's previous value (or removing only the added
+line if it was absent), then restart the idle Gateway. Do not overwrite unrelated
+configuration with an older whole-file backup. Returning to the default brings
+back the five-call limit; it does not delete conversation history. This setting
+is local to the receiving profile and must be applied to both directions.
+
+Validation record: [cross-host limit 20, nine rounds](validation/a2a-limit20-2026-10-15.md).

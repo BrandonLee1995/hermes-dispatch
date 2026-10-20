@@ -76,6 +76,10 @@ _THREAD_OWNERS: "weakref.WeakValueDictionary[str, Any]" = (
 
 
 def _claim_thread_owner(thread_id: str, session: Any) -> None:
+    client = getattr(session, "_client", None)
+    if client is not None:
+        # Cache replacement can drop the Agent without calling release_clients.
+        weakref.finalize(session, client.close)
     with _THREAD_OWNER_LOCK:
         _THREAD_OWNERS[str(thread_id)] = session
 
@@ -1217,7 +1221,8 @@ def wrap_codex_runtime_turn(original: Callable) -> Callable:
         live = getattr(agent, "_codex_session", None)
         live_binding = getattr(live, "_dispatch_session_binding", None)
         if live is not None and (
-            live_binding is None
+            getattr(live, "_closed", False)
+            or live_binding is None
             or live_binding.session_id != binding.session_id
             or live_binding.project_path != binding.project_path
         ):
