@@ -144,11 +144,19 @@ peer. They check unchanged baseline tools, upstream A2A opt-in gating, required 
 all five handlers, exact message/context forwarding, bearer-auth refusal, and
 separate peer lists/conversation files for two profiles using the same context
 ID. With no `HERMES_HOME`, they verify default-home peers and conversation
-storage even when the working directory belongs to another profile. The optional
+storage even when the working directory belongs to another profile. The
+Windows isolation regression repeats that roundtrip with a disposable parent
+`LOCALAPPDATA` and asserts it remains untouched. The test launchers explicitly
+set `HOME`, `USERPROFILE`, and `LOCALAPPDATA` to fixture paths: the MCP SDK merges
+inherited Windows environment variables, and Hermes prefers `LOCALAPPDATA` over
+`USERPROFILE` for its default home. Run this suite on native Windows as well as
+POSIX to exercise that resolution; this is test-only isolation and requires no
+deployment or runtime configuration change. The optional
 Codex checks cover both explicit and absent `HERMES_HOME`, using
 `mcpServerStatus/list` and `mcpServer/tool/call` in ephemeral threads; they perform
 no model turn and need no account credentials. Without `CODEX_BINARY`, those
-checks are skipped.
+checks are skipped. On Windows, cleanup terminates the test app-server's process
+tree so its Git children cannot keep temporary-home files locked.
 
 After a real deployment, verify separately:
 
@@ -190,6 +198,16 @@ profile 门槛；无需修改账号、模型、peer 配置或删除对话历史�
 The seven startup unit tests, eight MCP/TLS integration tests (including both
 Codex app-server cases), and seven CLI/App SOUL-isolation wire tests passed.
 The new no-home regression failed against the old gate before the change.
+
+PR #25 review follow-up: the parent-`LOCALAPPDATA` regression failed on native
+Windows before the fixture fix, both losing A2A tools and writing beneath the
+disposable parent directory. After the fix, all seven startup and nine MCP/TLS
+tests passed on macOS and native Windows, including both Codex app-server cases;
+the seven CLI/App SOUL-isolation wire tests also passed on macOS. The Windows
+parent directory stayed untouched, and test app-server process-tree cleanup
+prevented Git children from blocking temporary-directory removal. These checks
+used local fixtures; they do not establish Windows GUI refresh or production
+profile/QQ delivery acceptance.
 
 After backing up and replacing the three installed wrapper copies, four fresh
 ephemeral Codex runtimes used their existing `hermes-tools` configuration:

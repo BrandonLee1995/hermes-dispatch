@@ -117,6 +117,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         env = {k: v for k, v in os.environ.items()
                if k in ("PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "LANG")}
         env.update(HOME=str(self.root), USERPROFILE=str(self.root), HERMES_HOME=str(home),
+                   LOCALAPPDATA=str(self.root / "AppData" / "Local"),
                    PYTHONPATH=str(self.source), HERMES_QUIET="1", HERMES_REDACT_SECRETS="true",
                    PYTHONDONTWRITEBYTECODE="1")
         if not forward_home:
@@ -170,6 +171,17 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("desktop received: unscoped roundtrip", result)
         self.assertTrue((self.default_home / "a2a_conversations/desktop-test.jsonl").exists())
         self.assertFalse((home / "a2a_conversations/desktop-test.jsonl").exists())
+
+    async def test_unscoped_codex_ignores_parent_local_appdata(self):
+        inherited = self.root / "parent-appdata"
+        inherited.mkdir()
+        # The MCP SDK inherits LOCALAPPDATA on Windows even when env omits it.
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(inherited)}):
+            try:
+                await self.test_unscoped_codex_exports_a2a_using_default_home()
+            finally:
+                self.assertEqual(list(inherited.iterdir()), [],
+                                 "MCP child touched the parent's Windows app-data directory")
 
     async def test_peer_directory_metadata_alias_and_capability_routing(self):
         for name in ("alpha", "beta"):
@@ -306,6 +318,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         env = {k: v for k, v in os.environ.items()
                if k in ("PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "LANG")}
         env.update(HOME=str(self.root), USERPROFILE=str(self.root), CODEX_HOME=str(codex_home),
+                   LOCALAPPDATA=str(self.root / "AppData" / "Local"),
                    PYTHONDONTWRITEBYTECODE="1")
         if forward_home:
             env["HERMES_HOME"] = str(home)
@@ -355,7 +368,15 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("codex received: app-server roundtrip", text)
         finally:
             if proc.returncode is None:
-                proc.terminate()
+                if os.name == "nt":
+                    # Codex's Git children can still hold the temporary home open.
+                    cleanup = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await cleanup.wait()
+                else:
+                    proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except asyncio.TimeoutError:
